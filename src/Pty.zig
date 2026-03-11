@@ -1,14 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
-const c = @cImport({
-    @cDefine("_XOPEN_SOURCE", "600");
-    @cInclude("stdlib.h");
-    @cInclude("fcntl.h");
-    @cInclude("unistd.h");
-    @cInclude("termios.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("sys/wait.h");
-});
+const c = @import("c.zig").c;
 
 /// Pseudoterminal
 pub const Pty = @This();
@@ -19,7 +11,8 @@ master_fd: posix.fd_t,
 pid: posix.pid_t,
 
 /// PTYを作成してshellを起動する
-pub fn init(cols: u16, row: u16) !Pty {
+/// PTY slave の termios は zmux を起動したシェルと同じ設定を使う
+pub fn init(cols: u16, row: u16, termios: c.termios) !Pty {
     var slave_name: [MAX_SNAME:0]u8 = undefined;
     const ws = std.posix.winsize{
         .col = cols,
@@ -28,37 +21,7 @@ pub fn init(cols: u16, row: u16) !Pty {
         .ypixel = 0,
     };
 
-    const termios = defaultTermios();
-
     return try ptyFork(&slave_name, termios, ws);
-}
-
-/// 端末の設定
-fn defaultTermios() c.termios {
-    var termios = std.mem.zeroes(c.termios);
-
-    // 入力フラグ
-    termios.c_iflag = c.ICRNL | c.IXON | c.BRKINT;
-    // 出力フラグ
-    termios.c_oflag = c.OPOST | c.ONLCR;
-    // 制御フラグ
-    termios.c_cflag = c.CS8 | c.CREAD | c.HUPCL;
-    // ローカルフラグ
-    termios.c_lflag = c.ISIG | c.ICANON | c.ECHO | c.ECHOE | c.ECHOK | c.IEXTEN;
-
-    // 制御文字の設定
-    termios.c_cc[c.VINTR] = 0x03; // Ctrl-C
-    termios.c_cc[c.VQUIT] = 0x1C; // Ctrl-\
-    termios.c_cc[c.VERASE] = 0x7F; // DEL
-    termios.c_cc[c.VKILL] = 0x15; // Ctrl-U
-    termios.c_cc[c.VEOF] = 0x04; // Ctrl-D
-    termios.c_cc[c.VSTART] = 0x11; // Ctrl-Q
-    termios.c_cc[c.VSTOP] = 0x13; // Ctrl-S
-    termios.c_cc[c.VSUSP] = 0x1A; // Ctrl-Z
-    termios.c_cc[c.VMIN] = 1;
-    termios.c_cc[c.VTIME] = 0;
-
-    return termios;
 }
 
 pub fn deinit(self: *Pty) void {
@@ -111,7 +74,7 @@ fn ptyFork(slave_name: [:0]u8, termios: c.termios, ws: std.posix.winsize) !Pty {
     // 新規セッションを開始 (制御端末から切り離す)
     if (c.setsid() < 0) std.process.exit(1);
 
-    // 子プロセスでは使用しないため
+    // 子プロセスでは不要
     _ = std.c.close(mfd);
 
     // slave を open
@@ -136,7 +99,8 @@ fn ptyFork(slave_name: [:0]u8, termios: c.termios, ws: std.posix.winsize) !Pty {
     _ = c.setenv("TERM", "xterm-256color", 1);
 
     const shell: [*:0]const u8 = c.getenv("SHELL") orelse "/bin/bash";
-    _ = c.execlp(shell, shell, @as([*c]u8, null));
+    const i_flag: [*:0]const u8 = "-i";
+    _ = c.execlp(shell, shell, i_flag, @as([*c]u8, null));
 
     std.process.exit(1);
 }
