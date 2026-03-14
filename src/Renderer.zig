@@ -58,7 +58,10 @@ pub fn renderAll(
     // ちらつき防止：カーソル非表示
     try writer.writeAll("\x1b[?25l");
 
-    for (workspace.panes.items) |*pane| {
+    var buf: [64]*Pane = undefined;
+    const panes = workspace.getPanes(&buf);
+
+    for (panes) |pane| {
         try self.renderPane(pane, writer);
     }
 
@@ -68,13 +71,12 @@ pub fn renderAll(
     try StatusBar.render(wm, status_row, self.term_cols, writer);
 
     // アクティブペインのカーソル位置を反映
-    if (workspace.activePane()) |active| {
-        const screen = active.terminal.screens.active;
-        try writer.print("\x1b[{d};{d}H", .{
-            active.y + screen.cursor.y + 1,
-            active.x + screen.cursor.x + 1,
-        });
-    }
+    const active = workspace.activePane();
+    const screen = active.terminal.screens.active;
+    try writer.print("\x1b[{d};{d}H", .{
+        active.y + screen.cursor.y + 1,
+        active.x + screen.cursor.x + 1,
+    });
 
     // カーソル再表示
     try writer.writeAll("\x1b[?25h");
@@ -249,7 +251,10 @@ fn drawBorders(
     defer self.alloc.free(border);
     @memset(border, 0);
 
-    for (workspace.panes.items) |*pane| {
+    var buf: [64]*Pane = undefined;
+    const panes = workspace.getPanes(&buf);
+
+    for (panes) |pane| {
         // 左辺の縦線: 各セルから上下に接続
         if (pane.x > 0) {
             const bx = pane.x - 1;

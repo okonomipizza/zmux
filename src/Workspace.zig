@@ -3,95 +3,192 @@ const Pane = @import("Pane.zig");
 const c = @import("c.zig").c;
 pub const Workspace = @This();
 
-panes: std.ArrayList(Pane),
-active_pane: usize,
+// panes: std.ArrayList(Pane),
+active_pane: *Pane,
 cols: u16,
 rows: u16,
 termios: c.termios,
+root: *PaneNode,
+
+// ノードは分割されているか、されていないかのどっちか
+const PaneNode = union(enum) {
+    leaf: *Pane,
+    split: struct {
+        dir: SplitDir,
+        ratio: f32,
+        first: *PaneNode,
+        second: *PaneNode,
+    },
+
+    pub fn deinit(self: *PaneNode, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .leaf => |pane| {
+                pane.deinit(alloc);
+                alloc.destroy(pane);
+            },
+            .split => |s| {
+                s.first.deinit(alloc);
+                alloc.destroy(s.first);
+                s.second.deinit(alloc);
+                alloc.destroy(s.second);
+            },
+        }
+    }
+};
 
 pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16, termios: c.termios) !Workspace {
-    var panes = std.ArrayList(Pane){};
-    errdefer panes.deinit(alloc);
+    const pane = try alloc.create(Pane);
+    errdefer alloc.destroy(pane);
+    pane.* = try Pane.init(alloc, termios, 0, 0, cols, rows);
 
-    const first_pane = try Pane.init(alloc, termios, 0, 0, cols, rows);
-    try panes.append(alloc, first_pane);
+    const root = try alloc.create(PaneNode);
+    errdefer alloc.destroy(root);
+    root.* = .{ .leaf = pane };
 
     return .{
-        .panes = panes,
-        .active_pane = 0,
+        // .panes = panes,
+        .active_pane = pane,
         .cols = cols,
         .rows = rows,
         .termios = termios,
+        .root = root,
     };
 }
 
 pub fn deinit(self: *Workspace, alloc: std.mem.Allocator) void {
-    for (self.panes.items) |*pane| {
-        pane.deinit(alloc);
+    self.root.deinit(alloc);
+}
+
+fn deinitPanes(node: *PaneNode) void {
+    switch (node) {
+        .leaf => node,
     }
-    self.panes.deinit(alloc);
 }
 
 /// 現在のワークスペース内におけるアクティブペインへの参照を返す
-pub fn activePane(self: *Workspace) ?*Pane {
-    if (self.panes.items.len == 0) return null;
-    if (self.active_pane >= self.panes.items.len) {
-        self.active_pane = 0;
-        // TODO カーソル位置をリセットする必要があるかも
-    }
-    return &self.panes.items[self.active_pane];
+pub fn activePane(self: *Workspace) *Pane {
+    return self.active_pane;
 }
 
 /// 指定された fd を持つ ペインを返す
 pub fn getPane(self: *Workspace, fd: c_int) ?*Pane {
-    for (self.panes.items) |*pane| {
-        if (pane.pty.master_fd == fd) {
-            return pane;
-        }
-    }
-    return null;
+    return findPane(self.root, fd);
 }
 
-/// 指定された fd を持つペインの index を返す
-pub fn getPaneIndex(self: *Workspace, fd: c_int) ?usize {
-    for (self.panes.items, 0..) |*pane, i| {
-        if (pane.pty.master_fd == fd) return i;
+fn findPane(node: *PaneNode, fd: c_int) ?*Pane {
+    switch (node.*) {
+        .leaf => |pane| {
+            if (pane.pty.master_fd == fd) return pane;
+            return null;
+        },
+        .split => |s| {
+            return findPane(s.first, fd) orelse findPane(s.second, fd);
+        },
     }
-    return null;
 }
 
 /// ペインを分割して epoll に登録すべき新しい fd を返す
 pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_int {
-    const active = self.activePane() orelse return error.ActivePaneLost;
+    // active_paneを持つleafノードを探す
+    const leaf_node = findLeafNode(self.root, self.active_pane) orelse return error.ActivePaneLost;
+    const active = leaf_node.leaf;
 
     const new_size = try calcNewPaneSize(active.x, active.y, active.cols, active.rows, dir);
 
-    // 既存のアクティブペインをリサイズ
+    // 既存ペインをリサイズ
     try active.resize(alloc, new_size.active_cols, new_size.active_rows);
 
-    const new_pane = try Pane.init(alloc, self.termios, new_size.x, new_size.y, new_size.cols, new_size.rows);
+    // 新しいペインを作成
+    const new_pane = try alloc.create(Pane);
+    errdefer alloc.destroy(new_pane);
+    new_pane.* = try Pane.init(alloc, self.termios, new_size.x, new_size.y, new_size.cols, new_size.rows);
 
-    try self.panes.append(alloc, new_pane);
+    // 子ノードを作成
+    const first_node = try alloc.create(PaneNode);
+    errdefer alloc.destroy(first_node);
+    first_node.* = .{ .leaf = active };
 
-    // 新しく追加したPaneをアクティブに設定する
-    self.active_pane = self.panes.items.len - 1;
+    const second_node = try alloc.create(PaneNode);
+    errdefer alloc.destroy(second_node);
+    second_node.* = .{ .leaf = new_pane };
 
-    return self.panes.items[self.active_pane].pty.master_fd;
+    // 元のleafノードをsplitに変換
+    leaf_node.* = .{ .split = .{
+        .dir = dir,
+        .ratio = 0.5,
+        .first = first_node,
+        .second = second_node,
+    } };
+
+    // 新ペインをアクティブに
+    self.active_pane = new_pane;
+
+    return new_pane.pty.master_fd;
 }
 
-/// アクティブペインを切り替える
-pub fn nextPane(self: *Workspace) void {
-    const len = self.panes.items.len;
-    if (self.panes.items.len == 0) return;
+fn findLeafNode(node: *PaneNode, target: *Pane) ?*PaneNode {
+    switch (node.*) {
+        .leaf => |pane| {
+            if (pane == target) return node;
+            return null;
+        },
+        .split => |s| {
+            return findLeafNode(s.first, target) orelse findLeafNode(s.second, target);
+        },
+    }
+}
 
-    self.active_pane = (self.active_pane + 1) % len;
+pub fn nextPane(self: *Workspace) void {
+    var buf: [64]*Pane = undefined;
+    const leaves = collectLeaves(self.root, &buf);
+    if (leaves.len <= 1) return;
+
+    for (leaves, 0..) |pane, i| {
+        if (pane == self.active_pane) {
+            self.active_pane = leaves[(i + 1) % leaves.len];
+            return;
+        }
+    }
 }
 
 pub fn prevPane(self: *Workspace) void {
-    const len = self.panes.items.len;
-    if (self.panes.items.len == 0) return;
+    var buf: [64]*Pane = undefined;
+    const leaves = collectLeaves(self.root, &buf);
+    if (leaves.len <= 1) return;
 
-    self.active_pane = (self.active_pane + len - 1) % len;
+    for (leaves, 0..) |pane, i| {
+        if (pane == self.active_pane) {
+            self.active_pane = leaves[(i + leaves.len - 1) % leaves.len];
+            return;
+        }
+    }
+}
+
+fn collectLeaves(node: *PaneNode, buf: []*Pane) []*Pane {
+    var count: usize = 0;
+    collectLeavesInner(node, buf, &count);
+    return buf[0..count];
+}
+
+pub fn getPanes(self: *Workspace, buf: []*Pane) []*Pane {
+    var count: usize = 0;
+    collectLeavesInner(self.root, buf, &count);
+    return buf[0..count];
+}
+
+fn collectLeavesInner(node: *PaneNode, buf: []*Pane, count: *usize) void {
+    switch (node.*) {
+        .leaf => |pane| {
+            if (count.* < buf.len) {
+                buf[count.*] = pane;
+                count.* += 1;
+            }
+        },
+        .split => |s| {
+            collectLeavesInner(s.first, buf, count);
+            collectLeavesInner(s.second, buf, count);
+        },
+    }
 }
 
 const NewPaneSize = struct {

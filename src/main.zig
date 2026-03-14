@@ -113,7 +113,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
     try epollAdd(epoll_fd, c.STDIN_FILENO, c.EPOLLIN);
     // 最初のpaneをepollの監視リストに追加
-    try epollAdd(epoll_fd, active_workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
+    try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
 
     var events: [16]c.epoll_event = undefined;
     var buf: [BUF_SIZE]u8 = undefined;
@@ -150,7 +150,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             workspace_manager.switchWorkspace(workspace_manager.workspaces.items.len - 1);
                             active_workspace = workspace_manager.getActiveWorkspace() orelse return;
                             // 新ワークスペースの最初のペインをepoll登録
-                            try epollAdd(epoll_fd, active_workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
+                            try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
 
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
@@ -202,14 +202,14 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             return;
                         },
                         else => {
-                            const active = active_workspace.activePane() orelse continue;
+                            const active = active_workspace.activePane();
                             active.pty.write(input) catch continue;
                         },
                     }
                     continue;
                 }
                 // 通常入力はアクティブペインへ送信
-                const active = active_workspace.activePane() orelse continue;
+                const active = active_workspace.activePane();
                 active.pty.write(input) catch continue;
             } else {
                 // paneから受け取った情報を出力
@@ -225,12 +225,11 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
             }
         }
 
-        if (active_workspace.activePane()) |active| {
-            // shellが終了していたら抜ける
-            const result = c.waitpid(active.pty.pid, null, c.WNOHANG);
-            if (result == active.pty.pid) {
-                return;
-            }
+        const active = active_workspace.activePane();
+        // shellが終了していたら抜ける
+        const result = c.waitpid(active.pty.pid, null, c.WNOHANG);
+        if (result == active.pty.pid) {
+            return;
         }
     }
 }
