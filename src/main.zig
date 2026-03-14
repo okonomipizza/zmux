@@ -3,7 +3,9 @@ const Io = std.Io;
 const posix = std.posix;
 
 const zmux = @import("zmux");
-const clap = @import("clap");
+const ghostty_vt = @import("ghostty-vt");
+
+const Renderer = @import("Renderer.zig");
 
 const c = @import("c.zig").c;
 
@@ -63,26 +65,12 @@ fn epollAdd(epoll_fd: c_int, fd: c_int, events: u32) !void {
         return error.EpollCtlFailed;
 }
 
-pub fn main(init: std.process.Init) !void {
-    // zig-clap の設定
-    const params = comptime clap.parseParamsComptime(
-        \\-h, --help            Display this help and exit.
-        \\-v, --version         Display zmux version.
-    );
-    var diag = clap.Diagnostic{};
-    var res = clap.parse(clap.Help, &params, clap.parsers.default, init.minimal.args, .{
-        .diagnostic = &diag,
-        .allocator = init.gpa,
-    }) catch |err| {
-        try diag.reportToFile(init.io, .stderr(), err);
-        return err;
-    };
-    defer res.deinit();
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
 
-    if (res.args.help != 0)
-        return clap.helpToFile(init.io, .stderr(), clap.Help, &params, .{});
-
-    try spawnServer(init.gpa, init.io);
+    try spawnServer(alloc);
 }
 
 fn getTermSize() struct { cols: u16, rows: u16 } {
@@ -91,24 +79,27 @@ fn getTermSize() struct { cols: u16, rows: u16 } {
     return .{ .cols = ws.col, .rows = ws.row };
 }
 
-fn spawnServer(allocator: std.mem.Allocator, io: std.Io) !void {
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const stdout_writer = &stdout_file_writer.interface;
+fn spawnServer(alloc: std.mem.Allocator) !void {
+    // 画面クリア
+    const stdout_file = std.fs.File.stdout();
+    try stdout_file.writeAll("\x1b[2J\x1b[H");
+
+    var stdout_buf: [65536]u8 = undefined;
+    var stdout_fbs = std.io.fixedBufferStream(&stdout_buf);
+    const buf_writer = stdout_fbs.writer();
 
     const term = getTermSize();
 
     try enableRawMode();
     defer disableRawMode();
 
-    var workspace = try Workspace.init(allocator, term.cols, term.rows, original_termios);
-    defer workspace.deinit(allocator);
+    var workspace = try Workspace.init(alloc, term.cols, term.rows, original_termios);
+    defer workspace.deinit(alloc);
+
+    var renderer = try Renderer.init(alloc, term.cols, term.rows);
+    defer renderer.deinit();
 
     // epollセットアップ
-    const event_count = 1 + workspace.panes.items.len; // stdin + number of panes
-    var events = try allocator.alloc(c.epoll_event, event_count);
-    defer allocator.free(events);
-
     const epoll_fd = c.epoll_create1(0);
     if (epoll_fd < 0) return error.EpollCreateFailed;
     defer _ = c.close(epoll_fd);
@@ -117,13 +108,13 @@ fn spawnServer(allocator: std.mem.Allocator, io: std.Io) !void {
     // 最初のpaneをepollの監視リストに追加
     try epollAdd(epoll_fd, workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
 
+    var events: [16]c.epoll_event = undefined;
     var buf: [BUF_SIZE]u8 = undefined;
+    var prefix_mode: bool = false;
 
     while (true) {
-        const n = c.epoll_wait(epoll_fd, events.ptr, @intCast(events.len), -1);
+        const n = c.epoll_wait(epoll_fd, &events, @intCast(events.len), -1);
         if (n < 0) continue;
-
-        const active_pane = workspace.activePane();
 
         for (events[0..@intCast(n)]) |ev| {
             const fd = ev.data.fd;
@@ -132,22 +123,71 @@ fn spawnServer(allocator: std.mem.Allocator, io: std.Io) !void {
                 // 標準入力からキー入力を読み取りアクティブPaneへ送信
                 const nr = c.read(c.STDIN_FILENO, &buf, BUF_SIZE);
                 if (nr <= 0) return;
-                active_pane.pty.write(buf[0..@intCast(nr)]) catch return;
+                const input = buf[0..@intCast(nr)];
+
+                // Ctrl-b (0x02)
+                if (input.len == 1 and input[0] == 0x02) {
+                    prefix_mode = true;
+                    continue;
+                }
+
+                if (prefix_mode) {
+                    prefix_mode = false;
+                    switch (input[0]) {
+                        'v' => {
+                            const new_fd = try workspace.splitPane(alloc, .vertical);
+                            try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
+
+                            stdout_fbs.reset();
+                            try buf_writer.writeAll("\x1b[2J");
+                            try renderer.renderAll(&workspace, buf_writer);
+                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                        },
+                        'h' => {
+                            const new_fd = try workspace.splitPane(alloc, .horizontal);
+                            try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
+
+                            stdout_fbs.reset();
+                            try buf_writer.writeAll("\x1b[2J");
+                            try renderer.renderAll(&workspace, buf_writer);
+                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                        },
+                        'j' => {
+                            workspace.nextPain();
+                        },
+                        'q' => {
+                            return;
+                        },
+                        else => {
+                            const active = workspace.activePane() orelse continue;
+                            active.pty.write(input) catch continue;
+                        },
+                    }
+                    continue;
+                }
+                // 通常入力はアクティブペインへ送信
+                const active = workspace.activePane() orelse continue;
+                active.pty.write(input) catch continue;
             } else {
                 // paneから受け取った情報を出力
-                const pane = workspace.getPane(ev.data.fd) orelse return error.FdNotFoundInWorkspace;
+                const pane = workspace.getPane(ev.data.fd) orelse continue;
                 const nr = c.read(pane.pty.master_fd, &buf, BUF_SIZE);
                 if (nr <= 0) return;
 
-                try stdout_writer.writeAll(buf[0..@intCast(nr)]);
-                try stdout_writer.flush();
+                try pane.feed(buf[0..@intCast(nr)]);
+
+                stdout_fbs.reset();
+                try renderer.renderAll(&workspace, buf_writer);
+                try stdout_file.writeAll(stdout_fbs.getWritten());
             }
         }
 
-        // shellが終了していたら抜ける
-        const result = c.waitpid(active_pane.pty.pid, null, c.WNOHANG);
-        if (result == active_pane.pty.pid) {
-            return;
+        if (workspace.activePane()) |active| {
+            // shellが終了していたら抜ける
+            const result = c.waitpid(active.pty.pid, null, c.WNOHANG);
+            if (result == active.pty.pid) {
+                return;
+            }
         }
     }
 }

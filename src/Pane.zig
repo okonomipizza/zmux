@@ -1,20 +1,34 @@
 const std = @import("std");
 const Pty = @import("Pty.zig");
+const Terminal = @import("ghostty-vt").Terminal;
 
 const c = @import("c.zig").c;
 
 pub const Pane = @This();
 
 pty: Pty,
-x: u16, // 左端列
-y: u16, // 上端行
+// lib-ghostty でターミナルのバッファを管理
+terminal: Terminal,
+x: u16, // 端末上の左端列 (0-indexed)
+y: u16, // 端末上の上端行 (0-indexed)
 cols: u16, // 横幅
 rows: u16, // 縦幅
 is_active: bool,
 
-pub fn init(termios: c.termios, x: u16, y: u16, cols: u16, rows: u16) !Pane {
+pub fn init(
+    alloc: std.mem.Allocator,
+    termios: c.termios,
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+) !Pane {
     return .{
         .pty = try Pty.init(cols, rows, termios),
+        .terminal = try Terminal.init(alloc, .{
+            .cols = cols,
+            .rows = rows,
+        }),
         .x = x,
         .y = y,
         .cols = cols,
@@ -23,8 +37,29 @@ pub fn init(termios: c.termios, x: u16, y: u16, cols: u16, rows: u16) !Pane {
     };
 }
 
-pub fn deinit(self: *Pane) void {
+pub fn deinit(self: *Pane, alloc: std.mem.Allocator) void {
     self.pty.deinit();
+    self.terminal.deinit(alloc);
+}
+
+/// PTYからの出力をVTパーサで処理してスクリーンバッファを更新
+pub fn feed(self: *Pane, data: []const u8) !void {
+    var stream = self.terminal.vtStream();
+    defer stream.deinit();
+
+    try stream.nextSlice(data);
+}
+
+pub fn resize(
+    self: *Pane,
+    alloc: std.mem.Allocator,
+    cols: u16,
+    rows: u16,
+) !void {
+    self.cols = cols;
+    self.rows = rows;
+    try self.terminal.resize(alloc, cols, rows);
+    try self.pty.resize(cols, rows);
 }
 
 pub fn activate(self: *Pane, writer: *std.Io.Writer) !void {

@@ -13,7 +13,7 @@
       };
     };
     zls = {
-      url = "github:zigtools/zls";
+      url = "github:zigtools/zls/0.15.1";
       inputs = {
         nixpkgs.follows = "nixpkgs";
         zig-overlay.follows = "zig";
@@ -34,7 +34,7 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in {
           devShell.${system} = pkgs.callPackage ./nix/devShell.nix {
-            zig = zig.packages.${system}."master";
+            zig = zig.packages.${system}."0.15.2";
             zls = zls.packages.${system}.zls;
           };
 
