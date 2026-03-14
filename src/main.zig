@@ -12,6 +12,7 @@ const c = @import("c.zig").c;
 const Pty = @import("Pty.zig");
 const StatusBar = @import("StatusBar.zig");
 const Workspace = @import("Workspace.zig");
+const WorkspaceManager = @import("WorkspaceManager.zig");
 
 var original_termios: c.termios = undefined;
 const BUF_SIZE: usize = 4096;
@@ -88,13 +89,19 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
     var stdout_fbs = std.io.fixedBufferStream(&stdout_buf);
     const buf_writer = stdout_fbs.writer();
 
-    const term = getTermSize();
+    const original_term = getTermSize();
+    const term = .{
+        .cols = original_term.cols,
+        .rows = original_term.rows - 1, // workspace monitor用
+    };
 
     try enableRawMode();
     defer disableRawMode();
 
-    var workspace = try Workspace.init(alloc, term.cols, term.rows, original_termios);
-    defer workspace.deinit(alloc);
+    var workspace_manager = try WorkspaceManager.init(alloc, term.cols, term.rows, original_termios);
+    defer workspace_manager.deinit(alloc);
+
+    var active_workspace: *Workspace = workspace_manager.getActiveWorkspace() orelse return;
 
     var renderer = try Renderer.init(alloc, term.cols, term.rows);
     defer renderer.deinit();
@@ -106,7 +113,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
     try epollAdd(epoll_fd, c.STDIN_FILENO, c.EPOLLIN);
     // 最初のpaneをepollの監視リストに追加
-    try epollAdd(epoll_fd, workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
+    try epollAdd(epoll_fd, active_workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
 
     var events: [16]c.epoll_event = undefined;
     var buf: [BUF_SIZE]u8 = undefined;
@@ -134,55 +141,111 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                 if (prefix_mode) {
                     prefix_mode = false;
                     switch (input[0]) {
-                        'v' => {
-                            const new_fd = try workspace.splitPane(alloc, .vertical);
-                            try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
+                        '\r' => {
+                            // enter でprefix modeから抜ける
+                        },
+                        'n' => {
+                            try workspace_manager.appendWorkspace(alloc);
+                            // 新しいワークスペースに切り替え
+                            workspace_manager.switchWorkspace(workspace_manager.workspaces.items.len - 1);
+                            active_workspace = workspace_manager.getActiveWorkspace() orelse return;
+
+                            // 新ワークスペースの最初のペインをepoll登録
+                            try epollAdd(epoll_fd, active_workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
 
                             stdout_fbs.reset();
                             try buf_writer.writeAll("\x1b[2J");
-                            try renderer.renderAll(&workspace, buf_writer);
+                            renderer.invalidate();
+                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
                             try stdout_file.writeAll(stdout_fbs.getWritten());
                         },
+                        'l' => {
+                            active_workspace = workspace_manager.nextWorkspace() orelse return;
+
+                            stdout_fbs.reset();
+                            try buf_writer.writeAll("\x1b[2J");
+                            renderer.invalidate();
+                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                            // l, h 連打でワークスペースを選べるように
+                            prefix_mode = true;
+                        },
                         'h' => {
-                            const new_fd = try workspace.splitPane(alloc, .horizontal);
+                            active_workspace = workspace_manager.prevWorkspace() orelse return;
+
+                            stdout_fbs.reset();
+                            try buf_writer.writeAll("\x1b[2J");
+                            renderer.invalidate();
+                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                            // l, h 連打でワークスペースを選べるように
+                            prefix_mode = true;
+                        },
+                        '1', '2', '3', '4', '5', '6', '7', '8', '9' => {
+                            const idx = input[0] - '1';
+                            if (idx < workspace_manager.workspaces.items.len) {
+                                workspace_manager.switchWorkspace(idx);
+                                active_workspace = workspace_manager.getActiveWorkspace() orelse return;
+
+                                stdout_fbs.reset();
+                                try buf_writer.writeAll("\x1b[2J");
+                                renderer.invalidate();
+                                try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                                try stdout_file.writeAll(stdout_fbs.getWritten());
+                            }
+                        },
+                        'v' => {
+                            const new_fd = try active_workspace.splitPane(alloc, .vertical);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
                             stdout_fbs.reset();
                             try buf_writer.writeAll("\x1b[2J");
-                            try renderer.renderAll(&workspace, buf_writer);
+                            renderer.invalidate();
+                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                        },
+                        '-' => {
+                            const new_fd = try active_workspace.splitPane(alloc, .horizontal);
+                            try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
+
+                            stdout_fbs.reset();
+                            try buf_writer.writeAll("\x1b[2J");
+                            renderer.invalidate();
+
+                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
                             try stdout_file.writeAll(stdout_fbs.getWritten());
                         },
                         'j' => {
-                            workspace.nextPain();
+                            active_workspace.nextPain();
                         },
                         'q' => {
                             return;
                         },
                         else => {
-                            const active = workspace.activePane() orelse continue;
+                            const active = active_workspace.activePane() orelse continue;
                             active.pty.write(input) catch continue;
                         },
                     }
                     continue;
                 }
                 // 通常入力はアクティブペインへ送信
-                const active = workspace.activePane() orelse continue;
+                const active = active_workspace.activePane() orelse continue;
                 active.pty.write(input) catch continue;
             } else {
                 // paneから受け取った情報を出力
-                const pane = workspace.getPane(ev.data.fd) orelse continue;
+                const pane = active_workspace.getPane(ev.data.fd) orelse continue;
                 const nr = c.read(pane.pty.master_fd, &buf, BUF_SIZE);
                 if (nr <= 0) return;
 
                 try pane.feed(buf[0..@intCast(nr)]);
 
                 stdout_fbs.reset();
-                try renderer.renderAll(&workspace, buf_writer);
+                try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
                 try stdout_file.writeAll(stdout_fbs.getWritten());
             }
         }
 
-        if (workspace.activePane()) |active| {
+        if (active_workspace.activePane()) |active| {
             // shellが終了していたら抜ける
             const result = c.waitpid(active.pty.pid, null, c.WNOHANG);
             if (result == active.pty.pid) {

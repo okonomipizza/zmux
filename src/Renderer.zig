@@ -1,6 +1,8 @@
 const std = @import("std");
 const Workspace = @import("Workspace.zig");
+const WorkspaceManager = @import("WorkspaceManager.zig");
 const Pane = @import("Pane.zig");
+const StatusBar = @import("StatusBar.zig");
 
 pub const Renderer = @This();
 
@@ -49,6 +51,8 @@ fn prevCell(self: *Renderer, x: u16, y: u16) *Cell {
 pub fn renderAll(
     self: *Renderer,
     workspace: *Workspace,
+    wm: *WorkspaceManager,
+    status_row: u16,
     writer: anytype,
 ) !void {
     // ちらつき防止：カーソル非表示
@@ -60,6 +64,8 @@ pub fn renderAll(
 
     // 境界線描画
     try self.drawBorders(workspace, writer);
+
+    try StatusBar.render(wm, status_row, self.term_cols, writer);
 
     // アクティブペインのカーソル位置を反映
     if (workspace.activePane()) |active| {
@@ -334,4 +340,10 @@ fn drawBorders(
             });
         }
     }
+}
+
+pub fn invalidate(self: *Renderer) void {
+    @memset(self.prev_cells, .{
+        .codepoint = std.math.maxInt(u21), // 全セルを「前回と違う」状態にする
+    });
 }
