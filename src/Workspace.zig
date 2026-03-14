@@ -80,9 +80,18 @@ pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_i
 }
 
 /// アクティブペインを切り替える
-pub fn nextPain(self: *Workspace) void {
+pub fn nextPane(self: *Workspace) void {
+    const len = self.panes.items.len;
     if (self.panes.items.len == 0) return;
-    self.active_pane = (self.active_pane + 1) % self.panes.items.len;
+
+    self.active_pane = (self.active_pane + 1) % len;
+}
+
+pub fn prevPane(self: *Workspace) void {
+    const len = self.panes.items.len;
+    if (self.panes.items.len == 0) return;
+
+    self.active_pane = (self.active_pane + len - 1) % len;
 }
 
 const NewPaneSize = struct {

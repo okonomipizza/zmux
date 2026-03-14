@@ -149,35 +149,22 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             // 新しいワークスペースに切り替え
                             workspace_manager.switchWorkspace(workspace_manager.workspaces.items.len - 1);
                             active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-
                             // 新ワークスペースの最初のペインをepoll登録
                             try epollAdd(epoll_fd, active_workspace.panes.items[0].pty.master_fd, c.EPOLLIN);
 
-                            stdout_fbs.reset();
-                            try buf_writer.writeAll("\x1b[2J");
-                            renderer.invalidate();
-                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
-                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
                         'l' => {
                             active_workspace = workspace_manager.nextWorkspace() orelse return;
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
 
-                            stdout_fbs.reset();
-                            try buf_writer.writeAll("\x1b[2J");
-                            renderer.invalidate();
-                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
-                            try stdout_file.writeAll(stdout_fbs.getWritten());
                             // l, h 連打でワークスペースを選べるように
                             prefix_mode = true;
                         },
                         'h' => {
                             active_workspace = workspace_manager.prevWorkspace() orelse return;
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
 
-                            stdout_fbs.reset();
-                            try buf_writer.writeAll("\x1b[2J");
-                            renderer.invalidate();
-                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
-                            try stdout_file.writeAll(stdout_fbs.getWritten());
                             // l, h 連打でワークスペースを選べるように
                             prefix_mode = true;
                         },
@@ -186,37 +173,30 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             if (idx < workspace_manager.workspaces.items.len) {
                                 workspace_manager.switchWorkspace(idx);
                                 active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-
-                                stdout_fbs.reset();
-                                try buf_writer.writeAll("\x1b[2J");
-                                renderer.invalidate();
-                                try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
-                                try stdout_file.writeAll(stdout_fbs.getWritten());
+                                try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                             }
                         },
                         'v' => {
                             const new_fd = try active_workspace.splitPane(alloc, .vertical);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
-                            stdout_fbs.reset();
-                            try buf_writer.writeAll("\x1b[2J");
-                            renderer.invalidate();
-                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
-                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
                         '-' => {
                             const new_fd = try active_workspace.splitPane(alloc, .horizontal);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
-                            stdout_fbs.reset();
-                            try buf_writer.writeAll("\x1b[2J");
-                            renderer.invalidate();
-
-                            try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
-                            try stdout_file.writeAll(stdout_fbs.getWritten());
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
                         'j' => {
-                            active_workspace.nextPain();
+                            active_workspace.nextPane();
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            prefix_mode = true;
+                        },
+                        'k' => {
+                            active_workspace.prevPane();
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            prefix_mode = true;
                         },
                         'q' => {
                             return;
@@ -253,4 +233,22 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
             }
         }
     }
+}
+
+fn refreshScreen(
+    stdout_fbs: *std.io.FixedBufferStream([]u8),
+    renderer: *Renderer,
+    active_workspace: *Workspace,
+    workspace_manager: *WorkspaceManager,
+    original_rows: u16,
+    stdout_file: std.fs.File,
+    comptime clear: bool,
+) !void {
+    stdout_fbs.reset();
+    if (clear) {
+        stdout_fbs.writer().writeAll("\x1b[2J") catch {};
+    }
+    renderer.invalidate();
+    try renderer.renderAll(active_workspace, workspace_manager, original_rows, stdout_fbs.writer());
+    try stdout_file.writeAll(stdout_fbs.getWritten());
 }
