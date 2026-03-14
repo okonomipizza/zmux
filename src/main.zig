@@ -188,6 +188,10 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
+                        'x' => {
+                            try active_workspace.closePane(alloc);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                        },
                         'j' => {
                             active_workspace.nextPane();
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);

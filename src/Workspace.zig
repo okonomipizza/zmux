@@ -126,6 +126,89 @@ pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_i
     return new_pane.pty.master_fd;
 }
 
+pub fn closePane(self: *Workspace, alloc: std.mem.Allocator) !void {
+    if (self.root.* == .leaf) return;
+
+    const result = findParentSplit(self.root, self.active_pane) orelse return;
+    const parent = result.parent;
+    const sibling = result.sibling;
+
+    const closing_node = result.closing;
+    const closing_pane = closing_node.leaf;
+    closing_pane.deinit(alloc);
+    alloc.destroy(closing_pane);
+    alloc.destroy(closing_node);
+
+    const sibling_copy = sibling.*;
+    alloc.destroy(sibling);
+    parent.* = sibling_copy;
+
+    // ルートからワークスペース全体を再レイアウト
+    try relayout(alloc, self.root, self.cols, self.rows, 0, 0);
+
+    self.active_pane = firstLeaf(parent);
+}
+
+const FindResult = struct {
+    parent: *PaneNode,
+    closing: *PaneNode,
+    sibling: *PaneNode,
+};
+
+fn findParentSplit(node: *PaneNode, target: *Pane) ?FindResult {
+    switch (node.*) {
+        .leaf => return null,
+        .split => |s| {
+            // firstが閉じる対象か
+            if (s.first.* == .leaf and s.first.leaf == target) {
+                return .{ .parent = node, .closing = s.first, .sibling = s.second };
+            }
+            // secondが閉じる対象か
+            if (s.second.* == .leaf and s.second.leaf == target) {
+                return .{ .parent = node, .closing = s.second, .sibling = s.first };
+            }
+            // 再帰的に探す
+            return findParentSplit(s.first, target) orelse findParentSplit(s.second, target);
+        },
+    }
+}
+
+fn firstLeaf(node: *PaneNode) *Pane {
+    switch (node.*) {
+        .leaf => |pane| return pane,
+        .split => |s| return firstLeaf(s.first),
+    }
+}
+
+/// ツリーを再帰的に走査して、各ペインの位置とサイズを再計算する
+fn relayout(alloc: std.mem.Allocator, node: *PaneNode, cols: u16, rows: u16, x: u16, y: u16) !void {
+    switch (node.*) {
+        .leaf => |pane| {
+            pane.x = x;
+            pane.y = y;
+            pane.cols = cols;
+            pane.rows = rows;
+            try pane.resize(alloc, cols, rows);
+        },
+        .split => |s| {
+            switch (s.dir) {
+                .vertical => {
+                    const first_cols = @as(u16, @intFromFloat(@as(f32, @floatFromInt(cols)) * s.ratio)) -| 1;
+                    const second_cols = cols - first_cols - 1; // 1は境界線
+                    try relayout(alloc, s.first, first_cols, rows, x, y);
+                    try relayout(alloc, s.second, second_cols, rows, x + first_cols + 1, y);
+                },
+                .horizontal => {
+                    const first_rows = @as(u16, @intFromFloat(@as(f32, @floatFromInt(rows)) * s.ratio)) -| 1;
+                    const second_rows = rows - first_rows - 1;
+                    try relayout(alloc, s.first, cols, first_rows, x, y);
+                    try relayout(alloc, s.second, cols, second_rows, x, y + first_rows + 1);
+                },
+            }
+        },
+    }
+}
+
 fn findLeafNode(node: *PaneNode, target: *Pane) ?*PaneNode {
     switch (node.*) {
         .leaf => |pane| {
