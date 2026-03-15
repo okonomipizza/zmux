@@ -114,6 +114,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
     try epollAdd(epoll_fd, c.STDIN_FILENO, c.EPOLLIN);
     // 最初のpaneをepollの監視リストに追加
     try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
+    try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);
 
     var events: [16]c.epoll_event = undefined;
     var buf: [BUF_SIZE]u8 = undefined;
@@ -168,7 +169,12 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             active_workspace = workspace_manager.getActiveWorkspace() orelse return;
                             // 新ワークスペースの最初のペインをepoll登録
                             try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
+                            try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);
 
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                        },
+                        'f' => {
+                            active_workspace.toggleFloating();
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
                         'l' => {
@@ -271,7 +277,13 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                 try pane.feed(buf[0..@intCast(nr)]);
 
                 stdout_fbs.reset();
-                try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+
+                if (active_workspace.show_floating and pane == active_workspace.floating_pane) {
+                    try renderer.renderFloatingOnly(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                } else {
+                    try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                }
+
                 try stdout_file.writeAll(stdout_fbs.getWritten());
             }
         }

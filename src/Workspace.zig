@@ -3,12 +3,13 @@ const Pane = @import("Pane.zig");
 const c = @import("c.zig").c;
 pub const Workspace = @This();
 
-// panes: std.ArrayList(Pane),
 active_pane: *Pane,
+floating_pane: *Pane,
 cols: u16,
 rows: u16,
 termios: c.termios,
 root: *PaneNode,
+show_floating: bool,
 
 // ノードは分割されているか、されていないかのどっちか
 const PaneNode = union(enum) {
@@ -41,23 +42,60 @@ pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16, termios: c.termios) 
     errdefer alloc.destroy(pane);
     pane.* = try Pane.init(alloc, termios, 0, 0, cols, rows);
 
+    const floating_geometry = calcFloatingGeometry(cols, rows);
+
+    const floating_pane = try alloc.create(Pane);
+    errdefer alloc.destroy(floating_pane);
+    floating_pane.* = try Pane.init(
+        alloc,
+        termios,
+        floating_geometry.x,
+        floating_geometry.y,
+        floating_geometry.cols,
+        floating_geometry.rows,
+    );
+
     const root = try alloc.create(PaneNode);
     errdefer alloc.destroy(root);
     root.* = .{ .leaf = pane };
 
     return .{
-        // .panes = panes,
         .active_pane = pane,
+        .floating_pane = floating_pane,
         .cols = cols,
         .rows = rows,
         .termios = termios,
         .root = root,
+        .show_floating = false,
+    };
+}
+
+const FloatingGeometry = struct {
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+};
+
+fn calcFloatingGeometry(ws_cols: u16, ws_rows: u16) FloatingGeometry {
+    const float_cols: u16 = @max(ws_cols * 8 / 10, 10);
+    const float_rows: u16 = @max(ws_rows * 8 / 10, 4);
+    const x: u16 = (ws_cols -| float_cols) / 2;
+    const y: u16 = (ws_rows -| float_rows) / 2;
+
+    return .{
+        .x = x,
+        .y = y,
+        .cols = float_cols,
+        .rows = float_rows,
     };
 }
 
 pub fn deinit(self: *Workspace, alloc: std.mem.Allocator) void {
     self.root.deinit(alloc);
     alloc.destroy(self.root);
+    self.floating_pane.deinit(alloc);
+    alloc.destroy(self.floating_pane);
 }
 
 fn deinitPanes(node: *PaneNode) void {
@@ -73,6 +111,7 @@ pub fn activePane(self: *Workspace) *Pane {
 
 /// 指定された fd を持つ ペインを返す
 pub fn getPane(self: *Workspace, fd: c_int) ?*Pane {
+    if (self.floating_pane.pty.master_fd == fd) return self.floating_pane;
     return findPane(self.root, fd);
 }
 
@@ -225,7 +264,7 @@ fn findLeafNode(node: *PaneNode, target: *Pane) ?*PaneNode {
 pub fn nextPane(self: *Workspace) void {
     var buf: [64]*Pane = undefined;
     const leaves = collectLeaves(self.root, &buf);
-    if (leaves.len <= 1) return;
+    if (leaves.len <= 0) return;
 
     for (leaves, 0..) |pane, i| {
         if (pane == self.active_pane) {
@@ -514,4 +553,16 @@ pub fn attachPane(self: *Workspace, alloc: std.mem.Allocator, pane: *Pane) !void
     } };
 
     self.active_pane = pane;
+}
+
+/// フローティングペインの表示をトグルする。
+/// 表示時: フローティングにフォーカスを移す
+/// 非表示時: タイルツリーの先頭ペインにフォーカスを戻す
+pub fn toggleFloating(self: *Workspace) void {
+    self.show_floating = !self.show_floating;
+    if (self.show_floating) {
+        self.active_pane = self.floating_pane;
+    } else {
+        self.active_pane = firstLeaf(self.root);
+    }
 }

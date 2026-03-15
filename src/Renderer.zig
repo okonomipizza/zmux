@@ -68,6 +68,11 @@ pub fn renderAll(
     // 境界線描画
     try self.drawBorders(workspace, writer);
 
+    // ── フローティングペインの描画（新規） ──
+    if (workspace.show_floating) {
+        try self.renderFloatingPane(workspace.floating_pane, workspace.active_pane == workspace.floating_pane, writer);
+    }
+
     try StatusBar.render(wm, status_row, self.term_cols, writer);
 
     // アクティブペインのカーソル位置を反映
@@ -109,7 +114,6 @@ fn renderPane(
             // wide_char の右側部分はスキップ
             if (cell.wide == .spacer_tail) continue;
 
-            //
             const current: Cell = .{
                 .codepoint = cell.codepoint(),
                 .wide = @intFromEnum(cell.wide),
@@ -351,4 +355,111 @@ pub fn invalidate(self: *Renderer) void {
     @memset(self.prev_cells, .{
         .codepoint = std.math.maxInt(u21), // 全セルを「前回と違う」状態にする
     });
+}
+pub fn renderFloatingOnly(
+    self: *Renderer,
+    workspace: *Workspace,
+    wm: *WorkspaceManager,
+    status_row: u16,
+    writer: anytype,
+) !void {
+    try writer.writeAll("\x1b[?25l");
+
+    if (workspace.show_floating) {
+        try self.renderFloatingPane(
+            workspace.floating_pane,
+            workspace.active_pane == workspace.floating_pane,
+            writer,
+        );
+    }
+
+    try StatusBar.render(wm, status_row, self.term_cols, writer);
+
+    const active = workspace.activePane();
+    const screen = active.terminal.screens.active;
+    try writer.print("\x1b[{d};{d}H", .{
+        active.y + screen.cursor.y + 1,
+        active.x + screen.cursor.x + 1,
+    });
+
+    try writer.writeAll("\x1b[?25h");
+}
+
+fn renderFloatingPane(
+    self: *Renderer,
+    pane: *Pane,
+    is_active: bool,
+    writer: anytype,
+) !void {
+    // 枠線の座標（ペイン領域の1セル外側）
+    const bx = if (pane.x > 0) pane.x - 1 else 0;
+    const by = if (pane.y > 0) pane.y - 1 else 0;
+    const inner_cols = pane.cols;
+    const inner_rows = pane.rows;
+
+    // 枠の色: アクティブなら明るい色、非アクティブなら暗い色
+    const border_style: []const u8 = if (is_active) "\x1b[1;36m" else "\x1b[0;90m";
+
+    // ── 上辺 ──
+    if (by < self.term_rows) {
+        try writer.print("\x1b[{d};{d}H{s}┌", .{ by + 1, bx + 1, border_style });
+        for (0..inner_cols) |_| {
+            try writer.writeAll("─");
+        }
+        try writer.writeAll("┐");
+
+        // prev_cells を枠線で上書き（差分描画が枠を消さないように）
+        if (bx < self.term_cols) {
+            self.prevCell(bx, by).* = .{ .codepoint = std.math.maxInt(u21) };
+        }
+        for (0..inner_cols) |ci| {
+            const cx = pane.x + @as(u16, @intCast(ci));
+            if (cx < self.term_cols and by < self.term_rows) {
+                self.prevCell(cx, by).* = .{ .codepoint = std.math.maxInt(u21) };
+            }
+        }
+    }
+
+    // ── 側面 + ペイン内容 ──
+    for (0..inner_rows) |row_i| {
+        const ry = pane.y + @as(u16, @intCast(row_i));
+        if (ry >= self.term_rows) break;
+
+        // 左枠
+        if (bx < self.term_cols) {
+            try writer.print("\x1b[{d};{d}H{s}│", .{ ry + 1, bx + 1, border_style });
+            self.prevCell(bx, ry).* = .{ .codepoint = std.math.maxInt(u21) };
+        }
+
+        // 右枠
+        const rx = pane.x + inner_cols;
+        if (rx < self.term_cols) {
+            try writer.print("\x1b[{d};{d}H{s}│", .{ ry + 1, rx + 1, border_style });
+            self.prevCell(rx, ry).* = .{ .codepoint = std.math.maxInt(u21) };
+        }
+    }
+
+    // ── 下辺 ──
+    const bottom_y = pane.y + inner_rows;
+    if (bottom_y < self.term_rows) {
+        try writer.print("\x1b[{d};{d}H{s}└", .{ bottom_y + 1, bx + 1, border_style });
+        for (0..inner_cols) |_| {
+            try writer.writeAll("─");
+        }
+        try writer.writeAll("┘");
+
+        if (bx < self.term_cols) {
+            self.prevCell(bx, bottom_y).* = .{ .codepoint = std.math.maxInt(u21) };
+        }
+        for (0..inner_cols) |ci| {
+            const cx = pane.x + @as(u16, @intCast(ci));
+            if (cx < self.term_cols and bottom_y < self.term_rows) {
+                self.prevCell(cx, bottom_y).* = .{ .codepoint = std.math.maxInt(u21) };
+            }
+        }
+    }
+
+    // ── ペイン内容を描画 ──
+    try writer.writeAll("\x1b[0m");
+    try self.renderPane(pane, writer);
 }
