@@ -117,7 +117,9 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
     var events: [16]c.epoll_event = undefined;
     var buf: [BUF_SIZE]u8 = undefined;
+
     var prefix_mode: bool = false;
+    var move_pane_mode: bool = false;
 
     while (true) {
         const n = c.epoll_wait(epoll_fd, &events, @intCast(events.len), -1);
@@ -137,12 +139,27 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                     prefix_mode = true;
                     continue;
                 }
-
+                if (move_pane_mode) {
+                    move_pane_mode = false;
+                    if (input.len == 1 and input[0] >= '1' and input[0] <= '9') {
+                        const target_idx: usize = input[0] - '1';
+                        workspace_manager.movePaneToWorkspace(alloc, target_idx) catch {
+                            continue;
+                        };
+                        active_workspace = workspace_manager.getActiveWorkspace() orelse return;
+                        try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                    }
+                    continue;
+                }
                 if (prefix_mode) {
                     prefix_mode = false;
                     switch (input[0]) {
                         '\r' => {
                             // enter でprefix modeから抜ける
+                        },
+                        'm' => {
+                            move_pane_mode = true;
+                            // prefix_mode は false のまま（次の入力を move_pane_mode で処理）
                         },
                         'n' => {
                             try workspace_manager.appendWorkspace(alloc);

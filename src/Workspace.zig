@@ -440,3 +440,78 @@ fn swapLeafPointers(node: *PaneNode, a: *Pane, b: *Pane) void {
         },
     }
 }
+
+/// アクティブペインをツリーから切り離して返す。
+/// Pane 自体は deinit しない（別ワークスペースで再利用するため）。
+/// ルートが leaf（ペインが1つだけ）の場合は null を返す。
+/// → 呼び出し側で extractLastPane を使うこと。
+pub fn detachPane(self: *Workspace, alloc: std.mem.Allocator) !?*Pane {
+    const target = self.active_pane;
+
+    // ペインが1つだけの場合は特別処理が必要
+    if (self.root.* == .leaf) {
+        return null;
+    }
+
+    const result = findParentSplit(self.root, target) orelse return error.ActivePaneLost;
+    const parent = result.parent;
+    const sibling = result.sibling;
+    const closing_node = result.closing;
+
+    // PaneNode だけ解放。Pane 自体は移動先で使うので解放しない。
+    alloc.destroy(closing_node);
+
+    // 兄弟ノードで親を上書き
+    const sibling_copy = sibling.*;
+    alloc.destroy(sibling);
+    parent.* = sibling_copy;
+
+    // 再レイアウト
+    try relayout(alloc, self.root, self.cols, self.rows, 0, 0);
+
+    // アクティブペインを残ったツリーの先頭に更新
+    self.active_pane = firstLeaf(parent);
+
+    return target;
+}
+
+/// ルートが leaf 1つだけの場合に、そのペインを取り出す。
+/// 呼び出し後、このワークスペースは無効になるため削除すること。
+pub fn extractLastPane(self: *Workspace) *Pane {
+    return self.root.leaf;
+}
+
+/// 外部から渡されたペインをこのワークスペースに挿入する。
+/// 既存ツリーの右側に vertical split で追加する。
+pub fn attachPane(self: *Workspace, alloc: std.mem.Allocator, pane: *Pane) !void {
+    const new_cols = self.cols / 2;
+    const first_cols = self.cols - new_cols - 1; // 1 は境界線
+
+    // 挿入するペインの位置・サイズを設定
+    pane.x = first_cols + 1;
+    pane.y = 0;
+    try pane.resize(alloc, new_cols, self.rows);
+
+    // 既存ツリーをリサイズ
+    try relayout(alloc, self.root, first_cols, self.rows, 0, 0);
+
+    // 新しい leaf ノード
+    const new_leaf = try alloc.create(PaneNode);
+    errdefer alloc.destroy(new_leaf);
+    new_leaf.* = .{ .leaf = pane };
+
+    // 既存ルートを first 側に退避
+    const old_root = try alloc.create(PaneNode);
+    errdefer alloc.destroy(old_root);
+    old_root.* = self.root.*;
+
+    // ルートを split に書き換え
+    self.root.* = .{ .split = .{
+        .dir = .vertical,
+        .ratio = 0.5,
+        .first = old_root,
+        .second = new_leaf,
+    } };
+
+    self.active_pane = pane;
+}
