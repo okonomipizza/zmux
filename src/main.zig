@@ -176,7 +176,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                                 try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                             }
                         },
-                        'v' => {
+                        '|' => {
                             const new_fd = try active_workspace.splitPane(alloc, .vertical);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
@@ -200,6 +200,36 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                         'k' => {
                             active_workspace.prevPane();
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            prefix_mode = true;
+                        },
+                        '>' => {
+                            try active_workspace.resizePane(alloc, 0.05);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            prefix_mode = true;
+                        },
+                        '<' => {
+                            try active_workspace.resizePane(alloc, -0.05);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            prefix_mode = true;
+                        },
+                        'J' => {
+                            try active_workspace.swapPane(alloc, .down);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            prefix_mode = true;
+                        },
+                        'H' => {
+                            try active_workspace.swapPane(alloc, .left);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            prefix_mode = true;
+                        },
+                        'L' => {
+                            try active_workspace.swapPane(alloc, .right);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            prefix_mode = true;
+                        },
+                        'K' => {
+                            try active_workspace.swapPane(alloc, .up);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                             prefix_mode = true;
                         },
                         'q' => {

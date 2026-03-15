@@ -57,6 +57,7 @@ pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16, termios: c.termios) 
 
 pub fn deinit(self: *Workspace, alloc: std.mem.Allocator) void {
     self.root.deinit(alloc);
+    alloc.destroy(self.root);
 }
 
 fn deinitPanes(node: *PaneNode) void {
@@ -321,4 +322,121 @@ fn calcNewPaneSize(x: u16, y: u16, cols: u16, rows: u16, dir: SplitDir) !NewPane
             };
         },
     };
+}
+
+/// アクティブペインの親splitのratioを調整してリサイズ
+pub fn resizePane(self: *Workspace, alloc: std.mem.Allocator, delta: f32) !void {
+    const info = findParentOf(self.root, self.active_pane) orelse return;
+
+    switch (info.parent.*) {
+        .split => |*s| {
+            if (info.is_first) {
+                s.ratio = std.math.clamp(s.ratio + delta, 0.1, 0.9);
+            } else {
+                s.ratio = std.math.clamp(s.ratio - delta, 0.1, 0.9);
+            }
+        },
+        .leaf => return,
+    }
+
+    try relayout(alloc, self.root, self.cols, self.rows, 0, 0);
+}
+
+const ParentInfo = struct {
+    parent: *PaneNode,
+    is_first: bool,
+};
+
+fn findParentOf(node: *PaneNode, target: *Pane) ?ParentInfo {
+    switch (node.*) {
+        .leaf => return null,
+        .split => |s| {
+            if (s.first.* == .leaf and s.first.leaf == target)
+                return .{ .parent = node, .is_first = true };
+            if (s.second.* == .leaf and s.second.leaf == target)
+                return .{ .parent = node, .is_first = false };
+            return findParentOf(s.first, target) orelse findParentOf(s.second, target);
+        },
+    }
+}
+
+const Direction = enum { left, right, up, down };
+
+pub fn swapPane(self: *Workspace, alloc: std.mem.Allocator, dir: Direction) !void {
+    const active = self.active_pane;
+    const target = findAdjacentPane(self.root, active, dir) orelse return;
+
+    // 座標とサイズを入れ替え
+    const tmp_x = active.x;
+    const tmp_y = active.y;
+    const tmp_cols = active.cols;
+    const tmp_rows = active.rows;
+
+    active.x = target.x;
+    active.y = target.y;
+    try active.resize(alloc, target.cols, target.rows);
+
+    target.x = tmp_x;
+    target.y = tmp_y;
+    try target.resize(alloc, tmp_cols, tmp_rows);
+
+    // ツリー内のポインタも入れ替え
+    swapLeafPointers(self.root, active, target);
+}
+
+fn findAdjacentPane(root: *PaneNode, active: *Pane, dir: Direction) ?*Pane {
+    var buf: [64]*Pane = undefined;
+    const leaves = collectLeaves(root, &buf);
+
+    var best: ?*Pane = null;
+    var best_dist: u32 = std.math.maxInt(u32);
+
+    // アクティブペインの中心座標を求める
+    const ax = @as(i32, active.x) + @divTrunc(@as(i32, active.cols), 2);
+    const ay = @as(i32, active.y) + @divTrunc(@as(i32, active.rows), 2);
+
+    for (leaves) |pane| {
+        if (pane == active) continue;
+
+        // 調査中のペインの中心座標を求める
+        const px = @as(i32, pane.x) + @divTrunc(@as(i32, pane.cols), 2);
+        const py = @as(i32, pane.y) + @divTrunc(@as(i32, pane.rows), 2);
+        // 中心座標の差を求める
+        const dx = px - ax;
+        const dy = py - ay;
+
+        // 方向に合致するか
+        const valid = switch (dir) {
+            .right => dx > 0,
+            .left => dx < 0,
+            .down => dy > 0,
+            .up => dy < 0,
+        };
+        if (!valid) continue;
+
+        // 主軸の距離 + 副軸のずれをペナルティとして加算
+        const dist = switch (dir) {
+            .right, .left => @abs(dx) + @abs(dy) * 2,
+            .down, .up => @abs(dy) + @abs(dx) * 2,
+        };
+
+        // もっとも近いものを返す
+        if (dist < best_dist) {
+            best_dist = dist;
+            best = pane;
+        }
+    }
+    return best;
+}
+
+fn swapLeafPointers(node: *PaneNode, a: *Pane, b: *Pane) void {
+    switch (node.*) {
+        .leaf => |*pane_ptr| {
+            if (pane_ptr.* == a) pane_ptr.* = b else if (pane_ptr.* == b) pane_ptr.* = a;
+        },
+        .split => |s| {
+            swapLeafPointers(s.first, a, b);
+            swapLeafPointers(s.second, a, b);
+        },
+    }
 }
