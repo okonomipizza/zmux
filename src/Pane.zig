@@ -63,14 +63,27 @@ pub fn resize(
 }
 
 pub fn activate(self: *Pane, writer: *std.Io.Writer) !void {
-    // スクロール領域を設定（上端y 〜 下端y+rows-1）
-    try writer.print("\x1b[{d};{d}r", .{ self.y, self.y + self.rows - 1 });
-    // カーソルをペインの左上へ
-    try writer.print("\x1b[{d};{d}H", .{ self.y, self.x });
+    // スクロール領域を設定
+    try writer.print("\x1b[{d};{d}r", .{ self.y + 1, self.y + self.rows });
 
-    try writer.flush();
+    self.terminal.restoreCursor();
+
+    const screen = self.terminal.screens.active;
+
+    // カーソルをペインの左上へ
+    try writer.print("\x1b[{d};{d}H", .{
+        self.y + 1 + screen.cursor.y,
+        self.x + 1 + screen.cursor.x,
+    });
+
+    // try writer.flush();
 
     self.is_active = true;
+}
+
+pub fn deactivate(self: *Pane) void {
+    self.terminal.saveCursor();
+    self.is_active = false;
 }
 
 /// ペインの境界線を描画（縦線）

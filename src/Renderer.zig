@@ -16,9 +16,13 @@ const Cell = struct {
     content_tag: u2 = 0,
 };
 
+// Cell state
 prev_cells: []Cell,
+// Terminal width
 term_cols: u16,
+// Terminal height
 term_rows: u16,
+
 alloc: std.mem.Allocator,
 
 pub fn init(
@@ -43,11 +47,12 @@ pub fn deinit(self: *Renderer) void {
     self.alloc.free(self.prev_cells);
 }
 
+// Returns a reference to the previous cell at the given position (x, y)
 fn prevCell(self: *Renderer, x: u16, y: u16) *Cell {
     return &self.prev_cells[@as(usize, y) * self.term_cols + x];
 }
 
-/// 全ペインの差分を描画する
+/// Renders the differences for all panes held by the active workspace.
 pub fn renderAll(
     self: *Renderer,
     workspace: *Workspace,
@@ -55,9 +60,10 @@ pub fn renderAll(
     status_row: u16,
     writer: anytype,
 ) !void {
-    // ちらつき防止：カーソル非表示
+    // Hide the cursor
     try writer.writeAll("\x1b[?25l");
 
+    // TODO Consider appropriate maximum number of panes
     var buf: [64]*Pane = undefined;
     const panes = workspace.getPanes(&buf);
 
@@ -65,17 +71,16 @@ pub fn renderAll(
         try self.renderPane(pane, writer);
     }
 
-    // 境界線描画
     try self.drawBorders(workspace, writer);
 
-    // ── フローティングペインの描画（新規） ──
     if (workspace.show_floating) {
         try self.renderFloatingPane(workspace.floating_pane, workspace.active_pane == workspace.floating_pane, writer);
     }
 
+    // Render status bar at the bottom of floor
     try StatusBar.render(wm, status_row, self.term_cols, writer);
 
-    // アクティブペインのカーソル位置を反映
+    // Move the cursor to saved position
     const active = workspace.activePane();
     const screen = active.terminal.screens.active;
     try writer.print("\x1b[{d};{d}H", .{
@@ -83,7 +88,7 @@ pub fn renderAll(
         active.x + screen.cursor.x + 1,
     });
 
-    // カーソル再表示
+    // Show the cursor
     try writer.writeAll("\x1b[?25h");
 }
 
@@ -105,13 +110,13 @@ fn renderPane(
             }) orelse continue;
             const cell = lc.cell;
 
-            // 画面上の絶対座標を計算
+            // Calculate absolute position
             const abs_x: u16 = pane.x + @as(u16, @intCast(col));
             const abs_y: u16 = pane.y + @as(u16, @intCast(row));
 
             if (abs_x >= self.term_cols or abs_y >= self.term_rows) continue;
 
-            // wide_char の右側部分はスキップ
+            // For wide-width characters
             if (cell.wide == .spacer_tail) continue;
 
             const current: Cell = .{
@@ -124,11 +129,11 @@ fn renderPane(
                 .b = if (cell.content_tag == .bg_color_rgb) cell.content.color_rgb.b else 0,
             };
 
-            // 前のフレームから変更がなければ何もしない
+            // Handling the case where no changes have occurred.
             const prev = self.prevCell(abs_x, abs_y);
             if (std.meta.eql(current, prev.*)) continue;
 
-            // カーソル移動
+            // Move cursor
             try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
 
             if (cell.style_id != prev_style_id) {
@@ -151,7 +156,6 @@ fn renderPane(
                         };
                         try writer.writeAll(buf[0..len]);
 
-                        // grapheme の追加コードポイントも出力
                         if (cell.content_tag == .codepoint_grapheme) {
                             const page = &lc.node.data;
                             if (page.lookupGrapheme(cell)) |cps| {
@@ -184,7 +188,6 @@ fn writeStyle(
     page: anytype,
     style_id: u16,
 ) !void {
-    // まずリセット
     try writer.writeAll("\x1b[0");
 
     if (style_id == 0) {
@@ -203,7 +206,6 @@ fn writeStyle(
     if (s.flags.invisible) try writer.writeAll(";8");
     if (s.flags.strikethrough) try writer.writeAll(";9");
 
-    // 前景色
     switch (s.fg_color) {
         .none => {},
         .palette => |idx| {
@@ -218,7 +220,6 @@ fn writeStyle(
         .rgb => |rgb| try writer.print(";38;2;{d};{d};{d}", .{ rgb.r, rgb.g, rgb.b }),
     }
 
-    // 背景色
     switch (s.bg_color) {
         .none => {},
         .palette => |idx| {
@@ -250,7 +251,7 @@ fn drawBorders(
     const H = self.term_rows;
     const size = @as(usize, W) * @as(usize, H);
 
-    // 各セルに直接 UP/DOWN/LEFT/RIGHT を蓄積する
+    // Accumulate UP/DOWN/LEFT/RIGHT flags directory into each cell
     var border = try self.alloc.alloc(u8, size);
     defer self.alloc.free(border);
     @memset(border, 0);
@@ -259,7 +260,7 @@ fn drawBorders(
     const panes = workspace.getPanes(&buf);
 
     for (panes) |pane| {
-        // 左辺の縦線: 各セルから上下に接続
+        // Left vertical border: connect each cell upward and downward
         if (pane.x > 0) {
             const bx = pane.x - 1;
             for (0..pane.rows) |row| {
@@ -273,7 +274,7 @@ fn drawBorders(
                 }
             }
         }
-        // 上辺の横線: 各セルから左右に接続
+        // Top horizontal border: connect each cell leftward and rightward
         if (pane.y > 0) {
             const by = pane.y - 1;
             for (0..pane.cols) |col| {
@@ -286,7 +287,7 @@ fn drawBorders(
                 }
             }
         }
-        // 交差点: 左上角（右と下に線が伸びる）
+        // Corner intersections: top-left corner (line extends right and down)
         if (pane.x > 0 and pane.y > 0) {
             const cx = pane.x - 1;
             const cy = pane.y - 1;
@@ -294,7 +295,7 @@ fn drawBorders(
                 border[@as(usize, cy) * W + cx] |= RIGHT | DOWN;
             }
         }
-        // 右上角（左と下に線が伸びる）
+        // Top-right corner (line extends left and down)
         if (pane.x + pane.cols < W and pane.y > 0) {
             const cx = pane.x + pane.cols;
             const cy = pane.y - 1;
@@ -302,7 +303,7 @@ fn drawBorders(
                 border[@as(usize, cy) * W + cx] |= LEFT | DOWN;
             }
         }
-        // 左下角（右と上に線が伸びる）
+        // Bottom-left corner (line extends right and up)
         if (pane.x > 0 and pane.y + pane.rows < H) {
             const cx = pane.x - 1;
             const cy = pane.y + pane.rows;
@@ -310,7 +311,7 @@ fn drawBorders(
                 border[@as(usize, cy) * W + cx] |= RIGHT | UP;
             }
         }
-        // 右下角（左と上に線が伸びる）
+        // Bottom-right corner (line extends left and up)
         if (pane.x + pane.cols < W and pane.y + pane.rows < H) {
             const cx = pane.x + pane.cols;
             const cy = pane.y + pane.rows;
@@ -351,11 +352,13 @@ fn drawBorders(
     }
 }
 
+/// Make all cells as dirty so they will be redrawn on the next render pass
 pub fn invalidate(self: *Renderer) void {
     @memset(self.prev_cells, .{
-        .codepoint = std.math.maxInt(u21), // 全セルを「前回と違う」状態にする
+        .codepoint = std.math.maxInt(u21),
     });
 }
+
 pub fn renderFloatingOnly(
     self: *Renderer,
     workspace: *Workspace,
@@ -391,16 +394,16 @@ fn renderFloatingPane(
     is_active: bool,
     writer: anytype,
 ) !void {
-    // 枠線の座標（ペイン領域の1セル外側）
+    // Border coordinates (one cell outside the pane area)
     const bx = if (pane.x > 0) pane.x - 1 else 0;
     const by = if (pane.y > 0) pane.y - 1 else 0;
     const inner_cols = pane.cols;
     const inner_rows = pane.rows;
 
-    // 枠の色: アクティブなら明るい色、非アクティブなら暗い色
+    // Border color: bright when active, dim when inactive
     const border_style: []const u8 = if (is_active) "\x1b[1;36m" else "\x1b[0;90m";
 
-    // ── 上辺 ──
+    // ── Top edge ──
     if (by < self.term_rows) {
         try writer.print("\x1b[{d};{d}H{s}┌", .{ by + 1, bx + 1, border_style });
         for (0..inner_cols) |_| {
@@ -408,7 +411,7 @@ fn renderFloatingPane(
         }
         try writer.writeAll("┐");
 
-        // prev_cells を枠線で上書き（差分描画が枠を消さないように）
+        // Overwrite prev_cells with border chars so the diff renderer doeson't erase them
         if (bx < self.term_cols) {
             self.prevCell(bx, by).* = .{ .codepoint = std.math.maxInt(u21) };
         }
@@ -420,18 +423,18 @@ fn renderFloatingPane(
         }
     }
 
-    // ── 側面 + ペイン内容 ──
+    // ── Sides + pane content ──
     for (0..inner_rows) |row_i| {
         const ry = pane.y + @as(u16, @intCast(row_i));
         if (ry >= self.term_rows) break;
 
-        // 左枠
+        // Left border
         if (bx < self.term_cols) {
             try writer.print("\x1b[{d};{d}H{s}│", .{ ry + 1, bx + 1, border_style });
             self.prevCell(bx, ry).* = .{ .codepoint = std.math.maxInt(u21) };
         }
 
-        // 右枠
+        // Right border
         const rx = pane.x + inner_cols;
         if (rx < self.term_cols) {
             try writer.print("\x1b[{d};{d}H{s}│", .{ ry + 1, rx + 1, border_style });
@@ -439,7 +442,7 @@ fn renderFloatingPane(
         }
     }
 
-    // ── 下辺 ──
+    // ── Bottom edge ──
     const bottom_y = pane.y + inner_rows;
     if (bottom_y < self.term_rows) {
         try writer.print("\x1b[{d};{d}H{s}└", .{ bottom_y + 1, bx + 1, border_style });
@@ -459,7 +462,7 @@ fn renderFloatingPane(
         }
     }
 
-    // ── ペイン内容を描画 ──
+    // ── Render pane content ──
     try writer.writeAll("\x1b[0m");
     try self.renderPane(pane, writer);
 }
