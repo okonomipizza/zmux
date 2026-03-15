@@ -121,6 +121,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
     var prefix_mode: bool = false;
     var move_pane_mode: bool = false;
+    var scroll_mode: bool = false;
 
     while (true) {
         const n = c.epoll_wait(epoll_fd, &events, @intCast(events.len), -1);
@@ -138,6 +139,23 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                 // Ctrl-b (0x02)
                 if (input.len == 1 and input[0] == 0x02) {
                     prefix_mode = true;
+                    continue;
+                }
+                if (scroll_mode) {
+                    switch (input[0]) {
+                        '\r' => {
+                            scroll_mode = false;
+                        },
+                        'j' => {
+                            workspace_manager.getActiveWorkspace().?.active_pane.terminal.scrollViewport(.{ .delta = 1 });
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                        },
+                        'k' => {
+                            workspace_manager.getActiveWorkspace().?.active_pane.terminal.scrollViewport(.{ .delta = -1 });
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                        },
+                        else => {},
+                    }
                     continue;
                 }
                 if (move_pane_mode) {
@@ -172,6 +190,9 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);
 
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                        },
+                        's' => {
+                            scroll_mode = true;
                         },
                         'f' => {
                             active_workspace.toggleFloating();

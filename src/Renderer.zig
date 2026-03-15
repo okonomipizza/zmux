@@ -98,7 +98,7 @@ fn renderPane(
     for (0..pane.rows) |row| {
         for (0..pane.cols) |col| {
             const lc = screen.pages.getCell(.{
-                .active = .{
+                .viewport = .{
                     .x = @intCast(col),
                     .y = @intCast(row),
                 },
