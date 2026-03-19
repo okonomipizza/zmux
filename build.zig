@@ -30,6 +30,10 @@ pub fn build(b: *std.Build) void {
         );
     }
 
+    if (b.lazyDependency("clap", .{})) |dep| {
+        exe_mod.addImport("clap", dep.module("clap"));
+    }
+
     const exe = b.addExecutable(.{
         .name = "zmux",
         .root_module = exe_mod,

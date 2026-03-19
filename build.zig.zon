@@ -2,11 +2,11 @@
     .name = .zmux,
     .version = "0.0.0",
     .fingerprint = 0x695fb32a8a8724f6, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.16.0-dev.2694+74f361a5c",
+    .minimum_zig_version = "0.15.1",
     .dependencies = .{
         .clap = .{
-            .url = "git+https://github.com/Hejsil/zig-clap#27621cb7207643f914bae7b01902b22a8b5916e7",
-            .hash = "clap-0.11.0-oBajBxDoAQChQCl4LRM4tyf-VChKLbhYilS806xxzxrQ",
+            .url = "git+https://github.com/Hejsil/zig-clap?ref=0.11.0#5289e0753cd274d65344bef1c114284c633536ea",
+            .hash = "clap-0.11.0-oBajB-HnAQDPCKYzwF7rO3qDFwRcD39Q0DALlTSz5H7e",
         },
         .ghostty = .{
             .url = "https://github.com/ghostty-org/ghostty/archive/refs/tags/v1.3.1.tar.gz",

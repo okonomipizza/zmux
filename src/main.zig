@@ -4,6 +4,9 @@ const posix = std.posix;
 
 const zmux = @import("zmux");
 const ghostty_vt = @import("ghostty-vt");
+const clap = @import("clap");
+
+const version = "0.0.0";
 
 const Renderer = @import("Renderer.zig");
 
@@ -70,6 +73,27 @@ pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
+
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help     Display this help and exit.
+        \\-v, --version  Output version information and exit.
+        \\
+    );
+
+    var res = try clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .allocator = alloc,
+    });
+    defer res.deinit();
+
+    if (res.args.help != 0) {
+        return clap.helpToFile(std.fs.File.stderr(), clap.Help, &params, .{});
+    }
+
+    if (res.args.version != 0) {
+        const stderr = std.fs.File.stderr();
+        try stderr.writeAll("zmux " ++ version ++ "\n");
+        return;
+    }
 
     try spawnServer(alloc);
 }
