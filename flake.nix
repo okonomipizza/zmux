@@ -38,6 +38,10 @@
             zls = zls.packages.${system}.zls;
           };
 
+          packages.${system}.default = pkgs.callPackage ./nix/packages.nix {
+            zig = zig.packages.${system}."0.15.2";
+          };
+
           formatter.${system} = pkgs.alejandra;
         }
       ) (builtins.attrNames zig.packages)

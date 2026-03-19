@@ -233,7 +233,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             }
                         },
                         // ----- Pane control -----
-                        '|' => {
+                        '\\' => {
                             const new_fd = try active_workspace.splitPane(alloc, .vertical);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
