@@ -116,9 +116,6 @@ fn renderPane(
 
             if (abs_x >= self.term_cols or abs_y >= self.term_rows) continue;
 
-            // For wide-width characters
-            if (cell.wide == .spacer_tail) continue;
-
             const current: Cell = .{
                 .codepoint = cell.codepoint(),
                 .wide = @intFromEnum(cell.wide),
@@ -129,8 +126,17 @@ fn renderPane(
                 .b = if (cell.content_tag == .bg_color_rgb) cell.content.color_rgb.b else 0,
             };
 
-            // Handling the case where no changes have occurred.
             const prev = self.prevCell(abs_x, abs_y);
+
+            // For wide-width spacer cells: update state tracking but don't render.
+            // Without this, prev_cells falls out of sync when a spacer_tail replaces
+            // a regular character, causing stale content to not be redrawn later.
+            if (cell.wide == .spacer_tail) {
+                prev.* = current;
+                continue;
+            }
+
+            // Handling the case where no changes have occurred.
             if (std.meta.eql(current, prev.*)) continue;
 
             // Move cursor

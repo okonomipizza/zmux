@@ -41,6 +41,7 @@ pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16, termios: c.termios) 
     const pane = try alloc.create(Pane);
     errdefer alloc.destroy(pane);
     pane.* = try Pane.init(alloc, termios, 0, 0, cols, rows);
+    pane.vt_stream = pane.terminal.vtStream();
 
     const floating_geometry = calcFloatingGeometry(cols, rows);
 
@@ -54,6 +55,7 @@ pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16, termios: c.termios) 
         floating_geometry.cols,
         floating_geometry.rows,
     );
+    floating_pane.vt_stream = floating_pane.terminal.vtStream();
 
     const root = try alloc.create(PaneNode);
     errdefer alloc.destroy(root);
@@ -142,6 +144,7 @@ pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_i
     const new_pane = try alloc.create(Pane);
     errdefer alloc.destroy(new_pane);
     new_pane.* = try Pane.init(alloc, self.termios, new_size.x, new_size.y, new_size.cols, new_size.rows);
+    new_pane.vt_stream = new_pane.terminal.vtStream();
 
     // 子ノードを作成
     const first_node = try alloc.create(PaneNode);
