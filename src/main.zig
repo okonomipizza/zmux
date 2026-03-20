@@ -302,11 +302,13 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                                     alloc.free(t);
                                 }
                             }
+                            pane.terminal.scrollViewport(.{ .bottom = {} });
                             copy_mode_state = null;
                             try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
                             continue;
                         },
                         'q', 0x1b => { // q or Escape
+                            pane.terminal.scrollViewport(.{ .bottom = {} });
                             copy_mode_state = null;
                             try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
                             continue;
@@ -534,9 +536,10 @@ fn refreshScreenCopyMode(
 ) !void {
     fbs.reset();
     const writer = fbs.writer();
-    renderer.invalidate();
+    const pane = active_workspace.activePane();
+    renderer.invalidateRect(pane.x, pane.y, pane.cols, pane.rows);
     try renderer.renderAll(active_workspace, workspace_manager, original_rows, writer, "COPY");
-    try renderer.renderCopyModeOverlay(active_workspace.activePane(), cm, writer);
+    try renderer.renderCopyModeOverlay(pane, cm, writer);
     try stdout_file.writeAll(fbs.getWritten());
 }
 

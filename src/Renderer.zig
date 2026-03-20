@@ -414,6 +414,18 @@ pub fn invalidate(self: *Renderer) void {
     });
 }
 
+/// Invalidate only the cells within a specific rectangular region
+pub fn invalidateRect(self: *Renderer, x: u16, y: u16, cols: u16, rows: u16) void {
+    const dirty: Cell = .{ .codepoint = std.math.maxInt(u21) };
+    for (y..y + rows) |row| {
+        if (row >= self.term_rows) break;
+        for (x..x + cols) |col| {
+            if (col >= self.term_cols) break;
+            self.prev_cells[row * self.term_cols + col] = dirty;
+        }
+    }
+}
+
 pub fn renderFloatingOnly(
     self: *Renderer,
     workspace: *Workspace,
