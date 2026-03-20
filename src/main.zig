@@ -235,16 +235,17 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                         '\r' => {
                             // enter key deactivates scroll mode
                             scroll_mode = false;
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
                         },
                         'j' => {
                             // Scroll down
                             workspace_manager.getActiveWorkspace().?.active_pane.terminal.scrollViewport(.{ .delta = 1 });
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "SCROLL");
                         },
                         'k' => {
                             // Scroll up
                             workspace_manager.getActiveWorkspace().?.active_pane.terminal.scrollViewport(.{ .delta = -1 });
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "SCROLL");
                         },
                         else => {},
                     }
@@ -260,7 +261,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             continue;
                         };
                         active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-                        try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                        try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                     }
                     continue;
                 }
@@ -296,12 +297,12 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                                 }
                             }
                             copy_mode_state = null;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
                             continue;
                         },
                         'q', 0x1b => { // q or Escape
                             copy_mode_state = null;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
                             continue;
                         },
                         else => {},
@@ -321,10 +322,12 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                         'm' => {
                             // Activate move_pane mode
                             move_pane_mode = true;
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "MOVE");
                         },
                         's' => {
                             // Activate scroll_mode
                             scroll_mode = true;
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "SCROLL");
                         },
                         'c' => {
                             const pane = active_workspace.activePane();
@@ -350,23 +353,23 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                                 try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
                                 try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);
 
-                                try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                                try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                             }
                         },
                         'f' => {
                             active_workspace.toggleFloating();
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                         },
                         'i' => {
                             active_workspace = workspace_manager.nextWorkspace() orelse return;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
 
                             // Keep prefix mode active so workspace can be cycled with repeated presses
                             prefix_mode = true;
                         },
                         'u' => {
                             active_workspace = workspace_manager.prevWorkspace() orelse return;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
 
                             // Keep prefix mode active so workspace can be cycled with repeated presses
                             prefix_mode = true;
@@ -376,7 +379,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             if (idx < workspace_manager.workspaces.items.len) {
                                 workspace_manager.switchWorkspace(idx);
                                 active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-                                try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                                try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                             }
                         },
                         // ----- Pane control -----
@@ -384,67 +387,67 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             const new_fd = try active_workspace.splitPane(alloc, .vertical);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                         },
                         '-' => {
                             const new_fd = try active_workspace.splitPane(alloc, .horizontal);
                             try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
 
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                         },
                         'h' => {
                             active_workspace.focusPane(.left);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
                             prefix_mode = true;
                         },
                         'j' => {
                             active_workspace.focusPane(.down);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
                             prefix_mode = true;
                         },
                         'k' => {
                             active_workspace.focusPane(.up);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
                             prefix_mode = true;
                         },
                         'l' => {
                             active_workspace.focusPane(.right);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
                             prefix_mode = true;
                         },
                         'J' => {
                             try active_workspace.swapPane(alloc, .down);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
                             prefix_mode = true;
                         },
                         'H' => {
                             try active_workspace.swapPane(alloc, .left);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
                             prefix_mode = true;
                         },
                         'L' => {
                             try active_workspace.swapPane(alloc, .right);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
                             prefix_mode = true;
                         },
                         'K' => {
                             try active_workspace.swapPane(alloc, .up);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
                             prefix_mode = true;
                         },
                         '>' => {
                             try active_workspace.resizePane(alloc, 0.05);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
                             prefix_mode = true;
                         },
                         '<' => {
                             try active_workspace.resizePane(alloc, -0.05);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
                             prefix_mode = true;
                         },
                         'x' => {
                             try active_workspace.closePane(alloc);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
+                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
                         },
                         'q' => {
                             // exit zmux
@@ -471,10 +474,12 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
                 output_fbs.reset();
 
+                const pty_mode_label: ?[]const u8 = if (copy_mode_state != null) "COPY" else if (prefix_mode) "PREFIX" else if (scroll_mode) "SCROLL" else if (move_pane_mode) "MOVE" else null;
+
                 if (active_workspace.show_floating and pane == active_workspace.floating_pane) {
-                    try renderer.renderFloatingOnly(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                    try renderer.renderFloatingOnly(active_workspace, &workspace_manager, original_term.rows, buf_writer, pty_mode_label);
                 } else {
-                    try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer);
+                    try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer, pty_mode_label);
                 }
 
                 try stdout_file.writeAll(output_fbs.getWritten());
@@ -500,13 +505,14 @@ fn refreshScreen(
     original_rows: u16,
     stdout_file: std.fs.File,
     comptime clear: bool,
+    mode_label: ?[]const u8,
 ) !void {
     fbs.reset();
     if (clear) {
         fbs.writer().writeAll("\x1b[2J") catch {};
     }
     renderer.invalidate();
-    try renderer.renderAll(active_workspace, workspace_manager, original_rows, fbs.writer());
+    try renderer.renderAll(active_workspace, workspace_manager, original_rows, fbs.writer(), mode_label);
     try stdout_file.writeAll(fbs.getWritten());
 }
 
@@ -523,7 +529,7 @@ fn refreshScreenCopyMode(
     fbs.reset();
     const writer = fbs.writer();
     renderer.invalidate();
-    try renderer.renderAllWithMode(active_workspace, workspace_manager, original_rows, writer, "COPY");
+    try renderer.renderAll(active_workspace, workspace_manager, original_rows, writer, "COPY");
     try renderer.renderCopyModeOverlay(active_workspace.activePane(), cm, writer);
     try stdout_file.writeAll(fbs.getWritten());
 }

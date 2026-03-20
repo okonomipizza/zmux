@@ -60,8 +60,9 @@ pub fn renderAll(
     wm: *WorkspaceManager,
     status_row: u16,
     writer: anytype,
+    mode_label: ?[]const u8,
 ) !void {
-    try self.renderAllWithMode(workspace, wm, status_row, writer, null);
+    try self.renderAllWithMode(workspace, wm, status_row, writer, mode_label);
 }
 
 /// Renders all panes with an optional mode label on the status bar.
@@ -275,6 +276,11 @@ fn drawBorders(
     defer self.alloc.free(border);
     @memset(border, 0);
 
+    // Track which border cells are adjacent to the active pane
+    var active_border = try self.alloc.alloc(bool, size);
+    defer self.alloc.free(active_border);
+    @memset(active_border, false);
+
     var buf: [64]*Pane = undefined;
     const panes = workspace.getPanes(&buf);
 
@@ -340,6 +346,41 @@ fn drawBorders(
         }
     }
 
+    // Mark border cells adjacent to the active pane on all four sides
+    const ap = workspace.active_pane;
+    // Left border
+    if (ap.x > 0) {
+        const bx = ap.x - 1;
+        for (0..ap.rows) |row| {
+            const by = ap.y + @as(u16, @intCast(row));
+            if (by < H) active_border[@as(usize, by) * W + bx] = true;
+        }
+    }
+    // Right border
+    if (ap.x + ap.cols < W) {
+        const bx = ap.x + ap.cols;
+        for (0..ap.rows) |row| {
+            const by = ap.y + @as(u16, @intCast(row));
+            if (by < H) active_border[@as(usize, by) * W + bx] = true;
+        }
+    }
+    // Top border
+    if (ap.y > 0) {
+        const by = ap.y - 1;
+        for (0..ap.cols) |col| {
+            const bx = ap.x + @as(u16, @intCast(col));
+            if (bx < W) active_border[@as(usize, by) * W + bx] = true;
+        }
+    }
+    // Bottom border
+    if (ap.y + ap.rows < H) {
+        const by = ap.y + ap.rows;
+        for (0..ap.cols) |col| {
+            const bx = ap.x + @as(u16, @intCast(col));
+            if (bx < W) active_border[@as(usize, by) * W + bx] = true;
+        }
+    }
+
     for (0..H) |row| {
         for (0..W) |col| {
             const v = border[row * W + col];
@@ -362,9 +403,12 @@ fn drawBorders(
                 else => continue,
             };
 
-            try writer.print("\x1b[{d};{d}H\x1b[0m{s}", .{
+            const is_intersection = @popCount(v) >= 3;
+            const color: []const u8 = if (!is_intersection and active_border[row * W + col]) "\x1b[38;5;46m" else "\x1b[0;90m";
+            try writer.print("\x1b[{d};{d}H{s}{s}", .{
                 row + 1,
                 col + 1,
+                color,
                 ch,
             });
         }
@@ -384,6 +428,7 @@ pub fn renderFloatingOnly(
     wm: *WorkspaceManager,
     status_row: u16,
     writer: anytype,
+    mode_label: ?[]const u8,
 ) !void {
     try writer.writeAll("\x1b[?25l");
 
@@ -395,7 +440,7 @@ pub fn renderFloatingOnly(
         );
     }
 
-    try StatusBar.render(wm, status_row, self.term_cols, writer);
+    try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label);
 
     const active = workspace.activePane();
     const screen = active.terminal.screens.active;
