@@ -1,4 +1,5 @@
 const std = @import("std");
+const CopyMode = @import("CopyMode.zig");
 const Workspace = @import("Workspace.zig");
 const WorkspaceManager = @import("WorkspaceManager.zig");
 const Pane = @import("Pane.zig");
@@ -60,6 +61,18 @@ pub fn renderAll(
     status_row: u16,
     writer: anytype,
 ) !void {
+    try self.renderAllWithMode(workspace, wm, status_row, writer, null);
+}
+
+/// Renders all panes with an optional mode label on the status bar.
+pub fn renderAllWithMode(
+    self: *Renderer,
+    workspace: *Workspace,
+    wm: *WorkspaceManager,
+    status_row: u16,
+    writer: anytype,
+    mode_label: ?[]const u8,
+) !void {
     // Hide the cursor
     try writer.writeAll("\x1b[?25l");
 
@@ -78,7 +91,7 @@ pub fn renderAll(
     }
 
     // Render status bar at the bottom of floor
-    try StatusBar.render(wm, status_row, self.term_cols, writer);
+    try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label);
 
     // Move the cursor to saved position
     const active = workspace.activePane();
@@ -471,4 +484,101 @@ fn renderFloatingPane(
     // ── Render pane content ──
     try writer.writeAll("\x1b[0m");
     try self.renderPane(pane, writer);
+}
+
+/// Render copy mode overlay: selection highlight and cursor
+pub fn renderCopyModeOverlay(
+    self: *Renderer,
+    pane: *Pane,
+    cm: *const CopyMode,
+    writer: anytype,
+) !void {
+    _ = self;
+    const screen = pane.terminal.screens.active;
+
+    // Hide cursor during overlay rendering
+    try writer.writeAll("\x1b[?25l");
+
+    // Render selected cells with reverse video
+    if (cm.selecting) {
+        var start_y = cm.sel_start_y;
+        var start_x = cm.sel_start_x;
+        var end_y = cm.cursor_y;
+        var end_x = cm.cursor_x;
+
+        if (start_y > end_y or (start_y == end_y and start_x > end_x)) {
+            const tmp_y = start_y;
+            const tmp_x = start_x;
+            start_y = end_y;
+            start_x = end_x;
+            end_y = tmp_y;
+            end_x = tmp_x;
+        }
+
+        var y = start_y;
+        while (y <= end_y) : (y += 1) {
+            const row_start: u16 = if (y == start_y) start_x else 0;
+            const row_end: u16 = if (y == end_y) end_x else pane.cols -| 1;
+
+            var x = row_start;
+            while (x <= row_end) : (x += 1) {
+                const abs_x = pane.x + x;
+                const abs_y = pane.y + y;
+
+                try writer.print("\x1b[{d};{d}H\x1b[7m", .{ abs_y + 1, abs_x + 1 });
+
+                const lc = screen.pages.getCell(.{
+                    .viewport = .{ .x = @intCast(x), .y = @intCast(y) },
+                });
+                if (lc) |l| {
+                    const cp = l.cell.codepoint();
+                    if (cp == 0 or l.cell.wide == .spacer_tail) {
+                        try writer.writeByte(' ');
+                    } else {
+                        var utf8_buf: [4]u8 = undefined;
+                        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
+                        if (len == 1 and utf8_buf[0] == 0) {
+                            try writer.writeByte(' ');
+                        } else {
+                            try writer.writeAll(utf8_buf[0..len]);
+                        }
+                    }
+                } else {
+                    try writer.writeByte(' ');
+                }
+                try writer.writeAll("\x1b[0m");
+            }
+        }
+    }
+
+    // Render block cursor at copy mode position
+    {
+        const abs_x = pane.x + cm.cursor_x;
+        const abs_y = pane.y + cm.cursor_y;
+        try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
+
+        const lc = screen.pages.getCell(.{
+            .viewport = .{ .x = @intCast(cm.cursor_x), .y = @intCast(cm.cursor_y) },
+        });
+
+        // Yellow background block cursor for copy mode
+        try writer.writeAll("\x1b[30;43m");
+        if (lc) |l| {
+            const cp = l.cell.codepoint();
+            if (cp == 0 or l.cell.wide == .spacer_tail) {
+                try writer.writeByte(' ');
+            } else {
+                var utf8_buf: [4]u8 = undefined;
+                const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
+                if (len == 1 and utf8_buf[0] == 0) {
+                    try writer.writeByte(' ');
+                } else {
+                    try writer.writeAll(utf8_buf[0..len]);
+                }
+            }
+        } else {
+            try writer.writeByte(' ');
+        }
+        try writer.writeAll("\x1b[0m");
+    }
 }

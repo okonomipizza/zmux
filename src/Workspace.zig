@@ -404,6 +404,12 @@ fn findParentOf(node: *PaneNode, target: *Pane) ?ParentInfo {
 
 const Direction = enum { left, right, up, down };
 
+/// 指定方向の隣接ペインにフォーカスを移す
+pub fn focusPane(self: *Workspace, dir: Direction) void {
+    const target = findAdjacentPane(self.root, self.active_pane, dir) orelse return;
+    self.active_pane = target;
+}
+
 pub fn swapPane(self: *Workspace, alloc: std.mem.Allocator, dir: Direction) !void {
     const active = self.active_pane;
     const target = findAdjacentPane(self.root, active, dir) orelse return;
@@ -431,41 +437,69 @@ fn findAdjacentPane(root: *PaneNode, active: *Pane, dir: Direction) ?*Pane {
     const leaves = collectLeaves(root, &buf);
 
     var best: ?*Pane = null;
-    var best_dist: u32 = std.math.maxInt(u32);
+    var best_gap: i32 = std.math.maxInt(i32);
+    var best_overlap: i32 = 0;
 
-    // アクティブペインの中心座標を求める
-    const ax = @as(i32, active.x) + @divTrunc(@as(i32, active.cols), 2);
-    const ay = @as(i32, active.y) + @divTrunc(@as(i32, active.rows), 2);
+    const ax: i32 = @intCast(active.x);
+    const ay: i32 = @intCast(active.y);
+    const aw: i32 = @intCast(active.cols);
+    const ah: i32 = @intCast(active.rows);
 
     for (leaves) |pane| {
         if (pane == active) continue;
 
-        // 調査中のペインの中心座標を求める
-        const px = @as(i32, pane.x) + @divTrunc(@as(i32, pane.cols), 2);
-        const py = @as(i32, pane.y) + @divTrunc(@as(i32, pane.rows), 2);
-        // 中心座標の差を求める
-        const dx = px - ax;
-        const dy = py - ay;
+        const px: i32 = @intCast(pane.x);
+        const py: i32 = @intCast(pane.y);
+        const pw: i32 = @intCast(pane.cols);
+        const ph: i32 = @intCast(pane.rows);
 
-        // 方向に合致するか
-        const valid = switch (dir) {
-            .right => dx > 0,
-            .left => dx < 0,
-            .down => dy > 0,
-            .up => dy < 0,
-        };
-        if (!valid) continue;
+        // 主軸方向のギャップ (ペイン端同士の距離) と
+        // 副軸方向のオーバーラップ量で判定する
+        var gap: i32 = undefined;
+        var overlap: i32 = undefined;
 
-        // 主軸の距離 + 副軸のずれをペナルティとして加算
-        const dist = switch (dir) {
-            .right, .left => @abs(dx) + @abs(dy) * 2,
-            .down, .up => @abs(dy) + @abs(dx) * 2,
-        };
+        switch (dir) {
+            .down => {
+                if (py < ay + ah) continue; // 下側にない
+                gap = py - (ay + ah);
+                overlap = @min(ax + aw, px + pw) - @max(ax, px);
+            },
+            .up => {
+                if (py + ph > ay) continue; // 上側にない
+                gap = ay - (py + ph);
+                overlap = @min(ax + aw, px + pw) - @max(ax, px);
+            },
+            .right => {
+                if (px < ax + aw) continue; // 右側にない
+                gap = px - (ax + aw);
+                overlap = @min(ay + ah, py + ph) - @max(ay, py);
+            },
+            .left => {
+                if (px + pw > ax) continue; // 左側にない
+                gap = ax - (px + pw);
+                overlap = @min(ay + ah, py + ph) - @max(ay, py);
+            },
+        }
 
-        // もっとも近いものを返す
-        if (dist < best_dist) {
-            best_dist = dist;
+        if (overlap <= 0) continue; // 副軸方向に重なりがない
+
+        if (gap < best_gap) {
+            best_gap = gap;
+            best_overlap = overlap;
             best = pane;
+        } else if (gap == best_gap) {
+            // 同距離の場合: 方向に応じた位置優先でタイブレーク
+            // down/right → 左上を優先、up/left → 右下を優先
+            const bx = @as(i32, @intCast(best.?.x));
+            const prefer = switch (dir) {
+                .down, .right => px < bx,
+                .up, .left => px > bx,
+            };
+            if (prefer or (!prefer and px == bx and overlap > best_overlap)) {
+                best_gap = gap;
+                best_overlap = overlap;
+                best = pane;
+            }
         }
     }
     return best;

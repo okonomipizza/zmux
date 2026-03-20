@@ -12,6 +12,7 @@ const Renderer = @import("Renderer.zig");
 
 const c = @import("c.zig").c;
 
+const CopyMode = @import("CopyMode.zig");
 const Pty = @import("Pty.zig");
 const StatusBar = @import("StatusBar.zig");
 const Workspace = @import("Workspace.zig");
@@ -141,10 +142,20 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
     var events: [16]c.epoll_event = undefined;
     var buf: [BUF_SIZE]u8 = undefined;
 
+    // Enable bracketed paste mode on the outer terminal
+    try stdout_file.writeAll("\x1b[?2004h");
+    defer stdout_file.writeAll("\x1b[?2004l") catch {};
+
     // Key input handling state
     var prefix_mode: bool = false;
     var move_pane_mode: bool = false;
     var scroll_mode: bool = false;
+    var copy_mode_state: ?CopyMode = null;
+    var bracketed_paste: bool = false;
+
+    // Internal clipboard buffer
+    var clipboard: std.ArrayList(u8) = .empty;
+    defer clipboard.deinit(alloc);
 
     while (true) {
         const n = c.epoll_wait(epoll_fd, &events, @intCast(events.len), -1);
@@ -158,6 +169,58 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                 const nr = c.read(c.STDIN_FILENO, &buf, BUF_SIZE);
                 if (nr <= 0) return;
                 const input = buf[0..@intCast(nr)];
+
+                // Bracketed paste: detect \x1b[200~ (start) and \x1b[201~ (end)
+                // Forward pasted content directly to PTY without interpretation
+                if (bracketed_paste) {
+                    // Check for end of bracketed paste: \x1b[201~
+                    if (std.mem.indexOf(u8, input, "\x1b[201~")) |end_pos| {
+                        const active = active_workspace.activePane();
+                        if (end_pos > 0) {
+                            active.pty.write(input[0..end_pos]) catch {};
+                        }
+                        bracketed_paste = false;
+                        // Forward any remaining input after the paste end marker
+                        const after = end_pos + 6; // len of "\x1b[201~"
+                        if (after < input.len) {
+                            active.pty.write(input[after..]) catch {};
+                        }
+                    } else {
+                        const active = active_workspace.activePane();
+                        active.pty.write(input) catch {};
+                    }
+                    continue;
+                }
+
+                // Check for bracketed paste start: \x1b[200~
+                if (std.mem.indexOf(u8, input, "\x1b[200~")) |start_pos| {
+                    const active = active_workspace.activePane();
+                    // Forward anything before the paste marker
+                    if (start_pos > 0) {
+                        active.pty.write(input[0..start_pos]) catch {};
+                    }
+                    // Forward the paste content after the marker
+                    const after = start_pos + 6; // len of "\x1b[200~"
+                    if (after < input.len) {
+                        // Check if paste end is also in this chunk
+                        const rest = input[after..];
+                        if (std.mem.indexOf(u8, rest, "\x1b[201~")) |end_pos| {
+                            if (end_pos > 0) {
+                                active.pty.write(rest[0..end_pos]) catch {};
+                            }
+                            const final_after = end_pos + 6;
+                            if (final_after < rest.len) {
+                                active.pty.write(rest[final_after..]) catch {};
+                            }
+                        } else {
+                            active.pty.write(rest) catch {};
+                            bracketed_paste = true;
+                        }
+                    } else {
+                        bracketed_paste = true;
+                    }
+                    continue;
+                }
 
                 // Ctrl-b (0x02) activates zmux prefix mode
                 if (input.len == 1 and input[0] == 0x02) {
@@ -201,6 +264,52 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                     continue;
                 }
 
+                // Handle copy mode input
+                if (copy_mode_state != null) {
+                    var cm = &copy_mode_state.?;
+                    const pane = active_workspace.activePane();
+                    switch (input[0]) {
+                        'h' => cm.moveLeft(),
+                        'j' => cm.moveDown(pane),
+                        'k' => cm.moveUp(pane),
+                        'l' => cm.moveRight(pane),
+                        'v' => cm.startSelection(),
+                        '0' => cm.beginOfLine(),
+                        '$' => cm.endOfLine(pane),
+                        'g' => cm.topOfScreen(),
+                        'G' => cm.bottomOfScreen(pane),
+                        'w' => cm.nextWord(pane),
+                        'b' => cm.prevWord(pane),
+                        0x15 => cm.halfPageUp(pane), // Ctrl-u
+                        0x04 => cm.halfPageDown(pane), // Ctrl-d
+                        'y' => {
+                            if (cm.selecting) {
+                                const text = cm.getSelectedText(alloc, pane) catch null;
+                                if (text) |t| {
+                                    // Store in internal clipboard
+                                    clipboard.clearRetainingCapacity();
+                                    clipboard.appendSlice(alloc, t) catch {};
+                                    // Send to macOS clipboard via OSC 52
+                                    setOsc52Clipboard(stdout_file, t) catch {};
+                                    alloc.free(t);
+                                }
+                            }
+                            copy_mode_state = null;
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            continue;
+                        },
+                        'q', 0x1b => { // q or Escape
+                            copy_mode_state = null;
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            continue;
+                        },
+                        else => {},
+                    }
+                    // Re-render with copy mode overlay
+                    try refreshScreenCopyMode(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, &copy_mode_state.?);
+                    continue;
+                }
+
                 // Handle prefix mode key bindings
                 if (prefix_mode) {
                     prefix_mode = false; // Reset prefix mode regardless of which key follows
@@ -215,6 +324,19 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                         's' => {
                             // Activate scroll_mode
                             scroll_mode = true;
+                        },
+                        'c' => {
+                            const pane = active_workspace.activePane();
+                            copy_mode_state = CopyMode.init(pane);
+                            try refreshScreenCopyMode(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, &copy_mode_state.?);
+                            continue;
+                        },
+                        'p' => {
+                            // Paste from internal clipboard
+                            if (clipboard.items.len > 0) {
+                                const active = active_workspace.activePane();
+                                active.pty.write(clipboard.items) catch {};
+                            }
                         },
                         // ----- Workspace control -----
                         'n' => {
@@ -234,18 +356,18 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
                             active_workspace.toggleFloating();
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
-                        'l' => {
+                        'i' => {
                             active_workspace = workspace_manager.nextWorkspace() orelse return;
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
 
-                            // Keep prefix mode active so workspace can be cycled with repeated l/h presses
+                            // Keep prefix mode active so workspace can be cycled with repeated presses
                             prefix_mode = true;
                         },
-                        'h' => {
+                        'u' => {
                             active_workspace = workspace_manager.prevWorkspace() orelse return;
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
 
-                            // Keep prefix mode active so workspace can be cycled with repeated l/h presses
+                            // Keep prefix mode active so workspace can be cycled with repeated presses
                             prefix_mode = true;
                         },
                         '1', '2', '3', '4', '5', '6', '7', '8', '9' => {
@@ -269,13 +391,23 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
 
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true);
                         },
+                        'h' => {
+                            active_workspace.focusPane(.left);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            prefix_mode = true;
+                        },
                         'j' => {
-                            active_workspace.nextPane();
+                            active_workspace.focusPane(.down);
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
                             prefix_mode = true;
                         },
                         'k' => {
-                            active_workspace.prevPane();
+                            active_workspace.focusPane(.up);
+                            try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
+                            prefix_mode = true;
+                        },
+                        'l' => {
+                            active_workspace.focusPane(.right);
                             try refreshScreen(&stdout_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false);
                             prefix_mode = true;
                         },
@@ -375,4 +507,63 @@ fn refreshScreen(
     renderer.invalidate();
     try renderer.renderAll(active_workspace, workspace_manager, original_rows, stdout_fbs.writer());
     try stdout_file.writeAll(stdout_fbs.getWritten());
+}
+
+/// Refresh screen with copy mode overlay
+fn refreshScreenCopyMode(
+    stdout_fbs: *std.io.FixedBufferStream([]u8),
+    renderer: *Renderer,
+    active_workspace: *Workspace,
+    workspace_manager: *WorkspaceManager,
+    original_rows: u16,
+    stdout_file: std.fs.File,
+    cm: *const CopyMode,
+) !void {
+    stdout_fbs.reset();
+    const writer = stdout_fbs.writer();
+    renderer.invalidate();
+    try renderer.renderAllWithMode(active_workspace, workspace_manager, original_rows, writer, "COPY");
+    try renderer.renderCopyModeOverlay(active_workspace.activePane(), cm, writer);
+    try stdout_file.writeAll(stdout_fbs.getWritten());
+}
+
+/// Send text to the outer terminal's clipboard via OSC 52
+fn setOsc52Clipboard(stdout_file: std.fs.File, text: []const u8) !void {
+    const encoder = std.base64.standard.Encoder;
+    const encoded_len = encoder.calcSize(text.len);
+
+    // Build the OSC 52 sequence: \x1b]52;c;<base64>\x1b\\
+    // Use a stack buffer for small payloads, heap for large
+    var stack_buf: [4096]u8 = undefined;
+    const header = "\x1b]52;c;";
+    const trailer = "\x1b\\";
+    const total_len = header.len + encoded_len + trailer.len;
+
+    if (total_len <= stack_buf.len) {
+        @memcpy(stack_buf[0..header.len], header);
+        _ = encoder.encode(stack_buf[header.len .. header.len + encoded_len], text);
+        @memcpy(stack_buf[header.len + encoded_len ..][0..trailer.len], trailer);
+        try stdout_file.writeAll(stack_buf[0..total_len]);
+    } else {
+        // For very large payloads, write in parts
+        try stdout_file.writeAll(header);
+        // Encode in chunks
+        var offset: usize = 0;
+        while (offset < text.len) {
+            const chunk_end = @min(offset + 2048, text.len);
+            // Base64 encode needs to work on 3-byte boundaries for intermediate chunks
+            const aligned_end = if (chunk_end < text.len)
+                offset + ((chunk_end - offset) / 3) * 3
+            else
+                chunk_end;
+            if (aligned_end == offset) break;
+            const chunk = text[offset..aligned_end];
+            const chunk_enc_len = encoder.calcSize(chunk.len);
+            var enc_buf: [2800]u8 = undefined; // 2048 * 4/3 + padding
+            _ = encoder.encode(enc_buf[0..chunk_enc_len], chunk);
+            try stdout_file.writeAll(enc_buf[0..chunk_enc_len]);
+            offset = aligned_end;
+        }
+        try stdout_file.writeAll(trailer);
+    }
 }
