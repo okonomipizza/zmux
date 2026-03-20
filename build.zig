@@ -34,6 +34,10 @@ pub fn build(b: *std.Build) void {
         exe_mod.addImport("clap", dep.module("clap"));
     }
 
+    if (b.lazyDependency("jsonc", .{})) |dep| {
+        exe_mod.addImport("jsonc", dep.module("jsonc"));
+    }
+
     const exe = b.addExecutable(.{
         .name = "zmux",
         .root_module = exe_mod,

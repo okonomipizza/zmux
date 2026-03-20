@@ -6,6 +6,7 @@ const c = @import("c.zig").c;
 
 const ghostty_vt = @import("ghostty-vt");
 const clap = @import("clap");
+const jsonc = @import("jsonc");
 
 const WorkspaceManager = @import("WorkspaceManager.zig");
 const Workspace = @import("Workspace.zig");
@@ -13,6 +14,7 @@ const CopyMode = @import("CopyMode.zig");
 const Pty = @import("Pty.zig");
 
 const Renderer = @import("Renderer.zig");
+const Config = @import("Config.zig");
 
 /// zmux app version
 const version = "0.0.0";
@@ -129,7 +131,9 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
     // Current active workspace. Must be updated whenever the active workspace changes.
     var active_workspace: *Workspace = workspace_manager.getActiveWorkspace() orelse return;
 
-    var renderer = try Renderer.init(alloc, term.cols, term.rows);
+    const config = Config.load(alloc);
+
+    var renderer = try Renderer.init(alloc, term.cols, term.rows, config);
     defer renderer.deinit();
 
     // Monitor each process by epoll

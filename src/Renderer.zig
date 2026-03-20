@@ -4,6 +4,7 @@ const Workspace = @import("Workspace.zig");
 const WorkspaceManager = @import("WorkspaceManager.zig");
 const Pane = @import("Pane.zig");
 const StatusBar = @import("StatusBar.zig");
+const Config = @import("Config.zig");
 
 pub const Renderer = @This();
 
@@ -25,11 +26,13 @@ term_cols: u16,
 term_rows: u16,
 
 alloc: std.mem.Allocator,
+config: Config,
 
 pub fn init(
     alloc: std.mem.Allocator,
     cols: u16,
     rows: u16,
+    config: Config,
 ) !Renderer {
     const cells = try alloc.alloc(
         Cell,
@@ -41,6 +44,7 @@ pub fn init(
         .term_cols = cols,
         .term_rows = rows,
         .alloc = alloc,
+        .config = config,
     };
 }
 
@@ -392,7 +396,7 @@ fn drawBorders(
             };
 
             const is_intersection = @popCount(v) >= 3;
-            const color: []const u8 = if (!is_intersection and active_border[row * W + col]) "\x1b[38;5;46m" else "\x1b[0;90m";
+            const color: []const u8 = if (!is_intersection and active_border[row * W + col]) self.config.active_border_color.toAnsiSeq() else "\x1b[0;90m";
             try writer.print("\x1b[{d};{d}H{s}{s}", .{
                 row + 1,
                 col + 1,
@@ -453,7 +457,7 @@ fn renderFloatingPane(
     const inner_rows = pane.rows;
 
     // Border color: bright when active, dim when inactive
-    const border_style: []const u8 = if (is_active) "\x1b[1;36m" else "\x1b[0;90m";
+    const border_style: []const u8 = if (is_active) self.config.active_border_color.toAnsiSeq() else "\x1b[0;90m";
 
     // ── Top edge ──
     if (by < self.term_rows) {
