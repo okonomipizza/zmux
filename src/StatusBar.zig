@@ -1,4 +1,5 @@
 const std = @import("std");
+const Config = @import("Config.zig");
 const WorkspaceManager = @import("WorkspaceManager.zig");
 
 pub const StatusBar = @This();
@@ -9,9 +10,12 @@ pub fn renderWithMode(
     term_cols: u16,
     writer: anytype,
     mode_label: ?[]const u8,
+    config: Config,
 ) !void {
     try writer.print("\x1b[{d};1H", .{status_row});
-    try writer.writeAll("\x1b[0;100m");
+    try writer.writeAll("\x1b[0m");
+    try writer.writeAll(config.status_bg.toBgAnsiSeq());
+    try writer.writeAll(config.status_fg.toFgAnsiSeq());
 
     var written: u16 = 0;
 
@@ -19,14 +23,16 @@ pub fn renderWithMode(
         const is_active = (i == wm.active_workspace);
 
         if (is_active) {
-            try writer.writeAll("\x1b[42;30m");
+            try writer.writeAll(config.active_workspace_bg.toBgAnsiSeq());
+            try writer.writeAll(config.active_workspace_fg.toFgAnsiSeq());
         }
 
         try writer.print(" {d} ", .{i + 1});
         written += 3;
 
         if (is_active) {
-            try writer.writeAll("\x1b[100;37m");
+            try writer.writeAll(config.status_bg.toBgAnsiSeq());
+            try writer.writeAll(config.status_fg.toFgAnsiSeq());
         }
     }
 
@@ -41,11 +47,13 @@ pub fn renderWithMode(
             }
             written += padding;
             // Render mode label with highlight
-            try writer.writeAll("\x1b[43;30m");
+            try writer.writeAll(config.mode_label_bg.toBgAnsiSeq());
+            try writer.writeAll(config.mode_label_fg.toFgAnsiSeq());
             try writer.writeByte(' ');
             try writer.writeAll(label);
             try writer.writeByte(' ');
-            try writer.writeAll("\x1b[100;37m");
+            try writer.writeAll(config.status_bg.toBgAnsiSeq());
+            try writer.writeAll(config.status_fg.toFgAnsiSeq());
             written += label_len;
         }
     }

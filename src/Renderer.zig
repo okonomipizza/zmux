@@ -84,7 +84,7 @@ pub fn renderAll(
     }
 
     // Render status bar at the bottom of floor
-    try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label);
+    try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label, self.config);
 
     // Move the cursor to saved position
     const active = workspace.activePane();
@@ -396,7 +396,7 @@ fn drawBorders(
             };
 
             const is_intersection = @popCount(v) >= 3;
-            const color: []const u8 = if (!is_intersection and active_border[row * W + col]) self.config.active_border_color.toAnsiSeq() else "\x1b[0;90m";
+            const color: []const u8 = if (!is_intersection and active_border[row * W + col]) self.config.active_border_color.toAnsiSeq() else self.config.inactive_border_color.toAnsiSeq();
             try writer.print("\x1b[{d};{d}H{s}{s}", .{
                 row + 1,
                 col + 1,
@@ -432,7 +432,7 @@ pub fn renderFloatingOnly(
         );
     }
 
-    try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label);
+    try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label, self.config);
 
     const active = workspace.activePane();
     const screen = active.terminal.screens.active;
@@ -457,7 +457,7 @@ fn renderFloatingPane(
     const inner_rows = pane.rows;
 
     // Border color: bright when active, dim when inactive
-    const border_style: []const u8 = if (is_active) self.config.active_border_color.toAnsiSeq() else "\x1b[0;90m";
+    const border_style: []const u8 = if (is_active) self.config.active_border_color.toAnsiSeq() else self.config.inactive_border_color.toAnsiSeq();
 
     // ── Top edge ──
     if (by < self.term_rows) {
@@ -530,7 +530,6 @@ pub fn renderCopyModeOverlay(
     cm: *const CopyMode,
     writer: anytype,
 ) !void {
-    _ = self;
     const screen = pane.terminal.screens.active;
 
     // Hide cursor during overlay rendering
@@ -598,8 +597,9 @@ pub fn renderCopyModeOverlay(
             .viewport = .{ .x = @intCast(cm.cursor_x), .y = @intCast(cm.cursor_y) },
         });
 
-        // Yellow background block cursor for copy mode
-        try writer.writeAll("\x1b[30;43m");
+        // Block cursor for copy mode
+        try writer.writeAll(self.config.copy_cursor_fg.toFgAnsiSeq());
+        try writer.writeAll(self.config.copy_cursor_bg.toBgAnsiSeq());
         if (lc) |l| {
             const cp = l.cell.codepoint();
             if (cp == 0 or l.cell.wide == .spacer_tail) {
