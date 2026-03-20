@@ -105,10 +105,6 @@ fn ptyFork(slave_name: [:0]u8, termios: c.termios, ws: std.posix.winsize) !Pty {
     std.process.exit(1);
 }
 
-pub fn read(self: *Pty, buf: []u8) !usize {
-    return posix.read(self.master_fd, buf);
-}
-
 pub fn write(self: *Pty, buf: []const u8) !void {
     var written: usize = 0;
     while (written < buf.len) {

@@ -264,32 +264,6 @@ fn findLeafNode(node: *PaneNode, target: *Pane) ?*PaneNode {
     }
 }
 
-pub fn nextPane(self: *Workspace) void {
-    var buf: [64]*Pane = undefined;
-    const leaves = collectLeaves(self.root, &buf);
-    if (leaves.len <= 0) return;
-
-    for (leaves, 0..) |pane, i| {
-        if (pane == self.active_pane) {
-            self.active_pane = leaves[(i + 1) % leaves.len];
-            return;
-        }
-    }
-}
-
-pub fn prevPane(self: *Workspace) void {
-    var buf: [64]*Pane = undefined;
-    const leaves = collectLeaves(self.root, &buf);
-    if (leaves.len <= 1) return;
-
-    for (leaves, 0..) |pane, i| {
-        if (pane == self.active_pane) {
-            self.active_pane = leaves[(i + leaves.len - 1) % leaves.len];
-            return;
-        }
-    }
-}
-
 fn collectLeaves(node: *PaneNode, buf: []*Pane) []*Pane {
     var count: usize = 0;
     collectLeavesInner(node, buf, &count);

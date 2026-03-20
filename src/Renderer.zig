@@ -62,18 +62,6 @@ pub fn renderAll(
     writer: anytype,
     mode_label: ?[]const u8,
 ) !void {
-    try self.renderAllWithMode(workspace, wm, status_row, writer, mode_label);
-}
-
-/// Renders all panes with an optional mode label on the status bar.
-pub fn renderAllWithMode(
-    self: *Renderer,
-    workspace: *Workspace,
-    wm: *WorkspaceManager,
-    status_row: u16,
-    writer: anytype,
-    mode_label: ?[]const u8,
-) !void {
     // Hide the cursor
     try writer.writeAll("\x1b[?25l");
 

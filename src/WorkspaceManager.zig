@@ -61,24 +61,6 @@ pub fn appendWorkspace(self: *WorkspaceManager, alloc: std.mem.Allocator) !void 
     try self.workspaces.append(alloc, new_ws);
 }
 
-pub fn saveCursorPos(self: *WorkspaceManager) void {
-    const aw = self.getActiveWorkspace() orelse return;
-    if (aw.show_floating) {
-        aw.floating_pane.terminal.saveCursor();
-    } else {
-        aw.active_pane.terminal.saveCursor();
-    }
-}
-
-pub fn restoreCursor(self: *WorkspaceManager) void {
-    const aw = self.getActiveWorkspace() orelse return;
-    if (aw.show_floating) {
-        aw.floating_pane.terminal.restoreCursor();
-    } else {
-        aw.active_pane.terminal.restoreCursor();
-    }
-}
-
 /// アクティブペインを target_idx 番目のワークスペースへ移動する。
 /// 移動後は target_idx のワークスペースに切り替える。
 /// 元のワークスペースが空になったら自動削除する。

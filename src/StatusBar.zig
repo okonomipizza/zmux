@@ -3,15 +3,6 @@ const WorkspaceManager = @import("WorkspaceManager.zig");
 
 pub const StatusBar = @This();
 
-pub fn render(
-    wm: *WorkspaceManager,
-    status_row: u16,
-    term_cols: u16,
-    writer: anytype,
-) !void {
-    try renderWithMode(wm, status_row, term_cols, writer, null);
-}
-
 pub fn renderWithMode(
     wm: *WorkspaceManager,
     status_row: u16,

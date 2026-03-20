@@ -14,7 +14,6 @@ const c = @import("c.zig").c;
 
 const CopyMode = @import("CopyMode.zig");
 const Pty = @import("Pty.zig");
-const StatusBar = @import("StatusBar.zig");
 const Workspace = @import("Workspace.zig");
 const WorkspaceManager = @import("WorkspaceManager.zig");
 
