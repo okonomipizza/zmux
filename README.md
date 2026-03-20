@@ -90,5 +90,37 @@ The prefix key is **Ctrl-b**. Press it first, then a command key.
 Yanked text is copied to the system clipboard via OSC 52, so it works across SSH sessions and VMs (e.g. macOS host + Multipass Ubuntu guest).
 
 
+## Configuration
+
+UI colors can be customized via `~/.config/zmux/zmux.jsonc`. Create the file and set any of the following properties:
+
+```jsonc
+{
+  // Border colors
+  "active_border_color": "green",       // default: green
+  "inactive_border_color": "bright_black", // default: bright_black
+
+  // Copy mode cursor
+  "copy_cursor_fg": "black",            // default: black
+  "copy_cursor_bg": "yellow",           // default: yellow
+
+  // Status bar
+  "status_bg": "bright_black",          // default: bright_black
+  "status_fg": "white",                 // default: white
+
+  // Active workspace indicator
+  "active_workspace_bg": "green",       // default: green
+  "active_workspace_fg": "black",       // default: black
+
+  // Mode label (e.g. SCROLL, COPY)
+  "mode_label_bg": "yellow",            // default: yellow
+  "mode_label_fg": "black"              // default: black
+}
+```
+
+Available colors: `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `bright_black`, `bright_red`, `bright_green`, `bright_yellow`, `bright_blue`, `bright_magenta`, `bright_cyan`, `bright_white`
+
+Unrecognized or missing keys are silently ignored and fall back to their defaults.
+
 ## License
 MIT
