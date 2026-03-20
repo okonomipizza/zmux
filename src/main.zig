@@ -1,65 +1,66 @@
 const std = @import("std");
 const Io = std.Io;
 const posix = std.posix;
+// c imports
+const c = @import("c.zig").c;
 
-const zmux = @import("zmux");
 const ghostty_vt = @import("ghostty-vt");
 const clap = @import("clap");
 
-const version = "0.0.0";
+const WorkspaceManager = @import("WorkspaceManager.zig");
+const Workspace = @import("Workspace.zig");
+const CopyMode = @import("CopyMode.zig");
+const Pty = @import("Pty.zig");
 
 const Renderer = @import("Renderer.zig");
 
-const c = @import("c.zig").c;
-
-const CopyMode = @import("CopyMode.zig");
-const Pty = @import("Pty.zig");
-const Workspace = @import("Workspace.zig");
-const WorkspaceManager = @import("WorkspaceManager.zig");
-
+/// zmux app version
+const version = "0.0.0";
+/// Original termios settings, restored on zmux exit
 var original_termios: c.termios = undefined;
+/// Buffer size for reading input
 const BUF_SIZE: usize = 4096;
 
-/// zmux メインプロセス用の termios 設定
-/// 端末を non-canonical mode に設定し、
-/// 入力を行単位にまとめず1文字ずつ読み取れるようにする
+/// termios configuration for zmux main process
+/// Sets the terminal to non-canonical mode,
+/// allowing input to be read character by character instead of line by line
 fn enableRawMode() !void {
-    //zmux メインプロセスを実行している端末の属性を取得する
+    // Get original termios configuration
     if (c.tcgetattr(c.STDIN_FILENO, &original_termios) < 0)
         return error.TcgetattrFailed;
 
     var raw = original_termios;
 
-    // non-canonical + エコーOFF + シグナル無効
-    // ICANON: Canonical-mode (入力を行単位にまとめる)
-    // ECHO: 入力文字のエコー
-    // ISIG: シグナルを生成する文字の有効化 (Ctrl-C etc...)
-    // IEXTEN: 入力の拡張処理 (zmuxは、ptyに入力をそのまま流したいため不要)
+    // non-canonical + echo off + Invalidate signal
+    // ICANON: Canonical-mode
+    // ECHO: Echo input characters
+    // ISIG: Enable signal-generating characters (Ctrl-C etc...)
+    // IEXTEN: Extended input processing (not needed since zmux passes input directly to pty)
     raw.c_lflag &= ~@as(c_uint, c.ICANON | c.ECHO | c.ISIG | c.IEXTEN);
-    // CR→LF変換など無効
-    // IXON: 出力フロー制御
-    // ICRNL: CR -> NL へのマッピング
-    // BRKINT: BREAK 時に SIGINT を生成
-    // INPCK: 入力パリティチェック
-    // ISTRIP: 入力の8 bit 目をクリア(マルチバイト文字を扱うためにoff)
+    // Disable CR→LF conversion and other input processing
+    // IXON: Output flow control
+    // ICRNL: CR -> NL mapping
+    // BRKINT: Generate SIGINT on BREAK
+    // INPCK: Input parity check
+    // ISTRIP: Clear the 8th bit of input (disabled to support multi-byte characters)
     raw.c_iflag &= ~@as(c_uint, c.IXON | c.ICRNL | c.BRKINT | c.INPCK | c.ISTRIP);
-    // マルチバイト文字の有効化
+    // Enable multi-byte character support
     raw.c_cflag |= @as(c_uint, c.CS8);
-    // read() が返ってくるタイミングを制御
-    // 1文字来たら返す、タイムアウトなし
-    raw.c_cc[c.VMIN] = 1; // 1文字受け取るまで待機
-    raw.c_cc[c.VTIME] = 0; // タイムアウトなし
+    // Control when read() returns
+    // Return as soon as 1 character is available, no timeout
+    raw.c_cc[c.VMIN] = 1; // Wait until 1 character is received
+    raw.c_cc[c.VTIME] = 0; // No timeout
 
-    // 端末設定を適用
     if (c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &raw) < 0)
         return error.TcsetattrFailed;
 }
 
-// zmux が変更した端末属性を元に戻す
+/// Restore the terminal attributes modified by zmux to their original state
 fn disableRawMode() void {
     _ = c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &original_termios);
 }
 
+/// Add fd to epoll monitor list
 fn epollAdd(epoll_fd: c_int, fd: c_int, events: u32) !void {
     var ev = c.epoll_event{
         .events = events,
@@ -125,6 +126,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
     var workspace_manager = try WorkspaceManager.init(alloc, term.cols, term.rows, original_termios);
     defer workspace_manager.deinit(alloc);
 
+    // Current active workspace. Must be updated whenever the active workspace changes.
     var active_workspace: *Workspace = workspace_manager.getActiveWorkspace() orelse return;
 
     var renderer = try Renderer.init(alloc, term.cols, term.rows);
@@ -135,6 +137,7 @@ fn spawnServer(alloc: std.mem.Allocator) !void {
     if (epoll_fd < 0) return error.EpollCreateFailed;
     defer _ = c.close(epoll_fd);
     try epollAdd(epoll_fd, c.STDIN_FILENO, c.EPOLLIN);
+
     // Register the initial panes into the epoll watch list
     try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
     try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);

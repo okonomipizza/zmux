@@ -6,7 +6,7 @@ pub const WorkspaceManager = @This();
 
 workspaces: std.ArrayList(Workspace),
 active_workspace: usize,
-
+// full term size
 cols: u16,
 rows: u16,
 termios: c.termios,
@@ -61,9 +61,9 @@ pub fn appendWorkspace(self: *WorkspaceManager, alloc: std.mem.Allocator) !void 
     try self.workspaces.append(alloc, new_ws);
 }
 
-/// アクティブペインを target_idx 番目のワークスペースへ移動する。
-/// 移動後は target_idx のワークスペースに切り替える。
-/// 元のワークスペースが空になったら自動削除する。
+/// Moves the active pane to the workspace at target_idx.
+/// Switches to that workspace after moving.
+/// If the source workspace becomes empty, it is automatically removed.
 pub fn movePaneToWorkspace(
     self: *WorkspaceManager,
     alloc: std.mem.Allocator,
@@ -78,25 +78,19 @@ pub fn movePaneToWorkspace(
     const maybe_pane = try src_ws.detachPane(alloc);
 
     if (maybe_pane) |pane| {
-        // ソースにまだペインが残っている
         try dst_ws.attachPane(alloc, pane);
         self.switchWorkspace(target_idx);
     } else {
-        // ソースにペインが1つしかなかった
         const pane = src_ws.extractLastPane();
         const src_root = src_ws.root;
 
-        // デスティネーションに追加
         try dst_ws.attachPane(alloc, pane);
 
-        // ソースのルートノードだけ解放（Pane は移動済み）
         alloc.destroy(src_root);
 
-        // ワークスペースを削除
         const removed_idx = self.active_workspace;
         _ = self.workspaces.orderedRemove(removed_idx);
 
-        // 削除によるインデックスずれを補正
         const adjusted = if (target_idx > removed_idx) target_idx - 1 else target_idx;
         self.switchWorkspace(adjusted);
     }
