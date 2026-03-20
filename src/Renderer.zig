@@ -94,8 +94,22 @@ pub fn renderAll(
         active.x + screen.cursor.x + 1,
     });
 
+    // Set cursor style (DECSCUSR) based on active pane's terminal state
+    try writeCursorStyle(screen.cursor.cursor_style, writer);
+
     // Show the cursor
     try writer.writeAll("\x1b[?25h");
+}
+
+fn writeCursorStyle(style: anytype, writer: anytype) !void {
+    // DECSCUSR: 0/1 = blinking block, 2 = steady block, 3 = blinking underline,
+    // 4 = steady underline, 5 = blinking bar, 6 = steady bar
+    const code: u8 = switch (style) {
+        .block, .block_hollow => 2,
+        .underline => 4,
+        .bar => 6,
+    };
+    try writer.print("\x1b[{d} q", .{code});
 }
 
 fn renderPane(
@@ -453,6 +467,7 @@ pub fn renderFloatingOnly(
         active.x + screen.cursor.x + 1,
     });
 
+    try writeCursorStyle(screen.cursor.cursor_style, writer);
     try writer.writeAll("\x1b[?25h");
 }
 
