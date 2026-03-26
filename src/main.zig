@@ -8,6 +8,9 @@ const ghostty_vt = @import("ghostty-vt");
 const clap = @import("clap");
 const jsonc = @import("jsonc");
 
+const server_mod = @import("server.zig");
+const attach_mod = @import("attach.zig");
+
 const WorkspaceManager = @import("WorkspaceManager.zig");
 const Workspace = @import("Workspace.zig");
 const CopyMode = @import("CopyMode.zig");
@@ -78,8 +81,9 @@ pub fn main() !void {
     const alloc = gpa.allocator();
 
     const params = comptime clap.parseParamsComptime(
-        \\-h, --help     Display this help and exit.
-        \\-v, --version  Output version information and exit.
+        \\-h, --help              Display this help and exit.
+        \\-v, --version           Output version information and exit.
+        \\-a, --attach <string>   Create or attach to a named session.
         \\
     );
 
@@ -98,7 +102,67 @@ pub fn main() !void {
         return;
     }
 
-    try spawnServer(alloc);
+    if (res.args.attach) |session_name| {
+        try attachSession(alloc, session_name);
+        return;
+    }
+
+    try attachSession(alloc, "main");
+}
+
+fn getSocketPath(buf: []u8) ![]const u8 {
+    const uid = std.os.linux.getuid();
+    const dir_path = std.fmt.bufPrint(buf, "/tmp/zmux-{d}", .{uid}) catch return error.BufferTooSmall;
+
+    // Ensure the directory exists.
+    std.fs.makeDirAbsolute(dir_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    return std.fmt.bufPrint(buf, "/tmp/zmux-{d}/server.sock", .{uid}) catch return error.BufferTooSmall;
+}
+
+fn attachSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
+    var path_buf: [256]u8 = undefined;
+    const socket_path = try getSocketPath(&path_buf);
+
+    // Try connecting to existing server. If it fails, fork a new server.
+    const needs_server = blk: {
+        const sock = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch break :blk true;
+        const address = std.net.Address.initUnix(socket_path) catch {
+            posix.close(sock);
+            break :blk true;
+        };
+        posix.connect(sock, &address.any, address.getOsSockLen()) catch {
+            posix.close(sock);
+            break :blk true;
+        };
+        // Connection succeeded — server is running. Close this probe socket.
+        posix.close(sock);
+        break :blk false;
+    };
+
+    if (needs_server) {
+        const pid = try posix.fork();
+        if (pid == 0) {
+            // Child: become the server daemon.
+            _ = std.os.linux.setsid();
+            // Redirect stdin/stdout/stderr to /dev/null after server() captures termios.
+            // server() calls tcgetattr(STDIN) at startup, so we don't close fds here.
+            server_mod.server(alloc, socket_path) catch |err| {
+                std.debug.print("server error: {}\n", .{err});
+            };
+            posix.exit(0);
+        }
+        // Parent: wait briefly for the server to bind the socket.
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    attach_mod.attach(alloc, socket_path, session_name) catch |err| {
+        std.debug.print("attach error: {}\n", .{err});
+        return err;
+    };
 }
 
 fn getTermSize() struct { cols: u16, rows: u16 } {
