@@ -65,9 +65,16 @@ pub fn renderAll(
     status_row: u16,
     writer: anytype,
     mode_label: ?[]const u8,
+    clear_screen: bool,
+    copy_mode: ?CopyMode.CopyMode,
 ) !void {
     // Hide the cursor
     try writer.writeAll("\x1b[?25l");
+
+    // Clear screen if requested (e.g., after closing a pane)
+    if (clear_screen) {
+        try writer.writeAll("\x1b[2J\x1b[H");
+    }
 
     // TODO Consider appropriate maximum number of panes
     var buf: [64]*Pane = undefined;
@@ -83,22 +90,29 @@ pub fn renderAll(
         try self.renderFloatingPane(workspace.floating_pane, workspace.active_pane == workspace.floating_pane, writer);
     }
 
+    // Render copy mode overlay if active
+    if (copy_mode) |cm| {
+        try self.renderCopyModeOverlay(workspace.activePane(), &cm, writer);
+    }
+
     // Render status bar at the bottom of floor
     try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label, self.config);
 
-    // Move the cursor to saved position
-    const active = workspace.activePane();
-    const screen = active.terminal.screens.active;
-    try writer.print("\x1b[{d};{d}H", .{
-        active.y + screen.cursor.y + 1,
-        active.x + screen.cursor.x + 1,
-    });
+    // Move the cursor to saved position (unless in copy mode, where we position in overlay)
+    if (copy_mode == null) {
+        const active = workspace.activePane();
+        const screen = active.terminal.screens.active;
+        try writer.print("\x1b[{d};{d}H", .{
+            active.y + screen.cursor.y + 1,
+            active.x + screen.cursor.x + 1,
+        });
 
-    // Set cursor style (DECSCUSR) based on active pane's terminal state
-    try writeCursorStyle(screen.cursor.cursor_style, writer);
+        // Set cursor style (DECSCUSR) based on active pane's terminal state
+        try writeCursorStyle(screen.cursor.cursor_style, writer);
 
-    // Show the cursor
-    try writer.writeAll("\x1b[?25h");
+        // Show the cursor
+        try writer.writeAll("\x1b[?25h");
+    }
 }
 
 fn writeCursorStyle(style: anytype, writer: anytype) !void {

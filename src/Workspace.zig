@@ -301,7 +301,7 @@ const NewPaneSize = struct {
     active_rows: u16,
 };
 
-const SplitDir = enum { vertical, horizontal };
+pub const SplitDir = enum { vertical, horizontal };
 const MINIMUM_PANE_SIZE: u16 = 4;
 
 // active pane の開始位置を渡すと、active_paneを分割した場合に、
@@ -376,7 +376,7 @@ fn findParentOf(node: *PaneNode, target: *Pane) ?ParentInfo {
     }
 }
 
-const Direction = enum { left, right, up, down };
+pub const Direction = enum { left, right, up, down };
 
 /// 指定方向の隣接ペインにフォーカスを移す
 pub fn focusPane(self: *Workspace, dir: Direction) void {
@@ -576,4 +576,19 @@ pub fn toggleFloating(self: *Workspace) void {
     } else {
         self.active_pane = firstLeaf(self.root);
     }
+}
+
+/// ワークスペース全体をリサイズする（タイルペイン + フローティングペイン）
+pub fn resizeWorkspace(self: *Workspace, alloc: std.mem.Allocator, cols: u16, rows: u16) !void {
+    self.cols = cols;
+    self.rows = rows;
+
+    // タイルペインをリレイアウト
+    try relayout(alloc, self.root, cols, rows, 0, 0);
+
+    // フローティングペインをリサイズ
+    const fg = calcFloatingGeometry(cols, rows);
+    self.floating_pane.x = fg.x;
+    self.floating_pane.y = fg.y;
+    try self.floating_pane.resize(alloc, fg.cols, fg.rows);
 }
