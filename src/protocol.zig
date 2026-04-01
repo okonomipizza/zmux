@@ -1,8 +1,6 @@
 const std = @import("std");
 
-pub const SessionName = []const u8;
-
-/// Direction for pane operations
+/// Direction for pane operations such as 'move' and 'focus'
 pub const Direction = enum(u8) {
     left = 0,
     right = 1,
@@ -16,19 +14,30 @@ pub const SplitDirection = enum(u8) {
     horizontal = 1,
 };
 
+/// Clients send a request to the server to manipulate PTYs and sessions
 pub const Request = union(enum) {
+    // Session
     attach: Attach,
     detach: void,
+    // Generic input to the PTY.
     input: Input,
+    // Window resize
     resize: Resize,
+    // Pane
     split_pane: SplitPane,
     focus_pane: FocusPane,
+    swap_pane: SwapPane,
+    resize_pane: ResizePane,
+    move_pane_to_workspace: MovePaneToWorkspace,
     close_pane: void,
+    // Workspace
     new_workspace: void,
     switch_workspace: SwitchWorkspace,
+    cycle_workspace: CycleWorkspace,
+    // Floating pane
     toggle_floating: void,
+    // Mode
     set_prefix_mode: SetPrefixMode,
-    // New request types for scroll/copy mode and pane operations
     scroll_mode_start: void,
     scroll_mode_input: ScrollModeInput,
     scroll_mode_exit: void,
@@ -37,10 +46,6 @@ pub const Request = union(enum) {
     copy_mode_exit: void,
     yank: void,
     paste: void,
-    swap_pane: SwapPane,
-    resize_pane: ResizePane,
-    move_pane_to_workspace: MovePaneToWorkspace,
-    cycle_workspace: CycleWorkspace,
 
     pub const Method = enum(u8) {
         attach = 0,
@@ -367,6 +372,7 @@ pub const Request = union(enum) {
     }
 };
 
+/// Representaion of server outpus, handled by the client
 pub const Response = union(enum) {
     attach_ok: AttachOk,
     message: []const u8,

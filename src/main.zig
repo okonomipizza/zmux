@@ -6,9 +6,11 @@ const Server = @import("Server.zig");
 const client = @import("client.zig").client;
 
 /// zmux app version
-const version = "0.0.0";
+const version = "1.0.0";
 
 /// Base directory for zmux sockets
+/// The session runs as a daemon in forked threads, with communication between
+/// server and client threads occurring via unix domain socket.
 const SOCKET_DIR = "/tmp/zmux";
 
 pub fn main() !void {
@@ -26,11 +28,11 @@ pub fn main() !void {
     };
 
     // Check for flags
-    if (std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "help")) {
+    if (std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
         return printHelp();
     }
 
-    if (std.mem.eql(u8, command, "-v") or std.mem.eql(u8, command, "--version")) {
+    if (std.mem.eql(u8, command, "-v") or std.mem.eql(u8, command, "version")) {
         var buf: [256]u8 = undefined;
         var writer = std.fs.File.stdout().writer(&buf);
         try writer.interface.writeAll("zmux " ++ version ++ "\n");
@@ -43,7 +45,7 @@ pub fn main() !void {
         // zmux new [session-name]
         const session_name = args.next() orelse "default";
         return newSession(alloc, session_name);
-    } else if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "a")) {
+    } else if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "-a")) {
         // zmux attach [session-name]
         const session_name = args.next() orelse "default";
         return attachSession(alloc, session_name);
@@ -61,8 +63,11 @@ pub fn main() !void {
         };
         return killSession(session_name);
     } else {
-        // Treat as session name: zmux <session-name>
-        return attachOrCreate(alloc, command);
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stdout().writer(&buf);
+        try writer.interface.writeAll("Unknown command.\nTo check usage instructions, run 'zmux -h'\n");
+        try writer.interface.flush();
+        return;
     }
 }
 
@@ -75,11 +80,12 @@ fn printHelp() void {
         \\Usage: zmux [command] [options]
         \\
         \\Commands:
-        \\  new [name]       Create a new session (default: "default")
-        \\  attach, a [name] Attach to an existing session
-        \\  list, ls         List all sessions
-        \\  kill <name>      Kill a session
-        \\  help             Show this help
+        \\  new [name]        Create a new session (default: "default")
+        \\  attach, -a [name] Attach to an existing session
+        \\  list, ls          List all sessions
+        \\  kill <name>       Kill a session
+        \\  help, -h          Show this help
+        \\  version, -v       Show version
         \\
         \\If no command is given, zmux will attach to "default" session
         \\or create it if it doesn't exist.
