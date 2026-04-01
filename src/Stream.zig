@@ -48,16 +48,21 @@ pub fn Stream(comptime buf_size: usize) type {
         fn bufferedMessage(self: *Self) !?[]u8 {
             const pos = self.pos;
             const start = self.start;
-            std.debug.assert(pos >= start);
+            if (pos < start) return error.InvalidState;
             const unprocessed = self.buf[start..pos];
 
             if (unprocessed.len < 4) {
-                self.ensureSpace(4 - unprocessed.len) catch unreachable;
+                try self.ensureSpace(4 - unprocessed.len);
                 return null;
             }
 
             const message_len = std.mem.readInt(u32, unprocessed[0..4], .little);
             const total_len = message_len + 4;
+
+            // Sanity check: message shouldn't be larger than buffer
+            if (total_len > buf_size) {
+                return error.MessageTooLarge;
+            }
 
             if (unprocessed.len < total_len) {
                 try self.ensureSpace(total_len);

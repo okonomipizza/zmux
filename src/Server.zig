@@ -48,6 +48,16 @@ const ServerState = struct {
 };
 
 pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.termios) !void {
+    // Ignore SIGPIPE to prevent crash when writing to closed sockets
+    // This can happen when sessionExists() checks for session existence
+    // by connecting and immediately disconnecting
+    var act: posix.Sigaction = .{
+        .handler = .{ .handler = posix.SIG.IGN },
+        .mask = @splat(0),
+        .flags = 0,
+    };
+    posix.sigaction(posix.SIG.PIPE, &act, null);
+
     // Create parent directory if it doesn't exist
     if (std.fs.path.dirname(socket_path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
@@ -129,25 +139,26 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
 
             if (fd == listen_fd) {
                 // New client connection
-                const client_fd = try posix.accept(listen_fd, null, null, 0);
+                const client_fd = posix.accept(listen_fd, null, null, 0) catch continue;
                 addClient(&state, client_fd);
             } else {
                 // Check for disconnect
                 if (ev.events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) {
-                    removeClient(&state, fd);
+                    // Check if it's a PTY fd first - don't close it, just ignore
+                    // (PTY HUP means shell exited, but we keep the pane)
+                    if (findPaneByFd(&state, fd) == null) {
+                        removeClient(&state, fd);
+                    }
                     continue;
                 }
 
                 // Check if this is pane pty output
                 if (findPaneByFd(&state, fd)) |pane| {
                     var pty_buf: [4096]u8 = undefined;
-                    const pty_n = posix.read(fd, &pty_buf) catch |err| {
-                        if (err == error.WouldBlock) continue;
-                        return err;
-                    };
+                    const pty_n = posix.read(fd, &pty_buf) catch continue;
                     if (pty_n > 0) {
-                        try pane.feed(pty_buf[0..pty_n]);
-                        try renderAndBroadcast(&state, false);
+                        pane.feed(pty_buf[0..pty_n]) catch {};
+                        renderAndBroadcast(&state, false) catch {};
                     }
                 } else if (getClient(&state, fd)) |client| {
                     // Client data
@@ -157,7 +168,10 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                         }
                         continue;
                     };
-                    try handleClient(&state, client, data);
+                    // Handle client request - errors should not crash the server
+                    handleClient(&state, client, data) catch {
+                        removeClient(&state, fd);
+                    };
                 }
             }
         }
@@ -242,16 +256,9 @@ fn renderAndBroadcast(state: *ServerState, clear_screen: bool) !void {
 
     const rendered = writer.buffered();
 
-    // Debug: Check if rendered data is non-empty
-    if (rendered.len == 0) {
-        std.debug.print("WARNING: renderAndBroadcast produced empty output\n", .{});
-    }
-
     for (&state.clients.*) |*slot| {
         if (slot.*) |*client| {
-            client.stream.write(rendered, client.fd) catch |err| {
-                std.debug.print("ERROR: Failed to write to client fd={}: {}\n", .{ client.fd, err });
-            };
+            client.stream.write(rendered, client.fd) catch {};
         }
     }
 }
@@ -286,7 +293,21 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
-        .detach => {},
+        .detach => {
+            // Remove client from epoll and close fd
+            posix.epoll_ctl(state.epoll_fd, linux.EPOLL.CTL_DEL, client.fd, null) catch {};
+            posix.close(client.fd);
+
+            // Remove from clients array
+            for (&state.clients.*) |*slot| {
+                if (slot.*) |*cl| {
+                    if (cl.fd == client.fd) {
+                        slot.* = null;
+                        break;
+                    }
+                }
+            }
+        },
         .input => |d| {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
             try active_ws.activePane().pty.write(d.input);

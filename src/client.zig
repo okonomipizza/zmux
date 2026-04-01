@@ -130,6 +130,33 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     const attach_data = try attach_req.encode(&attach_buf);
     try stream.write(attach_data, sock_fd);
 
+    // Wait for attach_ok response before entering main loop
+    while (true) {
+        stream.receiveData(sock_fd) catch |err| {
+            if (err == error.Closed) return;
+            return err;
+        };
+
+        if (stream.nextMessage()) |msg| {
+            // Parse as Response to verify it's attach_ok
+            const response = protocol.Response.decode(msg) catch {
+                // Invalid response, treat as fatal error
+                return error.InvalidAttachResponse;
+            };
+            switch (response) {
+                .attach_ok => break, // Success, proceed to main loop
+                .err => return error.AttachRejected,
+                .message => {}, // Ignore, wait for attach_ok
+            }
+        }
+    }
+
+    // Process any render output that came with the attach_ok
+    while (stream.nextMessage()) |output| {
+        try stdout.writeAll(output);
+        try stdout.flush();
+    }
+
     // Input mode state
     var mode: InputMode = .normal;
 
@@ -287,7 +314,13 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                             'p' => maybe_req = .{ .paste = {} },
 
                             // Quit
-                            'q' => break :outer,
+                            'q' => {
+                                const req = protocol.Request{ .detach = {} };
+                                const req_data = try req.encode(&req_buf);
+                                try stream.write(req_data, sock_fd);
+
+                                break :outer;
+                            },
 
                             // Unknown key also cancels prefix mode
                             else => {},

@@ -18,7 +18,7 @@ pub const SplitDirection = enum(u8) {
 
 pub const Request = union(enum) {
     attach: Attach,
-    detach: Detach,
+    detach: void,
     input: Input,
     resize: Resize,
     split_pane: SplitPane,
@@ -72,10 +72,6 @@ pub const Request = union(enum) {
         session_name: []const u8,
         cols: u16,
         rows: u16,
-    };
-
-    const Detach = struct {
-        session_name: []const u8,
     };
 
     const Input = struct {
@@ -165,7 +161,7 @@ pub const Request = union(enum) {
                     .rows = rows,
                 } };
             },
-            .detach => return .{ .detach = .{ .session_name = src[1..] } },
+            .detach => return .{ .detach = {} },
             .input => return .{ .input = .{ .input = src[1..] } },
             .resize => {
                 if (src.len < 5) return error.TooShort;
@@ -244,11 +240,10 @@ pub const Request = union(enum) {
                 @memcpy(buf[5..][0..a.session_name.len], a.session_name);
                 return buf[0..needed];
             },
-            .detach => |d| {
-                if (buf.len < 1 + d.session_name.len) return error.BufferTooSmall;
+            .detach => {
+                if (buf.len < 1) return error.BufferTooSmall;
                 buf[0] = @intFromEnum(Method.detach);
-                @memcpy(buf[1..][0..d.session_name.len], d.session_name);
-                return buf[0 .. 1 + d.session_name.len];
+                return buf[0..1];
             },
             .input => |i| {
                 if (buf.len < 1 + i.input.len) return error.BufferTooSmall;
