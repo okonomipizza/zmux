@@ -8,6 +8,7 @@ const client = @import("client.zig").client;
 /// zmux app version
 const version = "0.0.0";
 
+/// unix domain
 const SOCKET_PATH = "/tmp/zmux/default.sock";
 
 pub fn main() !void {

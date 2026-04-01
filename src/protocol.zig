@@ -109,6 +109,8 @@ pub const Request = union(enum) {
         pub const ScrollKey = enum(u8) {
             scroll_up = 0,
             scroll_down = 1,
+            half_page_up = 2,
+            half_page_down = 3,
         };
     };
 

@@ -573,6 +573,8 @@ pub fn toggleFloating(self: *Workspace) void {
     self.show_floating = !self.show_floating;
     if (self.show_floating) {
         self.active_pane = self.floating_pane;
+        // Reset viewport to bottom to show current cursor position
+        self.floating_pane.terminal.scrollViewport(.{ .bottom = {} });
     } else {
         self.active_pane = firstLeaf(self.root);
     }

@@ -384,9 +384,12 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
         .scroll_mode_input => |d| {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
             const pane = active_ws.activePane();
+            const half_page: isize = @intCast(pane.rows / 2);
             switch (d.key) {
                 .scroll_up => pane.terminal.scrollViewport(.{ .delta = -1 }),
                 .scroll_down => pane.terminal.scrollViewport(.{ .delta = 1 }),
+                .half_page_up => pane.terminal.scrollViewport(.{ .delta = -half_page }),
+                .half_page_down => pane.terminal.scrollViewport(.{ .delta = half_page }),
             }
             try renderAndBroadcast(state, false);
         },
@@ -395,7 +398,8 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
             const pane = active_ws.activePane();
             // Reset viewport to bottom
-            pane.terminal.scrollViewport(.{ .top = {} });
+            pane.terminal.scrollViewport(.{ .bottom = {} });
+            state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
         .copy_mode_start => {
@@ -432,37 +436,45 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             state.copy_mode = null;
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
             const pane = active_ws.activePane();
-            pane.terminal.scrollViewport(.{ .top = {} });
+            pane.terminal.scrollViewport(.{ .bottom = {} });
+            state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
         .yank => {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
             const pane = active_ws.activePane();
+
+            // Try to yank selected text if in copy mode with selection
             if (state.copy_mode) |*cm| {
                 if (cm.selecting) {
-                    // Get selected text
-                    const text = cm.getSelectedText(state.alloc, pane) catch return;
-
-                    // Free old clipboard if any
-                    if (state.clipboard) |old| {
-                        state.alloc.free(old);
-                    }
-                    state.clipboard = text;
-
-                    // Send OSC 52 to set system clipboard
-                    var osc_buf: [65536]u8 = undefined;
-                    const encoded = encodeOsc52(text, &osc_buf);
-                    for (&state.clients.*) |*slot| {
-                        if (slot.*) |*cli| {
-                            cli.stream.write(encoded, cli.fd) catch {};
+                    if (cm.getSelectedText(state.alloc, pane)) |text| {
+                        // Free old clipboard if any
+                        if (state.clipboard) |old| {
+                            state.alloc.free(old);
                         }
+                        state.clipboard = text;
+
+                        // Send OSC 52 to set system clipboard (include in render output)
+                        var osc_buf: [65536]u8 = undefined;
+                        const encoded = encodeOsc52(text, &osc_buf);
+                        if (encoded.len > 0) {
+                            for (&state.clients.*) |*slot| {
+                                if (slot.*) |*cli| {
+                                    cli.stream.write(encoded, cli.fd) catch {};
+                                }
+                            }
+                        }
+                    } else |_| {
+                        // Ignore error, just skip clipboard
                     }
                 }
             }
-            // Exit copy mode after yank
+
+            // Always exit copy mode after yank attempt
             state.input_mode = .normal;
             state.copy_mode = null;
-            pane.terminal.scrollViewport(.{ .top = {} });
+            pane.terminal.scrollViewport(.{ .bottom = {} });
+            state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
         .paste => {

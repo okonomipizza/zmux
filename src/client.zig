@@ -268,13 +268,19 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                             // Scroll mode
                             's' => {
                                 mode = .scroll;
-                                maybe_req = .{ .scroll_mode_start = {} };
+                                const req = protocol.Request{ .scroll_mode_start = {} };
+                                const req_data = try req.encode(&req_buf);
+                                try stream.write(req_data, sock_fd);
+                                continue;
                             },
 
                             // Copy mode
                             'c' => {
                                 mode = .copy;
-                                maybe_req = .{ .copy_mode_start = {} };
+                                const req = protocol.Request{ .copy_mode_start = {} };
+                                const req_data = try req.encode(&req_buf);
+                                try stream.write(req_data, sock_fd);
+                                continue;
                             },
 
                             // Paste
@@ -283,18 +289,8 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                             // Quit
                             'q' => break :outer,
 
-                            // Cancel prefix mode
-                            '\r' => {},
-
-                            // Escape also cancels prefix mode
-                            0x1b => {},
-
-                            else => {
-                                // Unknown key in prefix mode - forward as input
-                                const input_req = protocol.Request{ .input = .{ .input = user_input } };
-                                const req_data = try input_req.encode(&req_buf);
-                                try stream.write(req_data, sock_fd);
-                            },
+                            // Unknown key also cancels prefix mode
+                            else => {},
                         }
 
                         // Send the request if any
@@ -337,6 +333,10 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                             // Scroll navigation
                             'j' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
                             'k' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
+
+                            // Half page scroll (Ctrl-u, Ctrl-d)
+                            0x15 => maybe_req = .{ .scroll_mode_input = .{ .key = .half_page_up } }, // Ctrl-u
+                            0x04 => maybe_req = .{ .scroll_mode_input = .{ .key = .half_page_down } }, // Ctrl-d
 
                             // Exit scroll mode
                             '\r' => {
