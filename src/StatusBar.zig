@@ -4,6 +4,9 @@ const WorkspaceManager = @import("WorkspaceManager.zig");
 
 pub const StatusBar = @This();
 
+/// Japanese formal numerals (大字) for workspace numbers 1-10
+const DAIJI = [_][]const u8{ "壱", "弐", "参", "肆", "伍", "陸", "漆", "捌", "玖", "拾" };
+
 pub fn renderWithMode(
     wm: *WorkspaceManager,
     status_row: u16,
@@ -27,8 +30,16 @@ pub fn renderWithMode(
             try writer.writeAll(config.active_workspace_fg.toFgAnsiSeq());
         }
 
-        try writer.print(" {d} ", .{i + 1});
-        written += 3;
+        // Use 大字 for numbers 1-10, fallback to regular digits for > 10
+        if (i < DAIJI.len) {
+            try writer.writeByte(' ');
+            try writer.writeAll(DAIJI[i]);
+            try writer.writeByte(' ');
+            written += 4; // space + full-width char (2 cols) + space
+        } else {
+            try writer.print(" {d} ", .{i + 1});
+            written += 3;
+        }
 
         if (is_active) {
             try writer.writeAll(config.status_bg.toBgAnsiSeq());

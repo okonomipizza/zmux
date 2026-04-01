@@ -1,585 +1,295 @@
 const std = @import("std");
-const Io = std.Io;
-const posix = std.posix;
-// c imports
 const c = @import("c.zig").c;
+const posix = std.posix;
 
-const ghostty_vt = @import("ghostty-vt");
-const clap = @import("clap");
-const jsonc = @import("jsonc");
-
-const WorkspaceManager = @import("WorkspaceManager.zig");
-const Workspace = @import("Workspace.zig");
-const CopyMode = @import("CopyMode.zig");
-const Pty = @import("Pty.zig");
-
-const Renderer = @import("Renderer.zig");
-const Config = @import("Config.zig");
+const Server = @import("Server.zig");
+const client = @import("client.zig").client;
 
 /// zmux app version
-const version = "0.0.0";
-/// Original termios settings, restored on zmux exit
-var original_termios: c.termios = undefined;
-/// Buffer size for reading input
-const BUF_SIZE: usize = 4096;
+const version = "1.0.0";
 
-/// termios configuration for zmux main process
-/// Sets the terminal to non-canonical mode,
-/// allowing input to be read character by character instead of line by line
-fn enableRawMode() !void {
-    // Get original termios configuration
-    if (c.tcgetattr(c.STDIN_FILENO, &original_termios) < 0)
-        return error.TcgetattrFailed;
-
-    var raw = original_termios;
-
-    // non-canonical + echo off + Invalidate signal
-    // ICANON: Canonical-mode
-    // ECHO: Echo input characters
-    // ISIG: Enable signal-generating characters (Ctrl-C etc...)
-    // IEXTEN: Extended input processing (not needed since zmux passes input directly to pty)
-    raw.c_lflag &= ~@as(c_uint, c.ICANON | c.ECHO | c.ISIG | c.IEXTEN);
-    // Disable CR→LF conversion and other input processing
-    // IXON: Output flow control
-    // ICRNL: CR -> NL mapping
-    // BRKINT: Generate SIGINT on BREAK
-    // INPCK: Input parity check
-    // ISTRIP: Clear the 8th bit of input (disabled to support multi-byte characters)
-    raw.c_iflag &= ~@as(c_uint, c.IXON | c.ICRNL | c.BRKINT | c.INPCK | c.ISTRIP);
-    // Enable multi-byte character support
-    raw.c_cflag |= @as(c_uint, c.CS8);
-    // Control when read() returns
-    // Return as soon as 1 character is available, no timeout
-    raw.c_cc[c.VMIN] = 1; // Wait until 1 character is received
-    raw.c_cc[c.VTIME] = 0; // No timeout
-
-    if (c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &raw) < 0)
-        return error.TcsetattrFailed;
-}
-
-/// Restore the terminal attributes modified by zmux to their original state
-fn disableRawMode() void {
-    _ = c.tcsetattr(c.STDIN_FILENO, c.TCSANOW, &original_termios);
-}
-
-/// Add fd to epoll monitor list
-fn epollAdd(epoll_fd: c_int, fd: c_int, events: u32) !void {
-    var ev = c.epoll_event{
-        .events = events,
-        .data = .{ .fd = fd },
-    };
-    if (c.epoll_ctl(epoll_fd, c.EPOLL_CTL_ADD, fd, &ev) < 0)
-        return error.EpollCtlFailed;
-}
+/// Base directory for zmux sockets
+/// The session runs as a daemon in forked threads, with communication between
+/// server and client threads occurring via unix domain socket.
+const SOCKET_DIR = "/tmp/zmux";
 
 pub fn main() !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    const alloc = std.heap.page_allocator;
 
-    const params = comptime clap.parseParamsComptime(
-        \\-h, --help     Display this help and exit.
-        \\-v, --version  Output version information and exit.
-        \\
-    );
+    var args = try std.process.argsWithAllocator(alloc);
+    defer args.deinit();
 
-    var res = try clap.parse(clap.Help, &params, clap.parsers.default, .{
-        .allocator = alloc,
-    });
-    defer res.deinit();
+    // Skip program name
+    _ = args.next();
 
-    if (res.args.help != 0) {
-        return clap.helpToFile(std.fs.File.stderr(), clap.Help, &params, .{});
+    const command = args.next() orelse {
+        // Default: attach to "default" session or create it
+        return attachOrCreate(alloc, "default");
+    };
+
+    // Check for flags
+    if (std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+        return printHelp();
     }
 
-    if (res.args.version != 0) {
-        const stderr = std.fs.File.stderr();
-        try stderr.writeAll("zmux " ++ version ++ "\n");
+    if (std.mem.eql(u8, command, "-v") or std.mem.eql(u8, command, "version")) {
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stdout().writer(&buf);
+        try writer.interface.writeAll("zmux " ++ version ++ "\n");
+        try writer.interface.flush();
         return;
     }
 
-    try spawnServer(alloc);
+    // Commands
+    if (std.mem.eql(u8, command, "new")) {
+        // zmux new [session-name]
+        const session_name = args.next() orelse "default";
+        return newSession(alloc, session_name);
+    } else if (std.mem.eql(u8, command, "attach") or std.mem.eql(u8, command, "-a")) {
+        // zmux attach [session-name]
+        const session_name = args.next() orelse "default";
+        return attachSession(alloc, session_name);
+    } else if (std.mem.eql(u8, command, "list") or std.mem.eql(u8, command, "ls")) {
+        // zmux list
+        return listSessions(alloc);
+    } else if (std.mem.eql(u8, command, "kill")) {
+        // zmux kill <session-name>
+        const session_name = args.next() orelse {
+            var buf: [256]u8 = undefined;
+            var writer = std.fs.File.stderr().writer(&buf);
+            try writer.interface.writeAll("Usage: zmux kill <session-name>\n");
+            try writer.interface.flush();
+            return;
+        };
+        return killSession(session_name);
+    } else {
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stdout().writer(&buf);
+        try writer.interface.writeAll("Unknown command.\nTo check usage instructions, run 'zmux -h'\n");
+        try writer.interface.flush();
+        return;
+    }
 }
 
-fn getTermSize() struct { cols: u16, rows: u16 } {
-    var ws: std.posix.winsize = undefined;
-    _ = c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &ws);
-    return .{ .cols = ws.col, .rows = ws.row };
+fn printHelp() void {
+    var buf: [4096]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buf);
+    writer.interface.writeAll(
+        \\zmux - terminal multiplexer
+        \\
+        \\Usage: zmux [command] [options]
+        \\
+        \\Commands:
+        \\  new [name]        Create a new session (default: "default")
+        \\  attach, -a [name] Attach to an existing session
+        \\  list, ls          List all sessions
+        \\  kill <name>       Kill a session
+        \\  help, -h          Show this help
+        \\  version, -v       Show version
+        \\
+        \\If no command is given, zmux will attach to "default" session
+        \\or create it if it doesn't exist.
+        \\
+        \\Examples:
+        \\  zmux              Attach to or create "default" session
+        \\  zmux new work     Create a new session named "work"
+        \\  zmux work         Attach to or create "work" session
+        \\  zmux attach work  Attach to "work" session
+        \\  zmux ls           List all sessions
+        \\  zmux kill work    Kill "work" session
+        \\
+    ) catch {};
+    writer.interface.flush() catch {};
 }
 
-fn spawnServer(alloc: std.mem.Allocator) !void {
-    const stdout_file = std.fs.File.stdout();
-    try stdout_file.writeAll("\x1b[2J\x1b[H");
+fn getSocketPath(alloc: std.mem.Allocator, session_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "{s}/{s}.sock", .{ SOCKET_DIR, session_name });
+}
 
-    const output_slice = try alloc.alloc(u8, 2 * 1024 * 1024); // 2MB
-    defer alloc.free(output_slice);
-    var output_fbs = std.io.fixedBufferStream(output_slice);
-    const buf_writer = output_fbs.writer();
+fn sessionExists(socket_path: []const u8) bool {
+    // Try to connect to the socket to check if session is alive
+    const sock_fd = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0) catch return false;
+    defer posix.close(sock_fd);
 
-    const original_term = getTermSize();
-    const term = .{
-        .cols = original_term.cols,
-        .rows = original_term.rows - 1, // -1 for bottom bar
+    var addr = posix.sockaddr.un{
+        .family = posix.AF.UNIX,
+        .path = undefined,
     };
+    @memset(&addr.path, 0);
+    if (socket_path.len > addr.path.len) return false;
+    @memcpy(addr.path[0..socket_path.len], socket_path);
 
-    try enableRawMode();
-    defer disableRawMode();
+    posix.connect(sock_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un)) catch return false;
+    return true;
+}
 
-    var workspace_manager = try WorkspaceManager.init(alloc, term.cols, term.rows, original_termios);
-    defer workspace_manager.deinit(alloc);
+fn attachOrCreate(alloc: std.mem.Allocator, session_name: []const u8) !void {
+    const socket_path = try getSocketPath(alloc, session_name);
+    defer alloc.free(socket_path);
 
-    // Current active workspace. Must be updated whenever the active workspace changes.
-    var active_workspace: *Workspace = workspace_manager.getActiveWorkspace() orelse return;
+    if (sessionExists(socket_path)) {
+        // Session exists, attach to it
+        try client(alloc, socket_path);
+    } else {
+        // Session doesn't exist, create it
+        try startServerAndAttach(alloc, session_name, socket_path);
+    }
+}
 
-    const config = Config.load(alloc);
+fn newSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
+    const socket_path = try getSocketPath(alloc, session_name);
+    defer alloc.free(socket_path);
 
-    var renderer = try Renderer.init(alloc, term.cols, term.rows, config);
-    defer renderer.deinit();
+    if (sessionExists(socket_path)) {
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stderr().writer(&buf);
+        try writer.interface.print("Session '{s}' already exists. Use 'zmux attach {s}' to connect.\n", .{ session_name, session_name });
+        try writer.interface.flush();
+        return;
+    }
 
-    // Monitor each process by epoll
-    const epoll_fd = c.epoll_create1(0);
-    if (epoll_fd < 0) return error.EpollCreateFailed;
-    defer _ = c.close(epoll_fd);
-    try epollAdd(epoll_fd, c.STDIN_FILENO, c.EPOLLIN);
+    try startServerAndAttach(alloc, session_name, socket_path);
+}
 
-    // Register the initial panes into the epoll watch list
-    try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
-    try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);
+fn attachSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
+    const socket_path = try getSocketPath(alloc, session_name);
+    defer alloc.free(socket_path);
 
-    var events: [16]c.epoll_event = undefined;
-    var buf: [BUF_SIZE]u8 = undefined;
+    if (!sessionExists(socket_path)) {
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stderr().writer(&buf);
+        try writer.interface.print("Session '{s}' not found. Use 'zmux new {s}' to create.\n", .{ session_name, session_name });
+        try writer.interface.flush();
+        return;
+    }
 
-    // Enable bracketed paste mode on the outer terminal
-    try stdout_file.writeAll("\x1b[?2004h");
-    defer stdout_file.writeAll("\x1b[?2004l") catch {};
+    try client(alloc, socket_path);
+}
 
-    // Key input handling state
-    var prefix_mode: bool = false;
-    var move_pane_mode: bool = false;
-    var scroll_mode: bool = false;
-    var copy_mode_state: ?CopyMode = null;
-    var bracketed_paste: bool = false;
+fn startServerAndAttach(alloc: std.mem.Allocator, session_name: []const u8, socket_path: []const u8) !void {
+    _ = session_name;
 
-    // Internal clipboard buffer
-    var clipboard: std.ArrayList(u8) = .empty;
-    defer clipboard.deinit(alloc);
+    // Create socket directory if it doesn't exist
+    std.fs.cwd().makePath(SOCKET_DIR) catch {};
 
-    while (true) {
-        const n = c.epoll_wait(epoll_fd, &events, @intCast(events.len), -1);
-        if (n < 0) continue;
+    // Get termios BEFORE forking (while we still have a valid terminal)
+    var original_termios: c.termios = undefined;
+    _ = c.tcgetattr(c.STDIN_FILENO, &original_termios);
 
-        for (events[0..@intCast(n)]) |ev| {
-            const fd = ev.data.fd;
+    const pid = try posix.fork();
 
-            if (fd == c.STDIN_FILENO) {
-                // Read from stdin and forward to the active pane
-                const nr = c.read(c.STDIN_FILENO, &buf, BUF_SIZE);
-                if (nr <= 0) return;
-                const input = buf[0..@intCast(nr)];
+    if (pid == 0) {
+        // Child: become session leader and run server
+        _ = posix.setsid() catch {};
 
-                // Bracketed paste: detect \x1b[200~ (start) and \x1b[201~ (end)
-                // Forward pasted content directly to PTY without interpretation
-                if (bracketed_paste) {
-                    // Check for end of bracketed paste: \x1b[201~
-                    if (std.mem.indexOf(u8, input, "\x1b[201~")) |end_pos| {
-                        const active = active_workspace.activePane();
-                        if (end_pos > 0) {
-                            active.pty.write(input[0..end_pos]) catch {};
-                        }
-                        bracketed_paste = false;
-                        // Forward any remaining input after the paste end marker
-                        const after = end_pos + 6; // len of "\x1b[201~"
-                        if (after < input.len) {
-                            active.pty.write(input[after..]) catch {};
-                        }
-                    } else {
-                        const active = active_workspace.activePane();
-                        active.pty.write(input) catch {};
-                    }
-                    continue;
+        // Close stdin/stdout/stderr
+        posix.close(0);
+        posix.close(1);
+        posix.close(2);
+
+        // Reopen as /dev/null
+        _ = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {};
+        _ = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {};
+        _ = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {};
+
+        Server.server(alloc, socket_path, original_termios) catch {};
+        posix.exit(0);
+    } else {
+        // Parent process: wait a bit for server to start, then attach
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+
+        // Retry connection a few times
+        var attempts: u8 = 0;
+        while (attempts < 10) : (attempts += 1) {
+            if (sessionExists(socket_path)) {
+                try client(alloc, socket_path);
+                return;
+            }
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stderr().writer(&buf);
+        try writer.interface.writeAll("Failed to start session\n");
+        try writer.interface.flush();
+    }
+}
+
+fn listSessions(alloc: std.mem.Allocator) !void {
+    var buf: [4096]u8 = undefined;
+    var writer = std.fs.File.stdout().writer(&buf);
+    const stdout = &writer.interface;
+
+    var dir = std.fs.cwd().openDir(SOCKET_DIR, .{ .iterate = true }) catch {
+        try stdout.writeAll("No sessions found.\n");
+        try stdout.flush();
+        return;
+    };
+    defer dir.close();
+
+    var found = false;
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .unix_domain_socket or
+            (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".sock")))
+        {
+            // Check if session is actually alive
+            const socket_path = try getSocketPath(alloc, entry.name[0 .. entry.name.len - 5]); // Remove .sock
+            defer alloc.free(socket_path);
+
+            if (sessionExists(socket_path)) {
+                if (!found) {
+                    try stdout.writeAll("Active sessions:\n");
+                    found = true;
                 }
-
-                // Check for bracketed paste start: \x1b[200~
-                if (std.mem.indexOf(u8, input, "\x1b[200~")) |start_pos| {
-                    const active = active_workspace.activePane();
-                    // Forward anything before the paste marker
-                    if (start_pos > 0) {
-                        active.pty.write(input[0..start_pos]) catch {};
-                    }
-                    // Forward the paste content after the marker
-                    const after = start_pos + 6; // len of "\x1b[200~"
-                    if (after < input.len) {
-                        // Check if paste end is also in this chunk
-                        const rest = input[after..];
-                        if (std.mem.indexOf(u8, rest, "\x1b[201~")) |end_pos| {
-                            if (end_pos > 0) {
-                                active.pty.write(rest[0..end_pos]) catch {};
-                            }
-                            const final_after = end_pos + 6;
-                            if (final_after < rest.len) {
-                                active.pty.write(rest[final_after..]) catch {};
-                            }
-                        } else {
-                            active.pty.write(rest) catch {};
-                            bracketed_paste = true;
-                        }
-                    } else {
-                        bracketed_paste = true;
-                    }
-                    continue;
-                }
-
-                // Ctrl-b (0x02) activates zmux prefix mode
-                if (input.len == 1 and input[0] == 0x02) {
-                    prefix_mode = true;
-                    continue;
-                }
-
-                // Handle scroll mode input for the active pane
-                if (scroll_mode) {
-                    switch (input[0]) {
-                        '\r' => {
-                            // enter key deactivates scroll mode
-                            scroll_mode = false;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
-                        },
-                        'j' => {
-                            // Scroll down
-                            workspace_manager.getActiveWorkspace().?.active_pane.terminal.scrollViewport(.{ .delta = 1 });
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "SCROLL");
-                        },
-                        'k' => {
-                            // Scroll up
-                            workspace_manager.getActiveWorkspace().?.active_pane.terminal.scrollViewport(.{ .delta = -1 });
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "SCROLL");
-                        },
-                        else => {},
-                    }
-                    continue;
-                }
-
-                // Handle move_pane mode input for the moving pane
-                if (move_pane_mode) {
-                    move_pane_mode = false;
-                    if (input.len == 1 and input[0] >= '1' and input[0] <= '9') {
-                        const target_idx: usize = input[0] - '1';
-                        workspace_manager.movePaneToWorkspace(alloc, target_idx) catch {
-                            continue;
-                        };
-                        active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-                        try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                    }
-                    continue;
-                }
-
-                // Handle copy mode input
-                if (copy_mode_state != null) {
-                    var cm = &copy_mode_state.?;
-                    const pane = active_workspace.activePane();
-                    switch (input[0]) {
-                        'h' => cm.moveLeft(),
-                        'j' => cm.moveDown(pane),
-                        'k' => cm.moveUp(pane),
-                        'l' => cm.moveRight(pane),
-                        'v' => cm.startSelection(),
-                        '0' => cm.beginOfLine(),
-                        '$' => cm.endOfLine(pane),
-                        'g' => cm.topOfScreen(),
-                        'G' => cm.bottomOfScreen(pane),
-                        'w' => cm.nextWord(pane),
-                        'b' => cm.prevWord(pane),
-                        0x15 => cm.halfPageUp(pane), // Ctrl-u
-                        0x04 => cm.halfPageDown(pane), // Ctrl-d
-                        'y' => {
-                            if (cm.selecting) {
-                                const text = cm.getSelectedText(alloc, pane) catch null;
-                                if (text) |t| {
-                                    // Store in internal clipboard
-                                    clipboard.clearRetainingCapacity();
-                                    clipboard.appendSlice(alloc, t) catch {};
-                                    // Send to macOS clipboard via OSC 52
-                                    setOsc52Clipboard(stdout_file, t) catch {};
-                                    alloc.free(t);
-                                }
-                            }
-                            pane.terminal.scrollViewport(.{ .bottom = {} });
-                            copy_mode_state = null;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
-                            continue;
-                        },
-                        'q', 0x1b => { // q or Escape
-                            pane.terminal.scrollViewport(.{ .bottom = {} });
-                            copy_mode_state = null;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, null);
-                            continue;
-                        },
-                        else => {},
-                    }
-                    // Re-render with copy mode overlay
-                    try refreshScreenCopyMode(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, &copy_mode_state.?);
-                    continue;
-                }
-
-                // Handle prefix mode key bindings
-                if (prefix_mode) {
-                    prefix_mode = false; // Reset prefix mode regardless of which key follows
-                    switch (input[0]) {
-                        '\r' => {
-                            // Exit prefix mode
-                        },
-                        'm' => {
-                            // Activate move_pane mode
-                            move_pane_mode = true;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "MOVE");
-                        },
-                        's' => {
-                            // Activate scroll_mode
-                            scroll_mode = true;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "SCROLL");
-                        },
-                        'c' => {
-                            const pane = active_workspace.activePane();
-                            copy_mode_state = CopyMode.init(pane);
-                            try refreshScreenCopyMode(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, &copy_mode_state.?);
-                            continue;
-                        },
-                        'p' => {
-                            // Paste from internal clipboard
-                            if (clipboard.items.len > 0) {
-                                const active = active_workspace.activePane();
-                                active.pty.write(clipboard.items) catch {};
-                            }
-                        },
-                        // ----- Workspace control -----
-                        'n' => {
-                            // Append a new workspace
-                            const MAX_WORKSPACE_NUM: usize = 9;
-                            if (workspace_manager.workspaces.items.len < MAX_WORKSPACE_NUM) {
-                                try workspace_manager.appendWorkspace(alloc);
-                                workspace_manager.switchWorkspace(workspace_manager.workspaces.items.len - 1);
-                                active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-                                try epollAdd(epoll_fd, active_workspace.active_pane.pty.master_fd, c.EPOLLIN);
-                                try epollAdd(epoll_fd, active_workspace.floating_pane.pty.master_fd, c.EPOLLIN);
-
-                                try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                            }
-                        },
-                        'f' => {
-                            active_workspace.toggleFloating();
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                        },
-                        'i' => {
-                            active_workspace = workspace_manager.nextWorkspace() orelse return;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-
-                            // Keep prefix mode active so workspace can be cycled with repeated presses
-                            prefix_mode = true;
-                        },
-                        'u' => {
-                            active_workspace = workspace_manager.prevWorkspace() orelse return;
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-
-                            // Keep prefix mode active so workspace can be cycled with repeated presses
-                            prefix_mode = true;
-                        },
-                        '1', '2', '3', '4', '5', '6', '7', '8', '9' => {
-                            const idx = input[0] - '1';
-                            if (idx < workspace_manager.workspaces.items.len) {
-                                workspace_manager.switchWorkspace(idx);
-                                active_workspace = workspace_manager.getActiveWorkspace() orelse return;
-                                try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                            }
-                        },
-                        // ----- Pane control -----
-                        '\\' => {
-                            const new_fd = try active_workspace.splitPane(alloc, .vertical);
-                            try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
-
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                        },
-                        '-' => {
-                            const new_fd = try active_workspace.splitPane(alloc, .horizontal);
-                            try epollAdd(epoll_fd, new_fd, c.EPOLLIN);
-
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                        },
-                        'h' => {
-                            active_workspace.focusPane(.left);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'j' => {
-                            active_workspace.focusPane(.down);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'k' => {
-                            active_workspace.focusPane(.up);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'l' => {
-                            active_workspace.focusPane(.right);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, false, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'J' => {
-                            try active_workspace.swapPane(alloc, .down);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'H' => {
-                            try active_workspace.swapPane(alloc, .left);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'L' => {
-                            try active_workspace.swapPane(alloc, .right);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'K' => {
-                            try active_workspace.swapPane(alloc, .up);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        '>' => {
-                            try active_workspace.resizePane(alloc, 0.05);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        '<' => {
-                            try active_workspace.resizePane(alloc, -0.05);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, "PREFIX");
-                            prefix_mode = true;
-                        },
-                        'x' => {
-                            try active_workspace.closePane(alloc);
-                            try refreshScreen(&output_fbs, &renderer, active_workspace, &workspace_manager, original_term.rows, stdout_file, true, null);
-                        },
-                        'q' => {
-                            // exit zmux
-                            return;
-                        },
-                        else => {
-                            const active = active_workspace.activePane();
-                            active.pty.write(input) catch continue;
-                        },
-                    }
-                    continue;
-                }
-
-                // No matching key binding — forward input to the active pty
-                const active = active_workspace.activePane();
-                active.pty.write(input) catch continue;
+                // Print session name without .sock extension
+                const name = entry.name[0 .. entry.name.len - 5];
+                try stdout.print("  {s}\n", .{name});
             } else {
-                // Received output from the pane - read and feed it to the pane's buffer
-                const pane = active_workspace.getPane(ev.data.fd) orelse continue;
-                const nr = c.read(pane.pty.master_fd, &buf, BUF_SIZE);
-                if (nr <= 0) return;
-
-                try pane.feed(buf[0..@intCast(nr)]);
-
-                output_fbs.reset();
-
-                const pty_mode_label: ?[]const u8 = if (copy_mode_state != null) "COPY" else if (prefix_mode) "PREFIX" else if (scroll_mode) "SCROLL" else if (move_pane_mode) "MOVE" else null;
-
-                if (active_workspace.show_floating and pane == active_workspace.floating_pane) {
-                    try renderer.renderFloatingOnly(active_workspace, &workspace_manager, original_term.rows, buf_writer, pty_mode_label);
-                } else {
-                    try renderer.renderAll(active_workspace, &workspace_manager, original_term.rows, buf_writer, pty_mode_label);
-                }
-
-                try stdout_file.writeAll(output_fbs.getWritten());
+                // Clean up stale socket
+                dir.deleteFile(entry.name) catch {};
             }
         }
-
-        const active = active_workspace.activePane();
-
-        // If the shell process has exited, return
-        const result = c.waitpid(active.pty.pid, null, c.WNOHANG);
-        if (result == active.pty.pid) {
-            return;
-        }
     }
+
+    if (!found) {
+        try stdout.writeAll("No active sessions.\n");
+    }
+    try stdout.flush();
 }
 
-/// Call this function once terminal changes are complete.
-fn refreshScreen(
-    fbs: *std.io.FixedBufferStream([]u8),
-    renderer: *Renderer,
-    active_workspace: *Workspace,
-    workspace_manager: *WorkspaceManager,
-    original_rows: u16,
-    stdout_file: std.fs.File,
-    comptime clear: bool,
-    mode_label: ?[]const u8,
-) !void {
-    fbs.reset();
-    if (clear) {
-        fbs.writer().writeAll("\x1b[2J") catch {};
-    }
-    renderer.invalidate();
-    try renderer.renderAll(active_workspace, workspace_manager, original_rows, fbs.writer(), mode_label);
-    try stdout_file.writeAll(fbs.getWritten());
-}
+fn killSession(session_name: []const u8) !void {
+    var stdout_buf: [256]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_writer.interface;
 
-/// Refresh screen with copy mode overlay
-fn refreshScreenCopyMode(
-    fbs: *std.io.FixedBufferStream([]u8),
-    renderer: *Renderer,
-    active_workspace: *Workspace,
-    workspace_manager: *WorkspaceManager,
-    original_rows: u16,
-    stdout_file: std.fs.File,
-    cm: *const CopyMode,
-) !void {
-    fbs.reset();
-    const writer = fbs.writer();
-    const pane = active_workspace.activePane();
-    renderer.invalidateRect(pane.x, pane.y, pane.cols, pane.rows);
-    try renderer.renderAll(active_workspace, workspace_manager, original_rows, writer, "COPY");
-    try renderer.renderCopyModeOverlay(pane, cm, writer);
-    try stdout_file.writeAll(fbs.getWritten());
-}
+    var stderr_buf: [256]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_writer.interface;
 
-/// Send text to the outer terminal's clipboard via OSC 52
-fn setOsc52Clipboard(stdout_file: std.fs.File, text: []const u8) !void {
-    const encoder = std.base64.standard.Encoder;
-    const encoded_len = encoder.calcSize(text.len);
+    var path_buf: [256]u8 = undefined;
+    const socket_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.sock", .{ SOCKET_DIR, session_name }) catch {
+        try stderr.writeAll("Session name too long\n");
+        try stderr.flush();
+        return;
+    };
 
-    // Build the OSC 52 sequence: \x1b]52;c;<base64>\x1b\\
-    // Use a stack buffer for small payloads, heap for large
-    var stack_buf: [4096]u8 = undefined;
-    const header = "\x1b]52;c;";
-    const trailer = "\x1b\\";
-    const total_len = header.len + encoded_len + trailer.len;
+    // Check if session exists
+    const stat = std.fs.cwd().statFile(socket_path) catch {
+        try stderr.print("Session '{s}' not found.\n", .{session_name});
+        try stderr.flush();
+        return;
+    };
+    _ = stat;
 
-    if (total_len <= stack_buf.len) {
-        @memcpy(stack_buf[0..header.len], header);
-        _ = encoder.encode(stack_buf[header.len .. header.len + encoded_len], text);
-        @memcpy(stack_buf[header.len + encoded_len ..][0..trailer.len], trailer);
-        try stdout_file.writeAll(stack_buf[0..total_len]);
-    } else {
-        // For very large payloads, write in parts
-        try stdout_file.writeAll(header);
-        // Encode in chunks
-        var offset: usize = 0;
-        while (offset < text.len) {
-            const chunk_end = @min(offset + 2048, text.len);
-            // Base64 encode needs to work on 3-byte boundaries for intermediate chunks
-            const aligned_end = if (chunk_end < text.len)
-                offset + ((chunk_end - offset) / 3) * 3
-            else
-                chunk_end;
-            if (aligned_end == offset) break;
-            const chunk = text[offset..aligned_end];
-            const chunk_enc_len = encoder.calcSize(chunk.len);
-            var enc_buf: [2800]u8 = undefined; // 2048 * 4/3 + padding
-            _ = encoder.encode(enc_buf[0..chunk_enc_len], chunk);
-            try stdout_file.writeAll(enc_buf[0..chunk_enc_len]);
-            offset = aligned_end;
-        }
-        try stdout_file.writeAll(trailer);
-    }
+    // Remove the socket file - this will cause the server to exit
+    // when it tries to accept new connections
+    std.fs.cwd().deleteFile(socket_path) catch |err| {
+        try stderr.print("Failed to kill session: {}\n", .{err});
+        try stderr.flush();
+        return;
+    };
+
+    try stdout.print("Session '{s}' killed.\n", .{session_name});
+    try stdout.flush();
 }

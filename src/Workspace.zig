@@ -11,7 +11,7 @@ termios: c.termios,
 root: *PaneNode,
 show_floating: bool,
 
-// ノードは分割されているか、されていないかのどっちか
+/// A tree is used to represent the relationships among split panes.
 const PaneNode = union(enum) {
     leaf: *Pane,
     split: struct {
@@ -106,12 +106,10 @@ fn deinitPanes(node: *PaneNode) void {
     }
 }
 
-/// 現在のワークスペース内におけるアクティブペインへの参照を返す
 pub fn activePane(self: *Workspace) *Pane {
     return self.active_pane;
 }
 
-/// 指定された fd を持つ ペインを返す
 pub fn getPane(self: *Workspace, fd: c_int) ?*Pane {
     if (self.floating_pane.pty.master_fd == fd) return self.floating_pane;
     return findPane(self.root, fd);
@@ -129,24 +127,22 @@ fn findPane(node: *PaneNode, fd: c_int) ?*Pane {
     }
 }
 
-/// ペインを分割して epoll に登録すべき新しい fd を返す
+/// Split panes and returns new pane's master_fd
+/// New pane will be a next active pane
 pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_int {
-    // active_paneを持つleafノードを探す
+    // Find the active pane node
     const leaf_node = findLeafNode(self.root, self.active_pane) orelse return error.ActivePaneLost;
     const active = leaf_node.leaf;
 
     const new_size = try calcNewPaneSize(active.x, active.y, active.cols, active.rows, dir);
 
-    // 既存ペインをリサイズ
     try active.resize(alloc, new_size.active_cols, new_size.active_rows);
 
-    // 新しいペインを作成
     const new_pane = try alloc.create(Pane);
     errdefer alloc.destroy(new_pane);
     new_pane.* = try Pane.init(alloc, self.termios, new_size.x, new_size.y, new_size.cols, new_size.rows);
     new_pane.vt_stream = new_pane.terminal.vtStream();
 
-    // 子ノードを作成
     const first_node = try alloc.create(PaneNode);
     errdefer alloc.destroy(first_node);
     first_node.* = .{ .leaf = active };
@@ -155,7 +151,6 @@ pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_i
     errdefer alloc.destroy(second_node);
     second_node.* = .{ .leaf = new_pane };
 
-    // 元のleafノードをsplitに変換
     leaf_node.* = .{ .split = .{
         .dir = dir,
         .ratio = 0.5,
@@ -163,7 +158,6 @@ pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_i
         .second = second_node,
     } };
 
-    // 新ペインをアクティブに
     self.active_pane = new_pane;
 
     return new_pane.pty.master_fd;
@@ -186,7 +180,6 @@ pub fn closePane(self: *Workspace, alloc: std.mem.Allocator) !void {
     alloc.destroy(sibling);
     parent.* = sibling_copy;
 
-    // ルートからワークスペース全体を再レイアウト
     try relayout(alloc, self.root, self.cols, self.rows, 0, 0);
 
     self.active_pane = firstLeaf(parent);
@@ -202,15 +195,12 @@ fn findParentSplit(node: *PaneNode, target: *Pane) ?FindResult {
     switch (node.*) {
         .leaf => return null,
         .split => |s| {
-            // firstが閉じる対象か
             if (s.first.* == .leaf and s.first.leaf == target) {
                 return .{ .parent = node, .closing = s.first, .sibling = s.second };
             }
-            // secondが閉じる対象か
             if (s.second.* == .leaf and s.second.leaf == target) {
                 return .{ .parent = node, .closing = s.second, .sibling = s.first };
             }
-            // 再帰的に探す
             return findParentSplit(s.first, target) orelse findParentSplit(s.second, target);
         },
     }
@@ -223,7 +213,7 @@ fn firstLeaf(node: *PaneNode) *Pane {
     }
 }
 
-/// ツリーを再帰的に走査して、各ペインの位置とサイズを再計算する
+/// Calculate all panes size
 fn relayout(alloc: std.mem.Allocator, node: *PaneNode, cols: u16, rows: u16, x: u16, y: u16) !void {
     switch (node.*) {
         .leaf => |pane| {
@@ -237,13 +227,13 @@ fn relayout(alloc: std.mem.Allocator, node: *PaneNode, cols: u16, rows: u16, x: 
             switch (s.dir) {
                 .vertical => {
                     const first_cols = @as(u16, @intFromFloat(@as(f32, @floatFromInt(cols)) * s.ratio)) -| 1;
-                    const second_cols = cols - first_cols - 1; // 1は境界線
+                    const second_cols = cols - first_cols - 1; // 1 is for border width
                     try relayout(alloc, s.first, first_cols, rows, x, y);
                     try relayout(alloc, s.second, second_cols, rows, x + first_cols + 1, y);
                 },
                 .horizontal => {
                     const first_rows = @as(u16, @intFromFloat(@as(f32, @floatFromInt(rows)) * s.ratio)) -| 1;
-                    const second_rows = rows - first_rows - 1;
+                    const second_rows = rows - first_rows - 1; // 1 is for border height
                     try relayout(alloc, s.first, cols, first_rows, x, y);
                     try relayout(alloc, s.second, cols, second_rows, x, y + first_rows + 1);
                 },
@@ -296,23 +286,21 @@ const NewPaneSize = struct {
     y: u16,
     cols: u16,
     rows: u16,
-    // 分割前にactiveだった pane の分割後のサイズ
+    // The size of original pane after splitting
     active_cols: u16,
     active_rows: u16,
 };
 
-const SplitDir = enum { vertical, horizontal };
+pub const SplitDir = enum { vertical, horizontal };
 const MINIMUM_PANE_SIZE: u16 = 4;
 
-// active pane の開始位置を渡すと、active_paneを分割した場合に、
-// 新しく作成されるpaneの開始位置を返す
+// Start position and size of the (active) pane will be splitted is needed for calculating new pane size
 fn calcNewPaneSize(x: u16, y: u16, cols: u16, rows: u16, dir: SplitDir) !NewPaneSize {
     return switch (dir) {
         .vertical => {
-            // 左右に分割
             if (cols / 2 < MINIMUM_PANE_SIZE) return error.PaneTooSmall;
             const new_cols = cols / 2;
-            const active_cols = cols - new_cols - 1; // 1 は境界線の幅
+            const active_cols = cols - new_cols - 1; // 1 is width for border line
 
             return .{
                 .x = x + active_cols + 1,
@@ -324,10 +312,9 @@ fn calcNewPaneSize(x: u16, y: u16, cols: u16, rows: u16, dir: SplitDir) !NewPane
             };
         },
         .horizontal => {
-            // 上下に分割
             if (rows / 2 < MINIMUM_PANE_SIZE) return error.PaneTooSmall;
             const new_rows = rows / 2;
-            const active_rows = rows - new_rows - 1; // 1 は境界線の幅
+            const active_rows = rows - new_rows - 1; // 1 is height for border line
             return .{
                 .x = x,
                 .y = y + active_rows + 1,
@@ -376,7 +363,7 @@ fn findParentOf(node: *PaneNode, target: *Pane) ?ParentInfo {
     }
 }
 
-const Direction = enum { left, right, up, down };
+pub const Direction = enum { left, right, up, down };
 
 /// 指定方向の隣接ペインにフォーカスを移す
 pub fn focusPane(self: *Workspace, dir: Direction) void {
@@ -388,7 +375,6 @@ pub fn swapPane(self: *Workspace, alloc: std.mem.Allocator, dir: Direction) !voi
     const active = self.active_pane;
     const target = findAdjacentPane(self.root, active, dir) orelse return;
 
-    // 座標とサイズを入れ替え
     const tmp_x = active.x;
     const tmp_y = active.y;
     const tmp_cols = active.cols;
@@ -402,7 +388,6 @@ pub fn swapPane(self: *Workspace, alloc: std.mem.Allocator, dir: Direction) !voi
     target.y = tmp_y;
     try target.resize(alloc, tmp_cols, tmp_rows);
 
-    // ツリー内のポインタも入れ替え
     swapLeafPointers(self.root, active, target);
 }
 
@@ -498,7 +483,6 @@ fn swapLeafPointers(node: *PaneNode, a: *Pane, b: *Pane) void {
 pub fn detachPane(self: *Workspace, alloc: std.mem.Allocator) !?*Pane {
     const target = self.active_pane;
 
-    // ペインが1つだけの場合は特別処理が必要
     if (self.root.* == .leaf) {
         return null;
     }
@@ -516,10 +500,8 @@ pub fn detachPane(self: *Workspace, alloc: std.mem.Allocator) !?*Pane {
     alloc.destroy(sibling);
     parent.* = sibling_copy;
 
-    // 再レイアウト
     try relayout(alloc, self.root, self.cols, self.rows, 0, 0);
 
-    // アクティブペインを残ったツリーの先頭に更新
     self.active_pane = firstLeaf(parent);
 
     return target;
@@ -542,7 +524,6 @@ pub fn attachPane(self: *Workspace, alloc: std.mem.Allocator, pane: *Pane) !void
     pane.y = 0;
     try pane.resize(alloc, new_cols, self.rows);
 
-    // 既存ツリーをリサイズ
     try relayout(alloc, self.root, first_cols, self.rows, 0, 0);
 
     // 新しい leaf ノード
@@ -573,7 +554,24 @@ pub fn toggleFloating(self: *Workspace) void {
     self.show_floating = !self.show_floating;
     if (self.show_floating) {
         self.active_pane = self.floating_pane;
+        // Reset viewport to bottom to show current cursor position
+        self.floating_pane.terminal.scrollViewport(.{ .bottom = {} });
     } else {
         self.active_pane = firstLeaf(self.root);
     }
+}
+
+/// ワークスペース全体をリサイズする（タイルペイン + フローティングペイン）
+pub fn resizeWorkspace(self: *Workspace, alloc: std.mem.Allocator, cols: u16, rows: u16) !void {
+    self.cols = cols;
+    self.rows = rows;
+
+    // タイルペインをリレイアウト
+    try relayout(alloc, self.root, cols, rows, 0, 0);
+
+    // フローティングペインをリサイズ
+    const fg = calcFloatingGeometry(cols, rows);
+    self.floating_pane.x = fg.x;
+    self.floating_pane.y = fg.y;
+    try self.floating_pane.resize(alloc, fg.cols, fg.rows);
 }

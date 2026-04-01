@@ -65,9 +65,16 @@ pub fn renderAll(
     status_row: u16,
     writer: anytype,
     mode_label: ?[]const u8,
+    clear_screen: bool,
+    copy_mode: ?CopyMode.CopyMode,
 ) !void {
     // Hide the cursor
     try writer.writeAll("\x1b[?25l");
+
+    // Clear screen if requested (e.g., after closing a pane)
+    if (clear_screen) {
+        try writer.writeAll("\x1b[2J\x1b[H");
+    }
 
     // TODO Consider appropriate maximum number of panes
     var buf: [64]*Pane = undefined;
@@ -83,22 +90,29 @@ pub fn renderAll(
         try self.renderFloatingPane(workspace.floating_pane, workspace.active_pane == workspace.floating_pane, writer);
     }
 
+    // Render copy mode overlay if active
+    if (copy_mode) |cm| {
+        try self.renderCopyModeOverlay(workspace.activePane(), &cm, writer);
+    }
+
     // Render status bar at the bottom of floor
     try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label, self.config);
 
-    // Move the cursor to saved position
-    const active = workspace.activePane();
-    const screen = active.terminal.screens.active;
-    try writer.print("\x1b[{d};{d}H", .{
-        active.y + screen.cursor.y + 1,
-        active.x + screen.cursor.x + 1,
-    });
+    // Move the cursor to saved position (unless in copy mode, where we position in overlay)
+    if (copy_mode == null) {
+        const active = workspace.activePane();
+        const screen = active.terminal.screens.active;
+        try writer.print("\x1b[{d};{d}H", .{
+            active.y + screen.cursor.y + 1,
+            active.x + screen.cursor.x + 1,
+        });
 
-    // Set cursor style (DECSCUSR) based on active pane's terminal state
-    try writeCursorStyle(screen.cursor.cursor_style, writer);
+        // Set cursor style (DECSCUSR) based on active pane's terminal state
+        try writeCursorStyle(screen.cursor.cursor_style, writer);
 
-    // Show the cursor
-    try writer.writeAll("\x1b[?25h");
+        // Show the cursor
+        try writer.writeAll("\x1b[?25h");
+    }
 }
 
 fn writeCursorStyle(style: anytype, writer: anytype) !void {
@@ -551,13 +565,15 @@ fn renderFloatingPane(
 }
 
 /// Render copy mode overlay: selection highlight and cursor
+/// Also invalidates the affected cells so they will be redrawn correctly on the next frame
 pub fn renderCopyModeOverlay(
     self: *Renderer,
     pane: *Pane,
-    cm: *const CopyMode,
+    cm: *const CopyMode.CopyMode,
     writer: anytype,
 ) !void {
     const screen = pane.terminal.screens.active;
+    const dirty_cell: Cell = .{ .codepoint = std.math.maxInt(u21) };
 
     // Hide cursor during overlay rendering
     try writer.writeAll("\x1b[?25l");
@@ -588,6 +604,8 @@ pub fn renderCopyModeOverlay(
                 const abs_x = pane.x + x;
                 const abs_y = pane.y + y;
 
+                if (abs_x >= self.term_cols or abs_y >= self.term_rows) continue;
+
                 try writer.print("\x1b[{d};{d}H\x1b[7m", .{ abs_y + 1, abs_x + 1 });
 
                 const lc = screen.pages.getCell(.{
@@ -610,6 +628,9 @@ pub fn renderCopyModeOverlay(
                     try writer.writeByte(' ');
                 }
                 try writer.writeAll("\x1b[0m");
+
+                // Mark cell as dirty so it will be redrawn on next frame
+                self.prevCell(abs_x, abs_y).* = dirty_cell;
             }
         }
     }
@@ -618,31 +639,37 @@ pub fn renderCopyModeOverlay(
     {
         const abs_x = pane.x + cm.cursor_x;
         const abs_y = pane.y + cm.cursor_y;
-        try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
 
-        const lc = screen.pages.getCell(.{
-            .viewport = .{ .x = @intCast(cm.cursor_x), .y = @intCast(cm.cursor_y) },
-        });
+        if (abs_x < self.term_cols and abs_y < self.term_rows) {
+            try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
 
-        // Block cursor for copy mode
-        try writer.writeAll(self.config.copy_cursor_fg.toFgAnsiSeq());
-        try writer.writeAll(self.config.copy_cursor_bg.toBgAnsiSeq());
-        if (lc) |l| {
-            const cp = l.cell.codepoint();
-            if (cp == 0 or l.cell.wide == .spacer_tail) {
-                try writer.writeByte(' ');
-            } else {
-                var utf8_buf: [4]u8 = undefined;
-                const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
-                if (len == 1 and utf8_buf[0] == 0) {
+            const lc = screen.pages.getCell(.{
+                .viewport = .{ .x = @intCast(cm.cursor_x), .y = @intCast(cm.cursor_y) },
+            });
+
+            // Block cursor for copy mode
+            try writer.writeAll(self.config.copy_cursor_fg.toFgAnsiSeq());
+            try writer.writeAll(self.config.copy_cursor_bg.toBgAnsiSeq());
+            if (lc) |l| {
+                const cp = l.cell.codepoint();
+                if (cp == 0 or l.cell.wide == .spacer_tail) {
                     try writer.writeByte(' ');
                 } else {
-                    try writer.writeAll(utf8_buf[0..len]);
+                    var utf8_buf: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
+                    if (len == 1 and utf8_buf[0] == 0) {
+                        try writer.writeByte(' ');
+                    } else {
+                        try writer.writeAll(utf8_buf[0..len]);
+                    }
                 }
+            } else {
+                try writer.writeByte(' ');
             }
-        } else {
-            try writer.writeByte(' ');
+            try writer.writeAll("\x1b[0m");
+
+            // Mark cursor cell as dirty so it will be redrawn on next frame
+            self.prevCell(abs_x, abs_y).* = dirty_cell;
         }
-        try writer.writeAll("\x1b[0m");
     }
 }

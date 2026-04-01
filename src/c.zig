@@ -5,6 +5,7 @@ pub const c = @cImport({
     @cInclude("fcntl.h");
     @cInclude("unistd.h");
     @cInclude("termios.h");
+    @cInclude("signal.h");
     @cInclude("sys/ioctl.h");
     @cInclude("sys/epoll.h");
     @cInclude("sys/wait.h");
