@@ -134,6 +134,11 @@ fn renderPane(
     const screen = pane.terminal.screens.active;
     var prev_style_id: u16 = std.math.maxInt(u16);
 
+    // Track cursor position for row-based optimization
+    // After writing a character, cursor automatically advances to next column
+    var cursor_x: u16 = std.math.maxInt(u16);
+    var cursor_y: u16 = std.math.maxInt(u16);
+
     for (0..pane.rows) |row| {
         for (0..pane.cols) |col| {
             const lc = screen.pages.getCell(.{
@@ -173,14 +178,20 @@ fn renderPane(
             // Handling the case where no changes have occurred.
             if (std.meta.eql(current, prev.*)) continue;
 
-            // Move cursor
-            try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
+            // Only move cursor if not at expected position
+            // This saves escape sequences when rendering consecutive cells in the same row
+            if (cursor_y != abs_y or cursor_x != abs_x) {
+                try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
+            }
 
             if (cell.style_id != prev_style_id) {
                 const page = &lc.node.data;
                 try writeStyle(writer, page, cell.style_id);
                 prev_style_id = cell.style_id;
             }
+
+            // Determine character width for cursor tracking
+            const char_width: u16 = if (cell.wide == .wide) 2 else 1;
 
             switch (cell.content_tag) {
                 .codepoint, .codepoint_grapheme => {
@@ -192,6 +203,8 @@ fn renderPane(
                         const len = std.unicode.utf8Encode(cp, &buf) catch {
                             try writer.writeByte('?');
                             prev.* = current;
+                            cursor_y = abs_y;
+                            cursor_x = abs_x + char_width;
                             continue;
                         };
                         try writer.writeAll(buf[0..len]);
@@ -216,6 +229,11 @@ fn renderPane(
                     try writer.print("\x1b[48;2;{d};{d};{d}m ", .{ rgb.r, rgb.g, rgb.b });
                 },
             }
+
+            // Update cursor position - cursor advances after writing
+            cursor_y = abs_y;
+            cursor_x = abs_x + char_width;
+
             prev.* = current;
         }
     }
@@ -578,6 +596,10 @@ pub fn renderCopyModeOverlay(
     // Hide cursor during overlay rendering
     try writer.writeAll("\x1b[?25l");
 
+    // Track cursor position for row-based optimization
+    var cursor_x: u16 = std.math.maxInt(u16);
+    var cursor_y: u16 = std.math.maxInt(u16);
+
     // Render selected cells with reverse video
     if (cm.selecting) {
         var start_y = cm.sel_start_y;
@@ -606,7 +628,11 @@ pub fn renderCopyModeOverlay(
 
                 if (abs_x >= self.term_cols or abs_y >= self.term_rows) continue;
 
-                try writer.print("\x1b[{d};{d}H\x1b[7m", .{ abs_y + 1, abs_x + 1 });
+                // Only move cursor if not at expected position
+                if (cursor_y != abs_y or cursor_x != abs_x) {
+                    try writer.print("\x1b[{d};{d}H", .{ abs_y + 1, abs_x + 1 });
+                }
+                try writer.writeAll("\x1b[7m");
 
                 const lc = screen.pages.getCell(.{
                     .viewport = .{ .x = @intCast(x), .y = @intCast(y) },
@@ -628,6 +654,10 @@ pub fn renderCopyModeOverlay(
                     try writer.writeByte(' ');
                 }
                 try writer.writeAll("\x1b[0m");
+
+                // Update cursor position
+                cursor_y = abs_y;
+                cursor_x = abs_x + 1;
 
                 // Mark cell as dirty so it will be redrawn on next frame
                 self.prevCell(abs_x, abs_y).* = dirty_cell;
