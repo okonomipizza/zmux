@@ -33,6 +33,7 @@ pub fn init(
         .terminal = try Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
+            .max_scrollback = 100_000, // 100k lines of scrollback
         }),
         .vt_stream = undefined,
         .x = x,

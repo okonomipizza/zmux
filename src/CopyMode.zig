@@ -20,6 +20,23 @@ pub fn init(pane: *Pane) CopyMode {
     };
 }
 
+/// Initialize copy mode at a specific mouse position with selection started
+pub fn initAtPosition(x: u16, y: u16) CopyMode {
+    return .{
+        .cursor_x = x,
+        .cursor_y = y,
+        .selecting = true,
+        .sel_start_x = x,
+        .sel_start_y = y,
+    };
+}
+
+/// Update cursor position (for mouse drag)
+pub fn setCursorPosition(self: *CopyMode, x: u16, y: u16) void {
+    self.cursor_x = x;
+    self.cursor_y = y;
+}
+
 pub fn moveLeft(self: *CopyMode) void {
     self.cursor_x -|= 1;
 }

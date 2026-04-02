@@ -541,6 +541,105 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
+        .mouse_select_start => |d| {
+            const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
+            const pane = active_ws.activePane();
+
+            // Convert screen coordinates to pane-relative coordinates
+            // Mouse coordinates are 0-indexed from client
+            const pane_x = d.x -| pane.x;
+            const pane_y = d.y -| pane.y;
+
+            // Clamp to pane bounds
+            const x = @min(pane_x, pane.cols -| 1);
+            const y = @min(pane_y, pane.rows -| 1);
+
+            // Enter copy mode with selection started at mouse position
+            state.input_mode = .copy;
+            state.prefix_mode = false;
+            state.copy_mode = CopyMode.initAtPosition(x, y);
+            try renderAndBroadcast(state, false);
+        },
+        .mouse_select_update => |d| {
+            const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
+            const pane = active_ws.activePane();
+
+            if (state.copy_mode) |*cm| {
+                // Convert screen coordinates to pane-relative coordinates
+                const pane_x = d.x -| pane.x;
+                const pane_y = d.y -| pane.y;
+
+                // Clamp to pane bounds
+                const x = @min(pane_x, pane.cols -| 1);
+                const y = @min(pane_y, pane.rows -| 1);
+
+                cm.setCursorPosition(x, y);
+                try renderAndBroadcast(state, false);
+            }
+        },
+        .mouse_select_end => |d| {
+            const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
+            const pane = active_ws.activePane();
+
+            if (state.copy_mode) |*cm| {
+                // Convert screen coordinates to pane-relative coordinates
+                const pane_x = d.x -| pane.x;
+                const pane_y = d.y -| pane.y;
+
+                // Clamp to pane bounds
+                const x = @min(pane_x, pane.cols -| 1);
+                const y = @min(pane_y, pane.rows -| 1);
+
+                cm.setCursorPosition(x, y);
+                // Keep copy mode active - user can press Ctrl+C to copy or Esc to cancel
+                try renderAndBroadcast(state, false);
+            }
+        },
+        .clipboard_copy => {
+            const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
+            const pane = active_ws.activePane();
+
+            // Copy selected text if in copy mode with selection
+            if (state.copy_mode) |*cm| {
+                if (cm.selecting) {
+                    if (cm.getSelectedText(state.alloc, pane)) |text| {
+                        // Free old clipboard if any
+                        if (state.clipboard) |old| {
+                            state.alloc.free(old);
+                        }
+                        state.clipboard = text;
+
+                        // Send OSC 52 to set system clipboard
+                        var osc_buf: [65536]u8 = undefined;
+                        const encoded = encodeOsc52(text, &osc_buf);
+                        if (encoded.len > 0) {
+                            for (&state.clients.*) |*slot| {
+                                if (slot.*) |*cli| {
+                                    cli.stream.write(encoded, cli.fd) catch {};
+                                }
+                            }
+                        }
+                    } else |_| {}
+                }
+            }
+
+            // Exit copy mode
+            state.input_mode = .normal;
+            state.copy_mode = null;
+            pane.terminal.scrollViewport(.{ .bottom = {} });
+            state.renderer.invalidate();
+            try renderAndBroadcast(state, false);
+        },
+        .clipboard_paste => {
+            if (state.clipboard) |text| {
+                const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
+                const pane = active_ws.activePane();
+                // Send bracketed paste
+                try pane.pty.write("\x1b[200~");
+                try pane.pty.write(text);
+                try pane.pty.write("\x1b[201~");
+            }
+        },
     }
 }
 
