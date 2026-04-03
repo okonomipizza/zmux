@@ -18,6 +18,21 @@ const Cell = struct {
     content_tag: u2 = 0,
 };
 
+/// Dirty rectangle for tracking regions that need re-rendering
+const DirtyRect = struct {
+    x: u16,
+    y: u16,
+    cols: u16,
+    rows: u16,
+
+    fn contains(self: DirtyRect, px: u16, py: u16) bool {
+        return px >= self.x and px < self.x + self.cols and
+            py >= self.y and py < self.y + self.rows;
+    }
+};
+
+const MAX_DIRTY_RECTS = 16;
+
 // Cell state
 prev_cells: []Cell,
 // Terminal width
@@ -27,6 +42,11 @@ term_rows: u16,
 
 alloc: std.mem.Allocator,
 config: Config,
+
+// Dirty region tracking
+dirty_rects: [MAX_DIRTY_RECTS]DirtyRect,
+dirty_count: u8,
+full_redraw: bool,
 
 pub fn init(
     alloc: std.mem.Allocator,
@@ -45,6 +65,9 @@ pub fn init(
         .term_rows = rows,
         .alloc = alloc,
         .config = config,
+        .dirty_rects = undefined,
+        .dirty_count = 0,
+        .full_redraw = true, // Start with full redraw
     };
 }
 
@@ -55,6 +78,64 @@ pub fn deinit(self: *Renderer) void {
 // Returns a reference to the previous cell at the given position (x, y)
 fn prevCell(self: *Renderer, x: u16, y: u16) *Cell {
     return &self.prev_cells[@as(usize, y) * self.term_cols + x];
+}
+
+/// Add a dirty rectangle region
+pub fn addDirtyRect(self: *Renderer, x: u16, y: u16, cols: u16, rows: u16) void {
+    if (self.full_redraw) return; // Already doing full redraw
+
+    if (self.dirty_count >= MAX_DIRTY_RECTS) {
+        // Too many dirty rects, fall back to full redraw
+        self.full_redraw = true;
+        return;
+    }
+
+    self.dirty_rects[self.dirty_count] = .{
+        .x = x,
+        .y = y,
+        .cols = cols,
+        .rows = rows,
+    };
+    self.dirty_count += 1;
+}
+
+/// Mark a pane's region as dirty
+pub fn markPaneDirty(self: *Renderer, pane: *Pane) void {
+    self.addDirtyRect(pane.x, pane.y, pane.cols, pane.rows);
+}
+
+/// Check if a point falls within any dirty region
+fn isPointDirty(self: *Renderer, x: u16, y: u16) bool {
+    if (self.full_redraw) return true;
+    if (self.dirty_count == 0) return false;
+
+    for (self.dirty_rects[0..self.dirty_count]) |rect| {
+        if (rect.contains(x, y)) return true;
+    }
+    return false;
+}
+
+/// Check if a row intersects any dirty region (for early row skip)
+fn isRowDirty(self: *Renderer, y: u16, x_start: u16, x_end: u16) bool {
+    if (self.full_redraw) return true;
+    if (self.dirty_count == 0) return false;
+
+    for (self.dirty_rects[0..self.dirty_count]) |rect| {
+        // Check if row y intersects with this rect's y range
+        if (y >= rect.y and y < rect.y + rect.rows) {
+            // Check if x range overlaps
+            if (x_end >= rect.x and x_start < rect.x + rect.cols) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// Clear dirty tracking after render
+fn clearDirtyRects(self: *Renderer) void {
+    self.dirty_count = 0;
+    self.full_redraw = false;
 }
 
 /// Renders the differences for all panes held by the active workspace.
@@ -74,20 +155,36 @@ pub fn renderAll(
     // Clear screen if requested (e.g., after closing a pane)
     if (clear_screen) {
         try writer.writeAll("\x1b[2J\x1b[H");
+        self.full_redraw = true;
     }
 
     // TODO Consider appropriate maximum number of panes
     var buf: [64]*Pane = undefined;
     const panes = workspace.getPanes(&buf);
 
+    // Collect dirty regions from panes
+    for (panes) |pane| {
+        if (pane.is_dirty) {
+            self.markPaneDirty(pane);
+        }
+    }
+
+    // Also mark floating pane if dirty
+    if (workspace.show_floating and workspace.floating_pane.is_dirty) {
+        self.markPaneDirty(workspace.floating_pane);
+    }
+
+    // Render panes (only dirty regions will be processed)
     for (panes) |pane| {
         try self.renderPane(pane, writer);
+        pane.is_dirty = false;
     }
 
     try self.drawBorders(workspace, writer);
 
     if (workspace.show_floating) {
         try self.renderFloatingPane(workspace.floating_pane, workspace.active_pane == workspace.floating_pane, writer);
+        workspace.floating_pane.is_dirty = false;
     }
 
     // Render copy mode overlay if active
@@ -113,6 +210,9 @@ pub fn renderAll(
         // Show the cursor
         try writer.writeAll("\x1b[?25h");
     }
+
+    // Clear dirty tracking for next frame
+    self.clearDirtyRects();
 }
 
 fn writeCursorStyle(style: anytype, writer: anytype) !void {
@@ -140,6 +240,13 @@ fn renderPane(
     var cursor_y: u16 = std.math.maxInt(u16);
 
     for (0..pane.rows) |row| {
+        const abs_row: u16 = pane.y + @as(u16, @intCast(row));
+
+        // Skip entire row if it doesn't intersect any dirty region
+        if (!self.isRowDirty(abs_row, pane.x, pane.x + pane.cols)) {
+            continue;
+        }
+
         for (0..pane.cols) |col| {
             const lc = screen.pages.getCell(.{
                 .viewport = .{
@@ -458,6 +565,8 @@ pub fn invalidate(self: *Renderer) void {
     @memset(self.prev_cells, .{
         .codepoint = std.math.maxInt(u21),
     });
+    // Mark for full redraw
+    self.full_redraw = true;
 }
 
 /// Invalidate only the cells within a specific rectangular region
@@ -470,6 +579,8 @@ pub fn invalidateRect(self: *Renderer, x: u16, y: u16, cols: u16, rows: u16) voi
             self.prev_cells[row * self.term_cols + col] = dirty;
         }
     }
+    // Add to dirty regions
+    self.addDirtyRect(x, y, cols, rows);
 }
 
 pub fn renderFloatingOnly(
@@ -483,11 +594,17 @@ pub fn renderFloatingOnly(
     try writer.writeAll("\x1b[?25l");
 
     if (workspace.show_floating) {
+        // Mark floating pane region as dirty
+        if (workspace.floating_pane.is_dirty) {
+            self.markPaneDirty(workspace.floating_pane);
+        }
+
         try self.renderFloatingPane(
             workspace.floating_pane,
             workspace.active_pane == workspace.floating_pane,
             writer,
         );
+        workspace.floating_pane.is_dirty = false;
     }
 
     try StatusBar.renderWithMode(wm, status_row, self.term_cols, writer, mode_label, self.config);
@@ -501,6 +618,9 @@ pub fn renderFloatingOnly(
 
     try writeCursorStyle(screen.cursor.cursor_style, writer);
     try writer.writeAll("\x1b[?25h");
+
+    // Clear dirty tracking
+    self.clearDirtyRects();
 }
 
 fn renderFloatingPane(
