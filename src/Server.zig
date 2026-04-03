@@ -412,6 +412,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
                 .half_page_up => pane.terminal.scrollViewport(.{ .delta = -half_page }),
                 .half_page_down => pane.terminal.scrollViewport(.{ .delta = half_page }),
             }
+            pane.is_dirty = true; // Mark pane dirty after scrolling
             try renderAndBroadcast(state, false);
         },
         .scroll_mode_exit => {
@@ -450,6 +451,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
                     .start_selection => cm.startSelection(),
                 }
             }
+            pane.is_dirty = true; // Mark pane dirty after copy mode input
             try renderAndBroadcast(state, false);
         },
         .copy_mode_exit => {

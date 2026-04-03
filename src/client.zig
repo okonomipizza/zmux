@@ -92,9 +92,9 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    // Clear screen + enable mouse button tracking (1002) + SGR extended mode (1006)
-    // 1002 = track button press/release and drag motion
-    try stdout.writeAll("\x1b[2J\x1b[H\x1b[?1002h\x1b[?1006h");
+    // Clear screen + enable mouse tracking (1000) + SGR extended mode (1006)
+    // 1000 = track button press/release (including wheel)
+    try stdout.writeAll("\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h");
     try stdout.flush();
 
     const epoll_fd = try posix.epoll_create1(0);
@@ -203,41 +203,32 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                         while (remaining.len > 0) {
                             // Check for mouse escape sequence (SGR format: \x1b[<...)
                             if (parseSgrMouse(remaining)) |mouse| {
-                                var maybe_req: ?protocol.Request = null;
+                                // In normal mode, only handle wheel for scrolling
+                                // All other mouse events are forwarded to the application
+                                var handled = false;
 
-                                // Convert 1-indexed mouse coords to 0-indexed
-                                const x = mouse.event.x -| 1;
-                                const y = mouse.event.y -| 1;
-
-                                switch (mouse.event.button) {
-                                    MouseEvent.BUTTON_LEFT => {
-                                        if (mouse.event.is_release) {
-                                            // Left button release - end selection
-                                            maybe_req = .{ .mouse_select_end = .{ .x = x, .y = y } };
-                                        } else {
-                                            // Left button press - start selection
-                                            maybe_req = .{ .mouse_select_start = .{ .x = x, .y = y } };
-                                        }
-                                    },
-                                    MouseEvent.BUTTON_LEFT_DRAG => {
-                                        // Dragging with left button - update selection
-                                        maybe_req = .{ .mouse_select_update = .{ .x = x, .y = y } };
-                                    },
-                                    MouseEvent.WHEEL_UP => {
-                                        if (!mouse.event.is_release) {
-                                            maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } };
-                                        }
-                                    },
-                                    MouseEvent.WHEEL_DOWN => {
-                                        if (!mouse.event.is_release) {
-                                            maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } };
-                                        }
-                                    },
-                                    else => {},
+                                if (!mouse.event.is_release) {
+                                    switch (mouse.event.button) {
+                                        MouseEvent.WHEEL_UP => {
+                                            const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_up } };
+                                            const req_data = try req.encode(&req_buf);
+                                            try stream.write(req_data, sock_fd);
+                                            handled = true;
+                                        },
+                                        MouseEvent.WHEEL_DOWN => {
+                                            const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_down } };
+                                            const req_data = try req.encode(&req_buf);
+                                            try stream.write(req_data, sock_fd);
+                                            handled = true;
+                                        },
+                                        else => {},
+                                    }
                                 }
 
-                                if (maybe_req) |req| {
-                                    const req_data = try req.encode(&req_buf);
+                                if (!handled) {
+                                    // Forward mouse event to application
+                                    const input_req = protocol.Request{ .input = .{ .input = remaining[0..mouse.len] } };
+                                    const req_data = try input_req.encode(&req_buf);
                                     try stream.write(req_data, sock_fd);
                                 }
 
@@ -246,11 +237,9 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                                 continue;
                             }
 
-                            // If input looks like a mouse sequence but couldn't be parsed
-                            // (incomplete, malformed, or fragment), drop all remaining input
-                            if (isSgrMousePrefix(remaining) or looksLikeMouseSequenceFragment(remaining)) {
-                                break;
-                            }
+                            // If input looks like an incomplete mouse sequence, forward it to the app
+                            // The app can handle escape sequences with its own timeout logic
+                            // (This allows ESC key to work properly)
 
                             // Check for prefix key (Ctrl-b = 0x02)
                             if (remaining.len == 1 and remaining[0] == 0x02) {
@@ -262,26 +251,7 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                                 break;
                             }
 
-                            // Handle Ctrl+C (copy) and Ctrl+V (paste)
-                            if (remaining.len == 1) {
-                                switch (remaining[0]) {
-                                    0x03 => { // Ctrl+C
-                                        const copy_req = protocol.Request{ .clipboard_copy = {} };
-                                        const copy_data = try copy_req.encode(&req_buf);
-                                        try stream.write(copy_data, sock_fd);
-                                        break;
-                                    },
-                                    0x16 => { // Ctrl+V
-                                        const paste_req = protocol.Request{ .clipboard_paste = {} };
-                                        const paste_data = try paste_req.encode(&req_buf);
-                                        try stream.write(paste_data, sock_fd);
-                                        break;
-                                    },
-                                    else => {},
-                                }
-                            }
-
-                            // Forward remaining input to server and exit loop
+                            // Forward all other input to server
                             const input_req = protocol.Request{ .input = .{ .input = remaining } };
                             const req_data = try input_req.encode(&req_buf);
                             try stream.write(req_data, sock_fd);
@@ -484,28 +454,18 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                         var maybe_req: ?protocol.Request = null;
                         var exit_copy = false;
 
-                        // Check for mouse events first
+                        // Check for mouse wheel events (scrolling only)
                         if (parseSgrMouse(user_input)) |mouse| {
-                            // Convert 1-indexed mouse coords to 0-indexed
-                            const x = mouse.event.x -| 1;
-                            const y = mouse.event.y -| 1;
-
-                            switch (mouse.event.button) {
-                                MouseEvent.BUTTON_LEFT_DRAG => {
-                                    // Continue selection drag
-                                    maybe_req = .{ .mouse_select_update = .{ .x = x, .y = y } };
-                                },
-                                MouseEvent.WHEEL_UP => {
-                                    if (!mouse.event.is_release) {
+                            if (!mouse.event.is_release) {
+                                switch (mouse.event.button) {
+                                    MouseEvent.WHEEL_UP => {
                                         maybe_req = .{ .copy_mode_input = .{ .key = .half_page_up } };
-                                    }
-                                },
-                                MouseEvent.WHEEL_DOWN => {
-                                    if (!mouse.event.is_release) {
+                                    },
+                                    MouseEvent.WHEEL_DOWN => {
                                         maybe_req = .{ .copy_mode_input = .{ .key = .half_page_down } };
-                                    }
-                                },
-                                else => {},
+                                    },
+                                    else => {},
+                                }
                             }
                         } else if (user_input.len == 1) {
                             switch (user_input[0]) {
@@ -534,7 +494,7 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                                 // Selection
                                 'v' => maybe_req = .{ .copy_mode_input = .{ .key = .start_selection } },
 
-                                // Yank (y or Ctrl+C)
+                                // Yank (y or Ctrl+C) - copy and exit
                                 'y', 0x03 => {
                                     maybe_req = .{ .clipboard_copy = {} };
                                     exit_copy = true;
@@ -581,7 +541,7 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     }
 
     // Disable mouse reporting and clear screen on exit
-    try stdout.writeAll("\x1b[?1006l\x1b[?1002l\x1b[2J\x1b[H");
+    try stdout.writeAll("\x1b[?1006l\x1b[?1000l\x1b[2J\x1b[H");
     try stdout.flush();
 }
 
@@ -599,8 +559,6 @@ const MouseEvent = struct {
     is_release: bool,
 
     /// Mouse button codes
-    const BUTTON_LEFT = 0;
-    const BUTTON_LEFT_DRAG = 32; // Left button + motion
     const WHEEL_UP = 64;
     const WHEEL_DOWN = 65;
 };
