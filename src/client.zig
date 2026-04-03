@@ -87,12 +87,14 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
     const signal_fd = try setupSignalFd();
     defer posix.close(signal_fd);
 
-    // Clear screen on start
+    // Clear screen on start and enable mouse reporting (SGR mode)
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
     const stdout = &stdout_writer.interface;
 
-    try stdout.writeAll("\x1b[2J\x1b[H");
+    // Clear screen + enable mouse tracking (1000) + SGR extended mode (1006)
+    // 1000 = track button press/release (including wheel)
+    try stdout.writeAll("\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h");
     try stdout.flush();
 
     const epoll_fd = try posix.epoll_create1(0);
@@ -195,20 +197,66 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
 
                 switch (mode) {
                     .normal => {
-                        // Check for prefix key (Ctrl-b = 0x02)
-                        if (user_input.len == 1 and user_input[0] == 0x02) {
-                            mode = .prefix;
-                            // Notify server that prefix mode is active
-                            const prefix_req = protocol.Request{ .set_prefix_mode = .{ .enabled = true } };
-                            const prefix_data = try prefix_req.encode(&req_buf);
-                            try stream.write(prefix_data, sock_fd);
-                            continue;
-                        }
+                        // Process input, handling mouse events in a loop
+                        var remaining = user_input;
 
-                        // Forward input to server
-                        const input_req = protocol.Request{ .input = .{ .input = user_input } };
-                        const req_data = try input_req.encode(&req_buf);
-                        try stream.write(req_data, sock_fd);
+                        while (remaining.len > 0) {
+                            // Check for mouse escape sequence (SGR format: \x1b[<...)
+                            if (parseSgrMouse(remaining)) |mouse| {
+                                // In normal mode, only handle wheel for scrolling
+                                // All other mouse events are forwarded to the application
+                                var handled = false;
+
+                                if (!mouse.event.is_release) {
+                                    switch (mouse.event.button) {
+                                        MouseEvent.WHEEL_UP => {
+                                            const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_up } };
+                                            const req_data = try req.encode(&req_buf);
+                                            try stream.write(req_data, sock_fd);
+                                            handled = true;
+                                        },
+                                        MouseEvent.WHEEL_DOWN => {
+                                            const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_down } };
+                                            const req_data = try req.encode(&req_buf);
+                                            try stream.write(req_data, sock_fd);
+                                            handled = true;
+                                        },
+                                        else => {},
+                                    }
+                                }
+
+                                if (!handled) {
+                                    // Forward mouse event to application
+                                    const input_req = protocol.Request{ .input = .{ .input = remaining[0..mouse.len] } };
+                                    const req_data = try input_req.encode(&req_buf);
+                                    try stream.write(req_data, sock_fd);
+                                }
+
+                                // Consume parsed bytes and continue processing
+                                remaining = remaining[mouse.len..];
+                                continue;
+                            }
+
+                            // If input looks like an incomplete mouse sequence, forward it to the app
+                            // The app can handle escape sequences with its own timeout logic
+                            // (This allows ESC key to work properly)
+
+                            // Check for prefix key (Ctrl-b = 0x02)
+                            if (remaining.len == 1 and remaining[0] == 0x02) {
+                                mode = .prefix;
+                                // Notify server that prefix mode is active
+                                const prefix_req = protocol.Request{ .set_prefix_mode = .{ .enabled = true } };
+                                const prefix_data = try prefix_req.encode(&req_buf);
+                                try stream.write(prefix_data, sock_fd);
+                                break;
+                            }
+
+                            // Forward all other input to server
+                            const input_req = protocol.Request{ .input = .{ .input = remaining } };
+                            const req_data = try input_req.encode(&req_buf);
+                            try stream.write(req_data, sock_fd);
+                            break;
+                        }
                     },
                     .prefix, .prefix_repeatable => {
                         const was_repeatable = (mode == .prefix_repeatable);
@@ -362,7 +410,16 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                     .scroll => {
                         var maybe_req: ?protocol.Request = null;
 
-                        switch (user_input[0]) {
+                        // Check for mouse scroll first
+                        if (parseSgrMouse(user_input)) |mouse| {
+                            if (!mouse.event.is_release) {
+                                switch (mouse.event.button) {
+                                    MouseEvent.WHEEL_UP => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
+                                    MouseEvent.WHEEL_DOWN => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
+                                    else => {},
+                                }
+                            }
+                        } else switch (user_input[0]) {
                             // Scroll navigation
                             'j' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
                             'k' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
@@ -397,8 +454,20 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                         var maybe_req: ?protocol.Request = null;
                         var exit_copy = false;
 
-                        // Check for Ctrl-u (0x15) and Ctrl-d (0x04)
-                        if (user_input.len == 1) {
+                        // Check for mouse wheel events (scrolling only)
+                        if (parseSgrMouse(user_input)) |mouse| {
+                            if (!mouse.event.is_release) {
+                                switch (mouse.event.button) {
+                                    MouseEvent.WHEEL_UP => {
+                                        maybe_req = .{ .copy_mode_input = .{ .key = .half_page_up } };
+                                    },
+                                    MouseEvent.WHEEL_DOWN => {
+                                        maybe_req = .{ .copy_mode_input = .{ .key = .half_page_down } };
+                                    },
+                                    else => {},
+                                }
+                            }
+                        } else if (user_input.len == 1) {
                             switch (user_input[0]) {
                                 // Movement
                                 'h' => maybe_req = .{ .copy_mode_input = .{ .key = .move_left } },
@@ -425,9 +494,9 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
                                 // Selection
                                 'v' => maybe_req = .{ .copy_mode_input = .{ .key = .start_selection } },
 
-                                // Yank
-                                'y' => {
-                                    maybe_req = .{ .yank = {} };
+                                // Yank (y or Ctrl+C) - copy and exit
+                                'y', 0x03 => {
+                                    maybe_req = .{ .clipboard_copy = {} };
                                     exit_copy = true;
                                 },
 
@@ -471,8 +540,8 @@ pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
         }
     }
 
-    // Clear screen on exit
-    try stdout.writeAll("\x1b[2J\x1b[H");
+    // Disable mouse reporting and clear screen on exit
+    try stdout.writeAll("\x1b[?1006l\x1b[?1000l\x1b[2J\x1b[H");
     try stdout.flush();
 }
 
@@ -480,4 +549,101 @@ fn getTermSize() struct { cols: u16, rows: u16 } {
     var ws: std.posix.winsize = undefined;
     _ = c.ioctl(c.STDOUT_FILENO, c.TIOCGWINSZ, &ws);
     return .{ .cols = ws.col, .rows = ws.row };
+}
+
+/// Mouse event types
+const MouseEvent = struct {
+    button: u8,
+    x: u16,
+    y: u16,
+    is_release: bool,
+
+    /// Mouse button codes
+    const WHEEL_UP = 64;
+    const WHEEL_DOWN = 65;
+};
+
+/// Check if input looks like the start of an SGR mouse sequence
+/// Used to drop incomplete/partial mouse sequences
+fn isSgrMousePrefix(input: []const u8) bool {
+    if (input.len == 0) return false;
+    if (input[0] != 0x1b) return false;
+    if (input.len == 1) return true; // Just ESC, could be start of mouse seq
+    if (input[1] != '[') return false;
+    if (input.len == 2) return true; // ESC [
+    if (input[2] != '<') return false;
+    // Starts with \x1b[< - definitely a mouse sequence (or similar CSI)
+    return true;
+}
+
+/// Check if input looks like the middle/end of a mouse sequence
+/// Pattern: digits and semicolons ending with 'M' or 'm'
+/// e.g., "4;32;42M" or "32;42M64;33;42M"
+fn looksLikeMouseSequenceFragment(input: []const u8) bool {
+    if (input.len == 0) return false;
+
+    // Must contain 'M' or 'm' (mouse sequence terminator)
+    var has_terminator = false;
+    var has_semicolon = false;
+    var has_digit = false;
+
+    for (input) |ch| {
+        if (ch == 'M' or ch == 'm') {
+            has_terminator = true;
+        } else if (ch == ';') {
+            has_semicolon = true;
+        } else if (ch >= '0' and ch <= '9') {
+            has_digit = true;
+        } else if (ch == 0x1b or ch == '[' or ch == '<') {
+            // These are valid mouse sequence chars, continue
+        } else {
+            // Contains other characters - probably not a mouse fragment
+            return false;
+        }
+    }
+
+    // Looks like a mouse fragment if it has terminator with digits and semicolons
+    return has_terminator and has_semicolon and has_digit;
+}
+
+/// Parse SGR mouse escape sequence: \x1b[<Btn;X;Y;M or \x1b[<Btn;X;Y;m
+/// Returns the parsed mouse event and the number of bytes consumed, or null if not a valid mouse sequence
+fn parseSgrMouse(input: []const u8) ?struct { event: MouseEvent, len: usize } {
+    // Minimum: \x1b[<0;1;1M = 9 bytes
+    if (input.len < 9) return null;
+
+    // Check for SGR mouse prefix: \x1b[<
+    if (input[0] != 0x1b or input[1] != '[' or input[2] != '<') return null;
+
+    // Parse button;x;y
+    var i: usize = 3;
+    var numbers: [3]u16 = .{ 0, 0, 0 };
+    var num_idx: usize = 0;
+
+    while (i < input.len and num_idx < 3) {
+        const ch = input[i];
+        if (ch >= '0' and ch <= '9') {
+            numbers[num_idx] = numbers[num_idx] * 10 + (ch - '0');
+            i += 1;
+        } else if (ch == ';') {
+            num_idx += 1;
+            i += 1;
+        } else if (ch == 'M' or ch == 'm') {
+            // End of sequence
+            if (num_idx != 2) return null; // Need exactly 3 numbers
+            return .{
+                .event = .{
+                    .button = @intCast(numbers[0]),
+                    .x = numbers[1],
+                    .y = numbers[2],
+                    .is_release = (ch == 'm'),
+                },
+                .len = i + 1,
+            };
+        } else {
+            return null; // Invalid character
+        }
+    }
+
+    return null;
 }

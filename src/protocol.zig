@@ -46,6 +46,12 @@ pub const Request = union(enum) {
     copy_mode_exit: void,
     yank: void,
     paste: void,
+    // Mouse selection
+    mouse_select_start: MouseSelect,
+    mouse_select_update: MouseSelect,
+    mouse_select_end: MouseSelect,
+    clipboard_copy: void,
+    clipboard_paste: void,
 
     pub const Method = enum(u8) {
         attach = 0,
@@ -71,6 +77,11 @@ pub const Request = union(enum) {
         resize_pane = 20,
         move_pane_to_workspace = 21,
         cycle_workspace = 22,
+        mouse_select_start = 23,
+        mouse_select_update = 24,
+        mouse_select_end = 25,
+        clipboard_copy = 26,
+        clipboard_paste = 27,
     };
 
     const Attach = struct {
@@ -151,6 +162,11 @@ pub const Request = union(enum) {
         next: bool, // true = next (i), false = prev (u)
     };
 
+    const MouseSelect = struct {
+        x: u16, // 0-indexed screen coordinate
+        y: u16,
+    };
+
     pub fn decode(src: []const u8) !Request {
         if (src.len < 1) return error.TooShort;
         const method = std.enums.fromInt(Method, src[0]) orelse return error.InvalidMethod;
@@ -228,6 +244,26 @@ pub const Request = union(enum) {
                 if (src.len < 2) return error.TooShort;
                 return .{ .cycle_workspace = .{ .next = src[1] != 0 } };
             },
+            .mouse_select_start => {
+                if (src.len < 5) return error.TooShort;
+                const x = std.mem.readInt(u16, src[1..3], .little);
+                const y = std.mem.readInt(u16, src[3..5], .little);
+                return .{ .mouse_select_start = .{ .x = x, .y = y } };
+            },
+            .mouse_select_update => {
+                if (src.len < 5) return error.TooShort;
+                const x = std.mem.readInt(u16, src[1..3], .little);
+                const y = std.mem.readInt(u16, src[3..5], .little);
+                return .{ .mouse_select_update = .{ .x = x, .y = y } };
+            },
+            .mouse_select_end => {
+                if (src.len < 5) return error.TooShort;
+                const x = std.mem.readInt(u16, src[1..3], .little);
+                const y = std.mem.readInt(u16, src[3..5], .little);
+                return .{ .mouse_select_end = .{ .x = x, .y = y } };
+            },
+            .clipboard_copy => return .{ .clipboard_copy = {} },
+            .clipboard_paste => return .{ .clipboard_paste = {} },
         }
     }
 
@@ -367,6 +403,37 @@ pub const Request = union(enum) {
                 buf[0] = @intFromEnum(Method.cycle_workspace);
                 buf[1] = if (c.next) 1 else 0;
                 return buf[0..2];
+            },
+            .mouse_select_start => |m| {
+                if (buf.len < 5) return error.BufferTooSmall;
+                buf[0] = @intFromEnum(Method.mouse_select_start);
+                std.mem.writeInt(u16, buf[1..3], m.x, .little);
+                std.mem.writeInt(u16, buf[3..5], m.y, .little);
+                return buf[0..5];
+            },
+            .mouse_select_update => |m| {
+                if (buf.len < 5) return error.BufferTooSmall;
+                buf[0] = @intFromEnum(Method.mouse_select_update);
+                std.mem.writeInt(u16, buf[1..3], m.x, .little);
+                std.mem.writeInt(u16, buf[3..5], m.y, .little);
+                return buf[0..5];
+            },
+            .mouse_select_end => |m| {
+                if (buf.len < 5) return error.BufferTooSmall;
+                buf[0] = @intFromEnum(Method.mouse_select_end);
+                std.mem.writeInt(u16, buf[1..3], m.x, .little);
+                std.mem.writeInt(u16, buf[3..5], m.y, .little);
+                return buf[0..5];
+            },
+            .clipboard_copy => {
+                if (buf.len < 1) return error.BufferTooSmall;
+                buf[0] = @intFromEnum(Method.clipboard_copy);
+                return buf[0..1];
+            },
+            .clipboard_paste => {
+                if (buf.len < 1) return error.BufferTooSmall;
+                buf[0] = @intFromEnum(Method.clipboard_paste);
+                return buf[0..1];
             },
         }
     }
