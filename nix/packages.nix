@@ -3,6 +3,7 @@
   stdenv,
   callPackage,
   zig,
+  ghosttySrc,
 }: stdenv.mkDerivation (finalAttrs: {
   pname = "zmux";
   version = "0.0.0";
@@ -25,10 +26,11 @@
 
   buildPhase = ''
     runHook preBuild
+    mkdir -p zig-deps
+    ln -s ${ghosttySrc} zig-deps/ghostty
     zig build \
       --system ${finalAttrs.deps} \
       -Doptimize=ReleaseSafe \
-      -Dsimd=false \
       --global-cache-dir $(pwd)/.cache
     runHook postBuild
   '';

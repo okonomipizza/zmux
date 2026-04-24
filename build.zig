@@ -10,7 +10,9 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    if (b.lazyDependency("ghostty", .{})) |dep| {
+    if (b.lazyDependency("ghostty", .{
+        .simd = false,
+    })) |dep| {
         exe_mod.addImport(
             "ghostty-vt",
             dep.module("ghostty-vt"),

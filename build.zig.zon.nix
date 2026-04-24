@@ -89,6 +89,14 @@ let
 in
 linkFarm name [
   {
+    name = "jsonc-0.1.0-5-LqjTdRAADeaHDsbePsOTtXlgr0GoAm1gZqJ49KvKDV";
+    path = fetchZigArtifact {
+      name = "jsonc";
+      url = "https://github.com/okonomipizza/zig-jsonc/archive/5d2174b2606e46aed57c609ec7fe6b7b04ec9894.tar.gz";
+      hash = "sha256-TPSPunBFOetfzVqL70ZFSdFg6zhFcsAoKDPiRLUgoX4=";
+    };
+  }
+  {
     name = "N-V-__8AANT61wB--nJ95Gj_ctmzAtcjloZ__hRqNw5lC1Kr";
     path = fetchZigArtifact {
       name = "bindings";
