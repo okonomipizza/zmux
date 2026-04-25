@@ -6,7 +6,7 @@
   ghosttySrc,
 }: stdenv.mkDerivation (finalAttrs: {
   pname = "zmux";
-  version = "0.0.0";
+  version = "1.0.2";
 
   src = lib.fileset.toSource {
     root = ../.;
