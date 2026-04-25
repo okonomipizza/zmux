@@ -31,6 +31,7 @@
     zig build \
       --system ${finalAttrs.deps} \
       -Doptimize=ReleaseSafe \
+      -Dtarget=native-native-musl \
       --global-cache-dir $(pwd)/.cache
     runHook postBuild
   '';
