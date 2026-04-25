@@ -6,7 +6,7 @@ const Server = @import("Server.zig");
 const client = @import("client.zig").client;
 
 /// zmux app version
-const version = "1.0.0";
+const version = "1.0.1";
 
 /// Base directory for zmux sockets
 /// The session runs as a daemon in forked threads, with communication between
@@ -93,7 +93,6 @@ fn printHelp() void {
         \\Examples:
         \\  zmux              Attach to or create "default" session
         \\  zmux new work     Create a new session named "work"
-        \\  zmux work         Attach to or create "work" session
         \\  zmux attach work  Attach to "work" session
         \\  zmux ls           List all sessions
         \\  zmux kill work    Kill "work" session
@@ -129,10 +128,10 @@ fn attachOrCreate(alloc: std.mem.Allocator, session_name: []const u8) !void {
 
     if (sessionExists(socket_path)) {
         // Session exists, attach to it
-        try client(alloc, socket_path);
+        try client(socket_path);
     } else {
         // Session doesn't exist, create it
-        try startServerAndAttach(alloc, session_name, socket_path);
+        try startServerAndAttach(alloc, socket_path);
     }
 }
 
@@ -148,7 +147,7 @@ fn newSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
         return;
     }
 
-    try startServerAndAttach(alloc, session_name, socket_path);
+    try startServerAndAttach(alloc, socket_path);
 }
 
 fn attachSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
@@ -163,12 +162,10 @@ fn attachSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
         return;
     }
 
-    try client(alloc, socket_path);
+    try client(socket_path);
 }
 
-fn startServerAndAttach(alloc: std.mem.Allocator, session_name: []const u8, socket_path: []const u8) !void {
-    _ = session_name;
-
+fn startServerAndAttach(alloc: std.mem.Allocator, socket_path: []const u8) !void {
     // Create socket directory if it doesn't exist
     std.fs.cwd().makePath(SOCKET_DIR) catch {};
 
@@ -202,7 +199,7 @@ fn startServerAndAttach(alloc: std.mem.Allocator, session_name: []const u8, sock
         var attempts: u8 = 0;
         while (attempts < 10) : (attempts += 1) {
             if (sessionExists(socket_path)) {
-                try client(alloc, socket_path);
+                try client(socket_path);
                 return;
             }
             std.Thread.sleep(50 * std.time.ns_per_ms);

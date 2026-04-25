@@ -59,9 +59,7 @@ fn setupSignalFd() !posix.fd_t {
     return @intCast(fd);
 }
 
-pub fn client(allocator: std.mem.Allocator, socket_path: []const u8) !void {
-    _ = allocator;
-
+pub fn client(socket_path: []const u8) !void {
     // Original termios settings, restored on zmux exit
     var original_termios: c.termios = undefined;
     const stdin_fd: posix.fd_t = posix.STDIN_FILENO;

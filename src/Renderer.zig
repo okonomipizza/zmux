@@ -526,10 +526,26 @@ fn drawBorders(
         }
     }
 
+    // Calculate floating pane area (including its border) to skip drawing there
+    const fp = workspace.floating_pane;
+    const fp_left: u16 = if (fp.x > 0) fp.x - 1 else 0;
+    const fp_top: u16 = if (fp.y > 0) fp.y - 1 else 0;
+    const fp_right: u16 = fp.x + fp.cols; // right border column
+    const fp_bottom: u16 = fp.y + fp.rows; // bottom border row
+
     for (0..H) |row| {
         for (0..W) |col| {
             const v = border[row * W + col];
             if (v == 0) continue;
+
+            // Skip drawing borders in the floating pane area when it's visible
+            if (workspace.show_floating) {
+                const c = @as(u16, @intCast(col));
+                const r = @as(u16, @intCast(row));
+                if (c >= fp_left and c <= fp_right and r >= fp_top and r <= fp_bottom) {
+                    continue;
+                }
+            }
 
             const ch: []const u8 = switch (v) {
                 UP | DOWN => "│",
