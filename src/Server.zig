@@ -143,7 +143,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                             renderAndBroadcast(&state, false) catch {};
                         }
                     } else {
-                        const client: *Client = @ptrFromInt(tag);
+                        const client = activeClient(&state, tag) orelse continue;
                         const data = client.stream.read(client.fd) catch |err| {
                             if (err == error.Closed) removeClient(&state, client);
                             continue;
@@ -156,7 +156,9 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                 .disconnect => |tag| {
                     // ignore PTY EOF (shell exited) and listen fd; only remove clients
                     if (tag != LISTEN_TAG and tag & TAG_PANE == 0) {
-                        removeClient(&state, @ptrFromInt(tag));
+                        if (activeClient(&state, tag)) |client| {
+                            removeClient(&state, client);
+                        }
                     }
                 },
                 .signal => {},
@@ -189,6 +191,20 @@ fn removeClient(state: *ServerState, client: *Client) void {
             }
         }
     }
+}
+
+/// Resolve a client tag to a still-active *Client. Returns null if the
+/// client was already removed earlier in this poll iteration, preventing
+/// use-after-free when multiple events for the same client (e.g. readable
+/// + disconnect on close) arrive in the same wait batch.
+fn activeClient(state: *ServerState, tag: usize) ?*Client {
+    const target: *Client = @ptrFromInt(tag);
+    for (&state.clients.*) |*slot| {
+        if (slot.*) |*cl| {
+            if (cl == target) return cl;
+        }
+    }
+    return null;
 }
 
 fn renderAndBroadcast(state: *ServerState, clear_screen: bool) !void {
