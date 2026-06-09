@@ -51,27 +51,33 @@ const EPoll = struct {
     }
 
     pub fn addSignal(self: *EPoll, signum: u32, tag: usize) !void {
-        var mask: linux.sigset_t = .{0};
+        // Reserve slot before any signal/fd setup so we can fail cleanly.
+        const slot_idx = blk: {
+            for (self.signal_fds, 0..) |entry, i| {
+                if (entry == null) break :blk i;
+            }
+            return error.TooManySignals;
+        };
+
+        var mask: linux.sigset_t = std.mem.zeroes(linux.sigset_t);
         linux.sigaddset(&mask, signum);
-        _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
+
+        var old_mask: linux.sigset_t = std.mem.zeroes(linux.sigset_t);
+        _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, &old_mask);
+        errdefer _ = linux.sigprocmask(linux.SIG.SETMASK, &old_mask, null);
 
         const rc = linux.signalfd(-1, &mask, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
         if (@as(isize, @bitCast(rc)) < 0) return error.SignalFdFailed;
         const sfd: posix.fd_t = @intCast(rc);
         errdefer posix.close(sfd);
 
-        for (&self.signal_fds, 0..) |*slot, i| {
-            if (slot.* == null) {
-                slot.* = .{ .sfd = sfd, .tag = tag };
-                var ev = linux.epoll_event{
-                    .events = linux.EPOLL.IN,
-                    .data = .{ .u64 = SIGNAL_MARK | i },
-                };
-                try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_ADD, sfd, &ev);
-                return;
-            }
-        }
-        return error.TooManySignals;
+        var ev = linux.epoll_event{
+            .events = linux.EPOLL.IN,
+            .data = .{ .u64 = SIGNAL_MARK | slot_idx },
+        };
+        try posix.epoll_ctl(self.efd, linux.EPOLL.CTL_ADD, sfd, &ev);
+
+        self.signal_fds[slot_idx] = .{ .sfd = sfd, .tag = tag };
     }
 
     pub fn remove(self: *EPoll, fd: posix.fd_t) void {

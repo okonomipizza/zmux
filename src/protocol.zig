@@ -323,6 +323,7 @@ pub const Request = union(enum) {
             },
             .switch_workspace => |s| {
                 if (buf.len < 2) return error.BufferTooSmall;
+                if (s.index > std.math.maxInt(u8)) return error.IndexTooLarge;
                 buf[0] = @intFromEnum(Method.switch_workspace);
                 buf[1] = @intCast(s.index);
                 return buf[0..2];
@@ -394,6 +395,7 @@ pub const Request = union(enum) {
             },
             .move_pane_to_workspace => |m| {
                 if (buf.len < 2) return error.BufferTooSmall;
+                if (m.index > std.math.maxInt(u8)) return error.IndexTooLarge;
                 buf[0] = @intFromEnum(Method.move_pane_to_workspace);
                 buf[1] = @intCast(m.index);
                 return buf[0..2];

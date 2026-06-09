@@ -86,10 +86,13 @@ pub fn movePaneToWorkspace(
     } else {
         const pane = src_ws.extractLastPane();
         const src_root = src_ws.root;
+        const src_floating = src_ws.floating_pane;
 
         try dst_ws.attachPane(alloc, pane);
 
         alloc.destroy(src_root);
+        src_floating.deinit(alloc);
+        alloc.destroy(src_floating);
 
         const removed_idx = self.active_workspace;
         _ = self.workspaces.orderedRemove(removed_idx);
