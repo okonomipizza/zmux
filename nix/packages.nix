@@ -6,7 +6,7 @@
   ghosttySrc,
 }: stdenv.mkDerivation (finalAttrs: {
   pname = "zmux";
-  version = "1.0.2";
+  version = "1.1.0";
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -31,7 +31,7 @@
     zig build \
       --system ${finalAttrs.deps} \
       -Doptimize=ReleaseSafe \
-      -Dtarget=native-native-musl \
+      ${lib.optionalString stdenv.hostPlatform.isLinux "-Dtarget=native-native-musl"} \
       --global-cache-dir $(pwd)/.cache
     runHook postBuild
   '';
@@ -46,7 +46,7 @@
   meta = {
     description = "Terminal multiplexer written in Zig";
     license = lib.licenses.mit;
-    platforms = ["x86_64-linux" "aarch64-linux"];
+    platforms = ["x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin"];
     mainProgram = "zmux";
   };
 })
