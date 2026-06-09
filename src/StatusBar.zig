@@ -4,8 +4,25 @@ const WorkspaceManager = @import("WorkspaceManager.zig");
 
 pub const StatusBar = @This();
 
-/// Japanese formal numerals (大字) for workspace numbers 1-10
-const DAIJI = [_][]const u8{ "壱", "弐", "参", "肆", "伍", "陸", "漆", "捌", "玖", "拾" };
+/// Japanese formal numerals (大字) for workspace numbers 1-10.
+/// `cells` is the terminal display width of the glyph; all entries are CJK
+/// Unified Ideographs (East Asian Width = Wide), so each occupies 2 cells.
+const Daiji = struct {
+    text: []const u8,
+    cells: u8,
+};
+const DAIJI = [_]Daiji{
+    .{ .text = "壱", .cells = 2 },
+    .{ .text = "弐", .cells = 2 },
+    .{ .text = "参", .cells = 2 },
+    .{ .text = "肆", .cells = 2 },
+    .{ .text = "伍", .cells = 2 },
+    .{ .text = "陸", .cells = 2 },
+    .{ .text = "漆", .cells = 2 },
+    .{ .text = "捌", .cells = 2 },
+    .{ .text = "玖", .cells = 2 },
+    .{ .text = "拾", .cells = 2 },
+};
 
 pub fn renderWithMode(
     wm: *WorkspaceManager,
@@ -32,10 +49,11 @@ pub fn renderWithMode(
 
         // Use 大字 for numbers 1-10, fallback to regular digits for > 10
         if (i < DAIJI.len) {
+            const entry = DAIJI[i];
             try writer.writeByte(' ');
-            try writer.writeAll(DAIJI[i]);
+            try writer.writeAll(entry.text);
             try writer.writeByte(' ');
-            written += 4; // space + full-width char (2 cols) + space
+            written += 2 + entry.cells; // space + glyph width + space
         } else {
             try writer.print(" {d} ", .{i + 1});
             written += 3;
