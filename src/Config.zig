@@ -102,15 +102,29 @@ pub const Color = enum {
     }
 };
 
+fn warn(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    var w = std.fs.File.stderr().writer(&buf);
+    w.interface.print("zmux: config: " ++ fmt ++ "\n", args) catch return;
+    w.interface.flush() catch {};
+}
+
 pub fn load(allocator: std.mem.Allocator) Config {
     const home = std.posix.getenv("HOME") orelse return .{};
     const path = std.fmt.allocPrint(allocator, "{s}/.config/zmux/zmux.jsonc", .{home}) catch return .{};
     defer allocator.free(path);
 
-    const file = std.fs.openFileAbsolute(path, .{}) catch return .{};
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+        // Missing config is the normal case; only warn on other errors.
+        if (err != error.FileNotFound) warn("could not open {s}: {s}", .{ path, @errorName(err) });
+        return .{};
+    };
     defer file.close();
 
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch return .{};
+    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+        warn("could not read {s}: {s}", .{ path, @errorName(err) });
+        return .{};
+    };
     defer allocator.free(content);
 
     return parseContent(allocator, content);
@@ -120,7 +134,10 @@ fn parseContent(allocator: std.mem.Allocator, content: []const u8) Config {
     var jc = jsonc.Jsonc.init(content);
     defer jc.deinit();
 
-    const parsed = jc.parse(std.json.Value, allocator, .{}) catch return .{};
+    const parsed = jc.parse(std.json.Value, allocator, .{}) catch |err| {
+        warn("JSON parse error: {s}", .{@errorName(err)});
+        return .{};
+    };
     defer parsed.deinit();
 
     var config = Config{};
@@ -128,10 +145,12 @@ fn parseContent(allocator: std.mem.Allocator, content: []const u8) Config {
     inline for (@typeInfo(Config).@"struct".fields) |field| {
         if (field.type == Color) {
             if (jsonc.Jsonc.getValueByPath(parsed.value, &.{field.name}) catch null) |val| {
-                if (val == .string) {
-                    if (Color.fromString(val.string)) |color| {
-                        @field(config, field.name) = color;
-                    }
+                if (val != .string) {
+                    warn("{s}: expected string, got {s}", .{ field.name, @tagName(val) });
+                } else if (Color.fromString(val.string)) |color| {
+                    @field(config, field.name) = color;
+                } else {
+                    warn("{s}: unknown color '{s}'", .{ field.name, val.string });
                 }
             }
         }
