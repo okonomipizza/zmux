@@ -622,8 +622,7 @@ fn encodeOsc52(text: []const u8, buf: []u8) []u8 {
     }
 
     @memcpy(buf[0..prefix.len], prefix);
-    const encoded = encoder.encode(buf[prefix.len..][0..encoded_len], text);
-    _ = encoded;
+    _ = encoder.encode(buf[prefix.len..][0..encoded_len], text);
     @memcpy(buf[prefix.len + encoded_len ..][0..suffix.len], suffix);
 
     return buf[0 .. prefix.len + encoded_len + suffix.len];

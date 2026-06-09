@@ -102,10 +102,6 @@ pub const Color = enum {
     }
 };
 
-pub fn init() Config {
-    return .{};
-}
-
 pub fn load(allocator: std.mem.Allocator) Config {
     const home = std.posix.getenv("HOME") orelse return .{};
     const path = std.fmt.allocPrint(allocator, "{s}/.config/zmux/zmux.jsonc", .{home}) catch return .{};

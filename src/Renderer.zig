@@ -104,17 +104,6 @@ pub fn markPaneDirty(self: *Renderer, pane: *Pane) void {
     self.addDirtyRect(pane.x, pane.y, pane.cols, pane.rows);
 }
 
-/// Check if a point falls within any dirty region
-fn isPointDirty(self: *Renderer, x: u16, y: u16) bool {
-    if (self.full_redraw) return true;
-    if (self.dirty_count == 0) return false;
-
-    for (self.dirty_rects[0..self.dirty_count]) |rect| {
-        if (rect.contains(x, y)) return true;
-    }
-    return false;
-}
-
 /// Check if a row intersects any dirty region (for early row skip)
 fn isRowDirty(self: *Renderer, y: u16, x_start: u16, x_end: u16) bool {
     if (self.full_redraw) return true;

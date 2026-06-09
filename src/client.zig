@@ -524,49 +524,6 @@ const MouseEvent = struct {
     const WHEEL_DOWN = 65;
 };
 
-/// Check if input looks like the start of an SGR mouse sequence
-/// Used to drop incomplete/partial mouse sequences
-fn isSgrMousePrefix(input: []const u8) bool {
-    if (input.len == 0) return false;
-    if (input[0] != 0x1b) return false;
-    if (input.len == 1) return true; // Just ESC, could be start of mouse seq
-    if (input[1] != '[') return false;
-    if (input.len == 2) return true; // ESC [
-    if (input[2] != '<') return false;
-    // Starts with \x1b[< - definitely a mouse sequence (or similar CSI)
-    return true;
-}
-
-/// Check if input looks like the middle/end of a mouse sequence
-/// Pattern: digits and semicolons ending with 'M' or 'm'
-/// e.g., "4;32;42M" or "32;42M64;33;42M"
-fn looksLikeMouseSequenceFragment(input: []const u8) bool {
-    if (input.len == 0) return false;
-
-    // Must contain 'M' or 'm' (mouse sequence terminator)
-    var has_terminator = false;
-    var has_semicolon = false;
-    var has_digit = false;
-
-    for (input) |ch| {
-        if (ch == 'M' or ch == 'm') {
-            has_terminator = true;
-        } else if (ch == ';') {
-            has_semicolon = true;
-        } else if (ch >= '0' and ch <= '9') {
-            has_digit = true;
-        } else if (ch == 0x1b or ch == '[' or ch == '<') {
-            // These are valid mouse sequence chars, continue
-        } else {
-            // Contains other characters - probably not a mouse fragment
-            return false;
-        }
-    }
-
-    // Looks like a mouse fragment if it has terminator with digits and semicolons
-    return has_terminator and has_semicolon and has_digit;
-}
-
 /// Parse SGR mouse escape sequence: \x1b[<Btn;X;Y;M or \x1b[<Btn;X;Y;m
 /// Returns the parsed mouse event and the number of bytes consumed, or null if not a valid mouse sequence
 fn parseSgrMouse(input: []const u8) ?struct { event: MouseEvent, len: usize } {
