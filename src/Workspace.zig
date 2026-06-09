@@ -100,12 +100,6 @@ pub fn deinit(self: *Workspace, alloc: std.mem.Allocator) void {
     alloc.destroy(self.floating_pane);
 }
 
-fn deinitPanes(node: *PaneNode) void {
-    switch (node) {
-        .leaf => node,
-    }
-}
-
 pub fn activePane(self: *Workspace) *Pane {
     return self.active_pane;
 }

@@ -779,11 +779,10 @@ pub fn renderCopyModeOverlay(
                         try writer.writeByte(' ');
                     } else {
                         var utf8_buf: [4]u8 = undefined;
-                        const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
-                        if (len == 1 and utf8_buf[0] == 0) {
-                            try writer.writeByte(' ');
-                        } else {
+                        if (std.unicode.utf8Encode(cp, &utf8_buf)) |len| {
                             try writer.writeAll(utf8_buf[0..len]);
+                        } else |_| {
+                            try writer.writeByte(' ');
                         }
                     }
                 } else {
@@ -822,11 +821,10 @@ pub fn renderCopyModeOverlay(
                     try writer.writeByte(' ');
                 } else {
                     var utf8_buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(cp, &utf8_buf) catch 1;
-                    if (len == 1 and utf8_buf[0] == 0) {
-                        try writer.writeByte(' ');
-                    } else {
+                    if (std.unicode.utf8Encode(cp, &utf8_buf)) |len| {
                         try writer.writeAll(utf8_buf[0..len]);
+                    } else |_| {
+                        try writer.writeByte(' ');
                     }
                 }
             } else {

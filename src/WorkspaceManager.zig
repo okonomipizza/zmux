@@ -40,18 +40,21 @@ pub fn getActiveWorkspace(self: *WorkspaceManager) ?*Workspace {
 }
 
 pub fn switchWorkspace(self: *WorkspaceManager, idx: usize) void {
-    if (idx > self.workspaces.items.len) return;
+    if (idx >= self.workspaces.items.len) return;
 
     self.active_workspace = idx;
 }
 
 pub fn nextWorkspace(self: *WorkspaceManager) ?*Workspace {
-    self.active_workspace = (self.active_workspace + 1) % self.workspaces.items.len;
+    const len = self.workspaces.items.len;
+    if (len == 0) return null;
+    self.active_workspace = (self.active_workspace + 1) % len;
     return self.getActiveWorkspace();
 }
 
 pub fn prevWorkspace(self: *WorkspaceManager) ?*Workspace {
     const len = self.workspaces.items.len;
+    if (len == 0) return null;
     self.active_workspace = (self.active_workspace + len - 1) % len;
     return self.getActiveWorkspace();
 }
