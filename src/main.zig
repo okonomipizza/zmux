@@ -6,7 +6,7 @@ const Server = @import("Server.zig");
 const client = @import("client.zig").client;
 
 /// zmux app version
-const version = "1.0.2";
+const version = "1.1.0";
 
 /// Base directory for zmux sockets
 /// The session runs as a daemon in forked threads, with communication between
