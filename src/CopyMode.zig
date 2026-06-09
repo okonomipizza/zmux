@@ -95,15 +95,15 @@ pub fn halfPageUp(self: *CopyMode, pane: *Pane) void {
 }
 
 pub fn halfPageDown(self: *CopyMode, pane: *Pane) void {
+    if (pane.rows == 0) return;
     const half = pane.rows / 2;
     if (self.cursor_y + half < pane.rows) {
         self.cursor_y += half;
     } else {
-        const overflow = (self.cursor_y + half) -| (pane.rows - 1);
-        self.cursor_y = pane.rows - 1;
-        if (overflow > 0) {
-            pane.terminal.scrollViewport(.{ .delta = @intCast(overflow) });
-        }
+        const last_row = pane.rows - 1;
+        const scroll_amount = self.cursor_y + half - last_row;
+        self.cursor_y = last_row;
+        pane.terminal.scrollViewport(.{ .delta = @intCast(scroll_amount) });
     }
 }
 

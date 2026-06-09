@@ -144,8 +144,8 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                         }
                     } else {
                         const client = activeClient(&state, tag) orelse continue;
-                        const data = client.stream.read(client.fd) catch |err| {
-                            if (err == error.Closed) removeClient(&state, client);
+                        const data = client.stream.read(client.fd) catch {
+                            removeClient(&state, client);
                             continue;
                         };
                         handleClient(&state, client, data) catch {
