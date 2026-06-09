@@ -44,14 +44,12 @@ pub const Request = union(enum) {
     copy_mode_start: void,
     copy_mode_input: CopyModeInput,
     copy_mode_exit: void,
-    yank: void,
     paste: void,
     // Mouse selection
     mouse_select_start: MouseSelect,
     mouse_select_update: MouseSelect,
     mouse_select_end: MouseSelect,
     clipboard_copy: void,
-    clipboard_paste: void,
 
     pub const Method = enum(u8) {
         attach = 0,
@@ -71,7 +69,6 @@ pub const Request = union(enum) {
         copy_mode_start = 14,
         copy_mode_input = 15,
         copy_mode_exit = 16,
-        yank = 17,
         paste = 18,
         swap_pane = 19,
         resize_pane = 20,
@@ -81,7 +78,6 @@ pub const Request = union(enum) {
         mouse_select_update = 24,
         mouse_select_end = 25,
         clipboard_copy = 26,
-        clipboard_paste = 27,
     };
 
     const Attach = struct {
@@ -225,7 +221,6 @@ pub const Request = union(enum) {
                 return .{ .copy_mode_input = .{ .key = key } };
             },
             .copy_mode_exit => return .{ .copy_mode_exit = {} },
-            .yank => return .{ .yank = {} },
             .paste => return .{ .paste = {} },
             .swap_pane => {
                 if (src.len < 2) return error.TooShort;
@@ -263,7 +258,6 @@ pub const Request = union(enum) {
                 return .{ .mouse_select_end = .{ .x = x, .y = y } };
             },
             .clipboard_copy => return .{ .clipboard_copy = {} },
-            .clipboard_paste => return .{ .clipboard_paste = {} },
         }
     }
 
@@ -371,11 +365,6 @@ pub const Request = union(enum) {
                 buf[0] = @intFromEnum(Method.copy_mode_exit);
                 return buf[0..1];
             },
-            .yank => {
-                if (buf.len < 1) return error.BufferTooSmall;
-                buf[0] = @intFromEnum(Method.yank);
-                return buf[0..1];
-            },
             .paste => {
                 if (buf.len < 1) return error.BufferTooSmall;
                 buf[0] = @intFromEnum(Method.paste);
@@ -430,11 +419,6 @@ pub const Request = union(enum) {
             .clipboard_copy => {
                 if (buf.len < 1) return error.BufferTooSmall;
                 buf[0] = @intFromEnum(Method.clipboard_copy);
-                return buf[0..1];
-            },
-            .clipboard_paste => {
-                if (buf.len < 1) return error.BufferTooSmall;
-                buf[0] = @intFromEnum(Method.clipboard_paste);
                 return buf[0..1];
             },
         }

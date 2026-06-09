@@ -427,43 +427,6 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
-        .yank => {
-            const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
-            const pane = active_ws.activePane();
-
-            // Try to yank selected text if in copy mode with selection
-            if (state.copy_mode) |*cm| {
-                if (cm.selecting) {
-                    if (cm.getSelectedText(state.alloc, pane)) |text| {
-                        // Free old clipboard if any
-                        if (state.clipboard) |old| {
-                            state.alloc.free(old);
-                        }
-                        state.clipboard = text;
-
-                        // Send OSC 52 to set system clipboard (include in render output)
-                        var osc_buf: [65536]u8 = undefined;
-                        const encoded = encodeOsc52(text, &osc_buf);
-                        if (encoded.len > 0) {
-                            for (&state.clients.*) |*slot| {
-                                if (slot.*) |*cli| {
-                                    cli.stream.write(encoded, cli.fd) catch {};
-                                }
-                            }
-                        }
-                    } else |_| {
-                        // Ignore error, just skip clipboard
-                    }
-                }
-            }
-
-            // Always exit copy mode after yank attempt
-            state.input_mode = .normal;
-            state.copy_mode = null;
-            pane.terminal.scrollViewport(.{ .bottom = {} });
-            state.renderer.invalidate();
-            try renderAndBroadcast(state, false);
-        },
         .paste => {
             if (state.clipboard) |text| {
                 const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
@@ -595,16 +558,6 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             pane.terminal.scrollViewport(.{ .bottom = {} });
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
-        },
-        .clipboard_paste => {
-            if (state.clipboard) |text| {
-                const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
-                const pane = active_ws.activePane();
-                // Send bracketed paste
-                try pane.pty.write("\x1b[200~");
-                try pane.pty.write(text);
-                try pane.pty.write("\x1b[201~");
-            }
         },
     }
 }
