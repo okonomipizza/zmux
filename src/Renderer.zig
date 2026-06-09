@@ -35,6 +35,10 @@ const MAX_DIRTY_RECTS = 16;
 
 // Cell state
 prev_cells: []Cell,
+// Border bitmap reused across frames (UP/DOWN/LEFT/RIGHT flags per cell)
+border_buf: []u8,
+// Active-border bitmap reused across frames
+active_border_buf: []bool,
 // Terminal width
 term_cols: u16,
 // Terminal height
@@ -54,13 +58,17 @@ pub fn init(
     rows: u16,
     config: Config,
 ) !Renderer {
-    const cells = try alloc.alloc(
-        Cell,
-        @as(usize, cols) * @as(usize, rows),
-    );
+    const size = @as(usize, cols) * @as(usize, rows);
+    const cells = try alloc.alloc(Cell, size);
+    errdefer alloc.free(cells);
     @memset(cells, .{});
+    const border_buf = try alloc.alloc(u8, size);
+    errdefer alloc.free(border_buf);
+    const active_border_buf = try alloc.alloc(bool, size);
     return .{
         .prev_cells = cells,
+        .border_buf = border_buf,
+        .active_border_buf = active_border_buf,
         .term_cols = cols,
         .term_rows = rows,
         .alloc = alloc,
@@ -73,6 +81,8 @@ pub fn init(
 
 pub fn deinit(self: *Renderer) void {
     self.alloc.free(self.prev_cells);
+    self.alloc.free(self.border_buf);
+    self.alloc.free(self.active_border_buf);
 }
 
 // Returns a reference to the previous cell at the given position (x, y)
@@ -403,16 +413,13 @@ fn drawBorders(
 
     const W = self.term_cols;
     const H = self.term_rows;
-    const size = @as(usize, W) * @as(usize, H);
 
     // Accumulate UP/DOWN/LEFT/RIGHT flags directory into each cell
-    var border = try self.alloc.alloc(u8, size);
-    defer self.alloc.free(border);
+    const border = self.border_buf;
     @memset(border, 0);
 
     // Track which border cells are adjacent to the active pane
-    var active_border = try self.alloc.alloc(bool, size);
-    defer self.alloc.free(active_border);
+    const active_border = self.active_border_buf;
     @memset(active_border, false);
 
     var buf: [64]*Pane = undefined;
