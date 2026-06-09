@@ -18,7 +18,7 @@
       };
     };
     ghostty = {
-      url = "github:ghostty-org/ghostty/v1.3.1";
+      url = "github:ghostty-org/ghostty/tip";
       flake = false;
     };
   };

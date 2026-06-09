@@ -1,7 +1,7 @@
 const std = @import("std");
 const Pty = @import("Pty.zig");
 const Terminal = @import("ghostty-vt").Terminal;
-const ReadonlyStream = @import("ghostty-vt").ReadonlyStream;
+const TerminalStream = @import("ghostty-vt").TerminalStream;
 
 const c = @import("c.zig").c;
 
@@ -10,7 +10,7 @@ pub const Pane = @This();
 pty: Pty,
 // Manage terminal buffer with lib-ghostty
 terminal: Terminal,
-vt_stream: ReadonlyStream,
+vt_stream: TerminalStream,
 // x and y represent the cordinates of the top-left corner of the pane (0-indexed)
 x: u16,
 y: u16,
@@ -53,8 +53,8 @@ pub fn deinit(self: *Pane, alloc: std.mem.Allocator) void {
     self.terminal.deinit(alloc);
 }
 
-pub fn feed(self: *Pane, data: []const u8) !void {
-    try self.vt_stream.nextSlice(data);
+pub fn feed(self: *Pane, data: []const u8) void {
+    self.vt_stream.nextSlice(data);
     self.is_dirty = true;
 }
 

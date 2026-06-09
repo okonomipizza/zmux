@@ -1,4 +1,5 @@
 // src/c.zig
+const builtin = @import("builtin");
 pub const c = @cImport({
     @cDefine("_XOPEN_SOURCE", "600");
     @cInclude("stdlib.h");
@@ -7,6 +8,6 @@ pub const c = @cImport({
     @cInclude("termios.h");
     @cInclude("signal.h");
     @cInclude("sys/ioctl.h");
-    @cInclude("sys/epoll.h");
+    if (builtin.os.tag == .linux) @cInclude("sys/epoll.h");
     @cInclude("sys/wait.h");
 });

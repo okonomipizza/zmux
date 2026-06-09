@@ -12,6 +12,7 @@ pub fn build(b: *std.Build) void {
 
     if (b.lazyDependency("ghostty", .{
         .simd = false,
+        .@"emit-xcframework" = false,
     })) |dep| {
         exe_mod.addImport(
             "ghostty-vt",
@@ -51,7 +52,9 @@ pub fn build(b: *std.Build) void {
     });
 
     exe.linkLibC();
-    exe.linkage = .static;
+    if (target.result.os.tag == .linux) {
+        exe.linkage = .static;
+    }
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

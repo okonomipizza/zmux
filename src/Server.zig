@@ -2,8 +2,9 @@ const std = @import("std");
 const c = @import("c.zig").c;
 const Stream = @import("Stream.zig").Stream;
 const posix = std.posix;
-const linux = std.os.linux;
 const protocol = @import("protocol.zig");
+const loop_mod = @import("loop.zig");
+pub const Loop = loop_mod.Loop;
 const WorkspaceManager = @import("WorkspaceManager.zig");
 const Workspace = @import("Workspace.zig");
 const Pane = @import("Pane.zig");
@@ -13,6 +14,13 @@ const CopyMode = @import("CopyMode.zig").CopyMode;
 
 const MAX_CLIENTS = 64;
 const BUF_SIZE = 64 * 1024;
+
+// Tag encoding for the event loop (server-specific).
+// bit 0 set  → *Pane  (real ptr = tag & ~TAG_PANE)
+// bit 0 clear, non-zero → *Client
+// zero → listen fd
+const TAG_PANE: usize = 1;
+const LISTEN_TAG: usize = 0;
 const RENDER_BUF_SIZE = 256 * 1024;
 
 const Client = struct {
@@ -29,11 +37,10 @@ const InputMode = enum {
     copy,
 };
 
-/// Server state passed to helper functions
 const ServerState = struct {
     alloc: std.mem.Allocator,
     listen_fd: posix.fd_t,
-    epoll_fd: posix.fd_t,
+    loop: *Loop,
     clients: *[MAX_CLIENTS]?Client,
     workspace_manager: *WorkspaceManager,
     renderer: *Renderer,
@@ -53,7 +60,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
     // by connecting and immediately disconnecting
     var act: posix.Sigaction = .{
         .handler = .{ .handler = posix.SIG.IGN },
-        .mask = @splat(0),
+        .mask = std.mem.zeroes(posix.sigset_t),
         .flags = 0,
     };
     posix.sigaction(posix.SIG.PIPE, &act, null);
@@ -75,15 +82,9 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
     try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
     try posix.listen(listen_fd, 128);
 
-    // Setup epoll
-    const epoll_fd = try posix.epoll_create1(0);
-    defer posix.close(epoll_fd);
-
-    var listen_ev = linux.epoll_event{
-        .events = linux.EPOLL.IN,
-        .data = .{ .fd = listen_fd },
-    };
-    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &listen_ev);
+    var loop = try Loop.init();
+    defer loop.deinit();
+    try loop.addFd(listen_fd, LISTEN_TAG, false);
 
     // Terminal size
     const term_cols: u16 = 80;
@@ -105,19 +106,16 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
     const render_buf = try alloc.alloc(u8, RENDER_BUF_SIZE);
     defer alloc.free(render_buf);
 
-    // Register initial pane fds with epoll
     const active_ws = workspace_manager.getActiveWorkspace() orelse return error.NoActiveWorkspace;
-    try epollAdd(epoll_fd, active_ws.active_pane.pty.master_fd, linux.EPOLL.IN);
-    try epollAdd(epoll_fd, active_ws.floating_pane.pty.master_fd, linux.EPOLL.IN);
+    try loop.addFd(active_ws.active_pane.pty.master_fd, @intFromPtr(active_ws.active_pane) | TAG_PANE, false);
+    try loop.addFd(active_ws.floating_pane.pty.master_fd, @intFromPtr(active_ws.floating_pane) | TAG_PANE, false);
 
-    // Client storage
     var clients: [MAX_CLIENTS]?Client = [_]?Client{null} ** MAX_CLIENTS;
 
-    // Server state for helpers
     var state = ServerState{
         .alloc = alloc,
         .listen_fd = listen_fd,
-        .epoll_fd = epoll_fd,
+        .loop = &loop,
         .clients = &clients,
         .workspace_manager = &workspace_manager,
         .renderer = &renderer,
@@ -128,109 +126,69 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
         .prefix_mode = false,
     };
 
-    var events: [64]linux.epoll_event = undefined;
-
-    // Main event loop
     while (true) {
-        const n = posix.epoll_wait(epoll_fd, &events, -1);
-
-        for (events[0..n]) |ev| {
-            const fd: posix.fd_t = ev.data.fd;
-
-            if (fd == listen_fd) {
-                // New client connection
-                const client_fd = posix.accept(listen_fd, null, null, 0) catch continue;
-                addClient(&state, client_fd);
-            } else {
-                // Check for disconnect
-                if (ev.events & (linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR) != 0) {
-                    // Check if it's a PTY fd first - don't close it, just ignore
-                    // (PTY HUP means shell exited, but we keep the pane)
-                    if (findPaneByFd(&state, fd) == null) {
-                        removeClient(&state, fd);
-                    }
-                    continue;
-                }
-
-                // Check if this is pane pty output
-                if (findPaneByFd(&state, fd)) |pane| {
-                    var pty_buf: [4096]u8 = undefined;
-                    const pty_n = posix.read(fd, &pty_buf) catch continue;
-                    if (pty_n > 0) {
-                        pane.feed(pty_buf[0..pty_n]) catch {};
-                        renderAndBroadcast(&state, false) catch {};
-                    }
-                } else if (getClient(&state, fd)) |client| {
-                    // Client data
-                    const data = client.stream.read(client.fd) catch |err| {
-                        if (err == error.Closed) {
-                            removeClient(&state, fd);
+        var iter = loop.wait(-1);
+        while (iter.next()) |event| {
+            switch (event) {
+                .readable => |tag| {
+                    if (tag == LISTEN_TAG) {
+                        const client_fd = posix.accept(listen_fd, null, null, 0) catch continue;
+                        addClient(&state, client_fd);
+                    } else if (tag & TAG_PANE != 0) {
+                        const pane: *Pane = @ptrFromInt(tag & ~TAG_PANE);
+                        var pty_buf: [4096]u8 = undefined;
+                        const n = posix.read(pane.pty.master_fd, &pty_buf) catch continue;
+                        if (n > 0) {
+                            pane.feed(pty_buf[0..n]);
+                            renderAndBroadcast(&state, false) catch {};
                         }
-                        continue;
-                    };
-                    // Handle client request - errors should not crash the server
-                    handleClient(&state, client, data) catch {
-                        removeClient(&state, fd);
-                    };
-                }
+                    } else {
+                        const client: *Client = @ptrFromInt(tag);
+                        const data = client.stream.read(client.fd) catch |err| {
+                            if (err == error.Closed) removeClient(&state, client);
+                            continue;
+                        };
+                        handleClient(&state, client, data) catch {
+                            removeClient(&state, client);
+                        };
+                    }
+                },
+                .disconnect => |tag| {
+                    // ignore PTY EOF (shell exited) and listen fd; only remove clients
+                    if (tag != LISTEN_TAG and tag & TAG_PANE == 0) {
+                        removeClient(&state, @ptrFromInt(tag));
+                    }
+                },
+                .signal => {},
             }
         }
     }
-}
-
-fn epollAdd(epoll_fd: posix.fd_t, fd: posix.fd_t, events: u32) !void {
-    var ev = linux.epoll_event{
-        .events = events,
-        .data = .{ .fd = fd },
-    };
-    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
 }
 
 fn addClient(state: *ServerState, fd: posix.fd_t) void {
     for (&state.clients.*) |*slot| {
         if (slot.* == null) {
             slot.* = Client{ .fd = fd, .stream = Stream(BUF_SIZE).init() };
-
-            var ev = linux.epoll_event{
-                .events = linux.EPOLL.IN | linux.EPOLL.RDHUP,
-                .data = .{ .fd = fd },
-            };
-            posix.epoll_ctl(state.epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev) catch {};
+            if (slot.*) |*client| {
+                state.loop.addFd(fd, @intFromPtr(client), true) catch {};
+            }
             return;
         }
     }
     posix.close(fd);
 }
 
-fn removeClient(state: *ServerState, fd: posix.fd_t) void {
-    posix.epoll_ctl(state.epoll_fd, linux.EPOLL.CTL_DEL, fd, null) catch {};
-    posix.close(fd);
-
+fn removeClient(state: *ServerState, client: *Client) void {
+    state.loop.remove(client.fd);
+    posix.close(client.fd);
     for (&state.clients.*) |*slot| {
-        if (slot.*) |client| {
-            if (client.fd == fd) {
+        if (slot.*) |*cl| {
+            if (cl.fd == client.fd) {
                 slot.* = null;
                 return;
             }
         }
     }
-}
-
-fn getClient(state: *ServerState, fd: posix.fd_t) ?*Client {
-    for (&state.clients.*) |*slot| {
-        if (slot.*) |*client| {
-            if (client.fd == fd) return client;
-        }
-    }
-    return null;
-}
-
-fn findPaneByFd(state: *ServerState, fd: posix.fd_t) ?*Pane {
-    for (state.workspace_manager.workspaces.items) |*ws| {
-        if (ws.floating_pane.pty.master_fd == fd) return ws.floating_pane;
-        if (ws.getPane(fd)) |pane| return pane;
-    }
-    return null;
 }
 
 fn renderAndBroadcast(state: *ServerState, clear_screen: bool) !void {
@@ -294,19 +252,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             try renderAndBroadcast(state, false);
         },
         .detach => {
-            // Remove client from epoll and close fd
-            posix.epoll_ctl(state.epoll_fd, linux.EPOLL.CTL_DEL, client.fd, null) catch {};
-            posix.close(client.fd);
-
-            // Remove from clients array
-            for (&state.clients.*) |*slot| {
-                if (slot.*) |*cl| {
-                    if (cl.fd == client.fd) {
-                        slot.* = null;
-                        break;
-                    }
-                }
-            }
+            removeClient(state, client);
         },
         .input => |d| {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
@@ -340,7 +286,9 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
                 .horizontal => .horizontal,
             };
             const new_fd = try active_ws.splitPane(state.alloc, ws_dir);
-            try epollAdd(state.epoll_fd, new_fd, linux.EPOLL.IN);
+            if (active_ws.getPane(new_fd)) |new_pane| {
+                try state.loop.addFd(new_fd, @intFromPtr(new_pane) | TAG_PANE, false);
+            }
 
             state.prefix_mode = false;
 
@@ -362,7 +310,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
 
             const pty_fd = active_ws.active_pane.pty.master_fd;
-            try posix.epoll_ctl(state.epoll_fd, linux.EPOLL.CTL_DEL, pty_fd, null);
+            state.loop.remove(pty_fd);
 
             try active_ws.closePane(state.alloc);
 
@@ -374,8 +322,8 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             state.workspace_manager.switchWorkspace(state.workspace_manager.workspaces.items.len - 1);
 
             const new_ws = state.workspace_manager.getActiveWorkspace() orelse return;
-            try epollAdd(state.epoll_fd, new_ws.active_pane.pty.master_fd, linux.EPOLL.IN);
-            try epollAdd(state.epoll_fd, new_ws.floating_pane.pty.master_fd, linux.EPOLL.IN);
+            try state.loop.addFd(new_ws.active_pane.pty.master_fd, @intFromPtr(new_ws.active_pane) | TAG_PANE, false);
+            try state.loop.addFd(new_ws.floating_pane.pty.master_fd, @intFromPtr(new_ws.floating_pane) | TAG_PANE, false);
 
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
@@ -664,3 +612,4 @@ fn encodeOsc52(text: []const u8, buf: []u8) []u8 {
 
     return buf[0 .. prefix.len + encoded_len + suffix.len];
 }
+

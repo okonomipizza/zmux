@@ -1,9 +1,13 @@
 const std = @import("std");
 const posix = std.posix;
-const linux = std.os.linux;
 const c = @import("c.zig").c;
 const Stream = @import("Stream.zig").Stream;
 const protocol = @import("protocol.zig");
+const Loop = @import("loop.zig").Loop;
+
+const TAG_STDIN: usize = 1;
+const TAG_SOCK: usize = 2;
+const TAG_SIGNAL: usize = 3;
 
 /// termios configuration for zmux client
 /// Sets the terminal to non-canonical mode,
@@ -44,21 +48,6 @@ const InputMode = enum {
     move_pane, // Waiting for workspace number after 'm'
 };
 
-/// Setup signalfd for SIGWINCH to detect terminal resize
-fn setupSignalFd() !posix.fd_t {
-    var mask: linux.sigset_t = .{0};
-    linux.sigaddset(&mask, linux.SIG.WINCH);
-
-    // Block SIGWINCH so it's delivered via signalfd
-    _ = linux.sigprocmask(linux.SIG.BLOCK, &mask, null);
-
-    const fd = linux.signalfd(-1, &mask, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
-    if (@as(isize, @bitCast(fd)) < 0) {
-        return error.SignalFdFailed;
-    }
-    return @intCast(fd);
-}
-
 pub fn client(socket_path: []const u8) !void {
     // Original termios settings, restored on zmux exit
     var original_termios: c.termios = undefined;
@@ -81,10 +70,6 @@ pub fn client(socket_path: []const u8) !void {
     try enableRawMode(&original_termios);
     defer disableRawMode(&original_termios);
 
-    // Setup signalfd for SIGWINCH (terminal resize)
-    const signal_fd = try setupSignalFd();
-    defer posix.close(signal_fd);
-
     // Clear screen on start and enable mouse reporting (SGR mode)
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
@@ -95,28 +80,11 @@ pub fn client(socket_path: []const u8) !void {
     try stdout.writeAll("\x1b[2J\x1b[H\x1b[?1000h\x1b[?1006h");
     try stdout.flush();
 
-    const epoll_fd = try posix.epoll_create1(0);
-    defer posix.close(epoll_fd);
-
-    var stdin_event = linux.epoll_event{
-        .events = linux.EPOLL.IN,
-        .data = .{ .fd = stdin_fd },
-    };
-    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, stdin_fd, &stdin_event);
-
-    var sock_event = linux.epoll_event{
-        .events = linux.EPOLL.IN,
-        .data = .{ .fd = sock_fd },
-    };
-    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, sock_fd, &sock_event);
-
-    var signal_event = linux.epoll_event{
-        .events = linux.EPOLL.IN,
-        .data = .{ .fd = signal_fd },
-    };
-    try posix.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, signal_fd, &signal_event);
-
-    var events: [10]linux.epoll_event = undefined;
+    var loop = try Loop.init();
+    defer loop.deinit();
+    try loop.addFd(stdin_fd, TAG_STDIN, false);
+    try loop.addFd(sock_fd, TAG_SOCK, true);
+    try loop.addSignal(posix.SIG.WINCH, TAG_SIGNAL);
 
     var stream = Stream(256 * 1024).init(); // 256KB for rendered screen output
 
@@ -161,379 +129,374 @@ pub fn client(socket_path: []const u8) !void {
     var mode: InputMode = .normal;
 
     outer: while (true) {
-        const n_events = posix.epoll_wait(epoll_fd, &events, -1);
+        var iter = loop.wait(-1);
+        while (iter.next()) |event| {
+            switch (event) {
+                .disconnect => break :outer,
+                .signal => {
+                    const new_size = getTermSize();
+                    if (new_size.cols != term_size.cols or new_size.rows != term_size.rows) {
+                        term_size = new_size;
+                        var resize_buf: [256]u8 = undefined;
+                        const resize_req = protocol.Request{ .resize = .{
+                            .cols = new_size.cols,
+                            .rows = new_size.rows,
+                        } };
+                        const resize_data = try resize_req.encode(&resize_buf);
+                        try stream.write(resize_data, sock_fd);
+                    }
+                },
+                .readable => |tag| switch (tag) {
+                    TAG_SOCK => {
+                        stream.receiveData(sock_fd) catch |err| {
+                            if (err == error.Closed) break :outer;
+                            return err;
+                        };
+                        while (stream.nextMessage()) |output| {
+                            try stdout.writeAll(output);
+                            try stdout.flush();
+                        }
+                    },
+                    TAG_STDIN => {
+                        var buf: [64]u8 = undefined;
+                        const n = try posix.read(stdin_fd, &buf);
+                        if (n == 0) break :outer;
 
-        for (events[0..n_events]) |ev| {
-            const fd = ev.data.fd;
+                        const user_input = buf[0..n];
+                        var req_buf: [256]u8 = undefined;
 
-            if (fd == signal_fd) {
-                // Handle SIGWINCH - terminal resize
-                var siginfo: linux.signalfd_siginfo = undefined;
-                _ = posix.read(signal_fd, std.mem.asBytes(&siginfo)) catch continue;
+                        switch (mode) {
+                            .normal => {
+                                // Process input, handling mouse events in a loop
+                                var remaining = user_input;
 
-                // Get new terminal size
-                const new_size = getTermSize();
-                if (new_size.cols != term_size.cols or new_size.rows != term_size.rows) {
-                    term_size = new_size;
+                                while (remaining.len > 0) {
+                                    // Check for mouse escape sequence (SGR format: \x1b[<...)
+                                    if (parseSgrMouse(remaining)) |mouse| {
+                                        // In normal mode, only handle wheel for scrolling
+                                        // All other mouse events are forwarded to the application
+                                        var handled = false;
 
-                    // Send resize request to server
-                    var resize_buf: [256]u8 = undefined;
-                    const resize_req = protocol.Request{ .resize = .{
-                        .cols = new_size.cols,
-                        .rows = new_size.rows,
-                    } };
-                    const resize_data = try resize_req.encode(&resize_buf);
-                    try stream.write(resize_data, sock_fd);
-                }
-            } else if (fd == stdin_fd) {
-                var buf: [64]u8 = undefined;
-                const n = try posix.read(stdin_fd, &buf);
-                if (n == 0) break :outer;
+                                        if (!mouse.event.is_release) {
+                                            switch (mouse.event.button) {
+                                                MouseEvent.WHEEL_UP => {
+                                                    const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_up } };
+                                                    const req_data = try req.encode(&req_buf);
+                                                    try stream.write(req_data, sock_fd);
+                                                    handled = true;
+                                                },
+                                                MouseEvent.WHEEL_DOWN => {
+                                                    const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_down } };
+                                                    const req_data = try req.encode(&req_buf);
+                                                    try stream.write(req_data, sock_fd);
+                                                    handled = true;
+                                                },
+                                                else => {},
+                                            }
+                                        }
 
-                const user_input = buf[0..n];
-                var req_buf: [256]u8 = undefined;
-
-                switch (mode) {
-                    .normal => {
-                        // Process input, handling mouse events in a loop
-                        var remaining = user_input;
-
-                        while (remaining.len > 0) {
-                            // Check for mouse escape sequence (SGR format: \x1b[<...)
-                            if (parseSgrMouse(remaining)) |mouse| {
-                                // In normal mode, only handle wheel for scrolling
-                                // All other mouse events are forwarded to the application
-                                var handled = false;
-
-                                if (!mouse.event.is_release) {
-                                    switch (mouse.event.button) {
-                                        MouseEvent.WHEEL_UP => {
-                                            const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_up } };
-                                            const req_data = try req.encode(&req_buf);
+                                        if (!handled) {
+                                            // Forward mouse event to application
+                                            const input_req = protocol.Request{ .input = .{ .input = remaining[0..mouse.len] } };
+                                            const req_data = try input_req.encode(&req_buf);
                                             try stream.write(req_data, sock_fd);
-                                            handled = true;
+                                        }
+
+                                        // Consume parsed bytes and continue processing
+                                        remaining = remaining[mouse.len..];
+                                        continue;
+                                    }
+
+                                    // If input looks like an incomplete mouse sequence, forward it to the app
+                                    // The app can handle escape sequences with its own timeout logic
+                                    // (This allows ESC key to work properly)
+
+                                    // Check for prefix key (Ctrl-b = 0x02)
+                                    if (remaining.len == 1 and remaining[0] == 0x02) {
+                                        mode = .prefix;
+                                        // Notify server that prefix mode is active
+                                        const prefix_req = protocol.Request{ .set_prefix_mode = .{ .enabled = true } };
+                                        const prefix_data = try prefix_req.encode(&req_buf);
+                                        try stream.write(prefix_data, sock_fd);
+                                        break;
+                                    }
+
+                                    // Forward all other input to server
+                                    const input_req = protocol.Request{ .input = .{ .input = remaining } };
+                                    const req_data = try input_req.encode(&req_buf);
+                                    try stream.write(req_data, sock_fd);
+                                    break;
+                                }
+                            },
+                            .prefix, .prefix_repeatable => {
+                                const was_repeatable = (mode == .prefix_repeatable);
+                                var stay_in_prefix = false;
+                                var maybe_req: ?protocol.Request = null;
+
+                                switch (user_input[0]) {
+                                    // Pane splitting (exits prefix mode)
+                                    '\\' => maybe_req = .{ .split_pane = .{ .direction = .vertical } },
+                                    '-' => maybe_req = .{ .split_pane = .{ .direction = .horizontal } },
+
+                                    // Pane focus (repeatable)
+                                    'h' => {
+                                        maybe_req = .{ .focus_pane = .{ .direction = .left } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'j' => {
+                                        maybe_req = .{ .focus_pane = .{ .direction = .down } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'k' => {
+                                        maybe_req = .{ .focus_pane = .{ .direction = .up } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'l' => {
+                                        maybe_req = .{ .focus_pane = .{ .direction = .right } };
+                                        stay_in_prefix = true;
+                                    },
+
+                                    // Pane swap (repeatable)
+                                    'H' => {
+                                        maybe_req = .{ .swap_pane = .{ .direction = .left } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'J' => {
+                                        maybe_req = .{ .swap_pane = .{ .direction = .down } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'K' => {
+                                        maybe_req = .{ .swap_pane = .{ .direction = .up } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'L' => {
+                                        maybe_req = .{ .swap_pane = .{ .direction = .right } };
+                                        stay_in_prefix = true;
+                                    },
+
+                                    // Pane resize (repeatable)
+                                    '>' => {
+                                        maybe_req = .{ .resize_pane = .{ .grow = true } };
+                                        stay_in_prefix = true;
+                                    },
+                                    '<' => {
+                                        maybe_req = .{ .resize_pane = .{ .grow = false } };
+                                        stay_in_prefix = true;
+                                    },
+
+                                    // Close pane
+                                    'x' => maybe_req = .{ .close_pane = {} },
+
+                                    // Workspace operations
+                                    'n' => maybe_req = .{ .new_workspace = {} },
+                                    'f' => maybe_req = .{ .toggle_floating = {} },
+
+                                    // Workspace cycling (repeatable)
+                                    'i' => {
+                                        maybe_req = .{ .cycle_workspace = .{ .next = true } };
+                                        stay_in_prefix = true;
+                                    },
+                                    'u' => {
+                                        maybe_req = .{ .cycle_workspace = .{ .next = false } };
+                                        stay_in_prefix = true;
+                                    },
+
+                                    // Switch to workspace by number
+                                    '1'...'9' => |ws_char| maybe_req = .{ .switch_workspace = .{ .index = ws_char - '1' } },
+
+                                    // Move pane to workspace (enter move_pane mode)
+                                    'm' => {
+                                        mode = .move_pane;
+                                        continue;
+                                    },
+
+                                    // Scroll mode
+                                    's' => {
+                                        mode = .scroll;
+                                        const req = protocol.Request{ .scroll_mode_start = {} };
+                                        const req_data = try req.encode(&req_buf);
+                                        try stream.write(req_data, sock_fd);
+                                        continue;
+                                    },
+
+                                    // Copy mode
+                                    'c' => {
+                                        mode = .copy;
+                                        const req = protocol.Request{ .copy_mode_start = {} };
+                                        const req_data = try req.encode(&req_buf);
+                                        try stream.write(req_data, sock_fd);
+                                        continue;
+                                    },
+
+                                    // Paste
+                                    'p' => maybe_req = .{ .paste = {} },
+
+                                    // Quit
+                                    'q' => {
+                                        const req = protocol.Request{ .detach = {} };
+                                        const req_data = try req.encode(&req_buf);
+                                        try stream.write(req_data, sock_fd);
+
+                                        break :outer;
+                                    },
+
+                                    // Unknown key also cancels prefix mode
+                                    else => {},
+                                }
+
+                                // Send the request if any
+                                if (maybe_req) |req| {
+                                    const req_data = try req.encode(&req_buf);
+                                    try stream.write(req_data, sock_fd);
+                                }
+
+                                // Update mode
+                                if (stay_in_prefix) {
+                                    mode = .prefix_repeatable;
+                                } else if (!was_repeatable or !stay_in_prefix) {
+                                    // Exit prefix mode and notify server
+                                    mode = .normal;
+                                    const prefix_off_req = protocol.Request{ .set_prefix_mode = .{ .enabled = false } };
+                                    const prefix_off_data = try prefix_off_req.encode(&req_buf);
+                                    try stream.write(prefix_off_data, sock_fd);
+                                }
+                            },
+                            .move_pane => {
+                                // Expecting a workspace number 1-9
+                                switch (user_input[0]) {
+                                    '1'...'9' => |ws_char| {
+                                        const req = protocol.Request{ .move_pane_to_workspace = .{ .index = ws_char - '1' } };
+                                        const req_data = try req.encode(&req_buf);
+                                        try stream.write(req_data, sock_fd);
+                                    },
+                                    else => {},
+                                }
+                                // Exit to normal mode and turn off prefix
+                                mode = .normal;
+                                const prefix_off_req = protocol.Request{ .set_prefix_mode = .{ .enabled = false } };
+                                const prefix_off_data = try prefix_off_req.encode(&req_buf);
+                                try stream.write(prefix_off_data, sock_fd);
+                            },
+                            .scroll => {
+                                var maybe_req: ?protocol.Request = null;
+
+                                // Check for mouse scroll first
+                                if (parseSgrMouse(user_input)) |mouse| {
+                                    if (!mouse.event.is_release) {
+                                        switch (mouse.event.button) {
+                                            MouseEvent.WHEEL_UP => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
+                                            MouseEvent.WHEEL_DOWN => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
+                                            else => {},
+                                        }
+                                    }
+                                } else switch (user_input[0]) {
+                                    // Scroll navigation
+                                    'j' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
+                                    'k' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
+
+                                    // Half page scroll (Ctrl-u, Ctrl-d)
+                                    0x15 => maybe_req = .{ .scroll_mode_input = .{ .key = .half_page_up } }, // Ctrl-u
+                                    0x04 => maybe_req = .{ .scroll_mode_input = .{ .key = .half_page_down } }, // Ctrl-d
+
+                                    // Exit scroll mode
+                                    '\r' => {
+                                        mode = .normal;
+                                        maybe_req = .{ .scroll_mode_exit = {} };
+                                    },
+                                    0x1b => { // Escape
+                                        mode = .normal;
+                                        maybe_req = .{ .scroll_mode_exit = {} };
+                                    },
+                                    'q' => {
+                                        mode = .normal;
+                                        maybe_req = .{ .scroll_mode_exit = {} };
+                                    },
+
+                                    else => {},
+                                }
+
+                                if (maybe_req) |req| {
+                                    const req_data = try req.encode(&req_buf);
+                                    try stream.write(req_data, sock_fd);
+                                }
+                            },
+                            .copy => {
+                                var maybe_req: ?protocol.Request = null;
+                                var exit_copy = false;
+
+                                // Check for mouse wheel events (scrolling only)
+                                if (parseSgrMouse(user_input)) |mouse| {
+                                    if (!mouse.event.is_release) {
+                                        switch (mouse.event.button) {
+                                            MouseEvent.WHEEL_UP => {
+                                                maybe_req = .{ .copy_mode_input = .{ .key = .half_page_up } };
+                                            },
+                                            MouseEvent.WHEEL_DOWN => {
+                                                maybe_req = .{ .copy_mode_input = .{ .key = .half_page_down } };
+                                            },
+                                            else => {},
+                                        }
+                                    }
+                                } else if (user_input.len == 1) {
+                                    switch (user_input[0]) {
+                                        // Movement
+                                        'h' => maybe_req = .{ .copy_mode_input = .{ .key = .move_left } },
+                                        'j' => maybe_req = .{ .copy_mode_input = .{ .key = .move_down } },
+                                        'k' => maybe_req = .{ .copy_mode_input = .{ .key = .move_up } },
+                                        'l' => maybe_req = .{ .copy_mode_input = .{ .key = .move_right } },
+
+                                        // Word movement
+                                        'w' => maybe_req = .{ .copy_mode_input = .{ .key = .next_word } },
+                                        'b' => maybe_req = .{ .copy_mode_input = .{ .key = .prev_word } },
+
+                                        // Line movement
+                                        '0' => maybe_req = .{ .copy_mode_input = .{ .key = .begin_of_line } },
+                                        '$' => maybe_req = .{ .copy_mode_input = .{ .key = .end_of_line } },
+
+                                        // Screen movement
+                                        'g' => maybe_req = .{ .copy_mode_input = .{ .key = .top_of_screen } },
+                                        'G' => maybe_req = .{ .copy_mode_input = .{ .key = .bottom_of_screen } },
+
+                                        // Half page movement (Ctrl-u, Ctrl-d)
+                                        0x15 => maybe_req = .{ .copy_mode_input = .{ .key = .half_page_up } }, // Ctrl-u
+                                        0x04 => maybe_req = .{ .copy_mode_input = .{ .key = .half_page_down } }, // Ctrl-d
+
+                                        // Selection
+                                        'v' => maybe_req = .{ .copy_mode_input = .{ .key = .start_selection } },
+
+                                        // Yank (y or Ctrl+C) - copy and exit
+                                        'y', 0x03 => {
+                                            maybe_req = .{ .clipboard_copy = {} };
+                                            exit_copy = true;
                                         },
-                                        MouseEvent.WHEEL_DOWN => {
-                                            const req = protocol.Request{ .scroll_mode_input = .{ .key = .scroll_down } };
-                                            const req_data = try req.encode(&req_buf);
-                                            try stream.write(req_data, sock_fd);
-                                            handled = true;
+
+                                        // Exit copy mode
+                                        'q' => {
+                                            maybe_req = .{ .copy_mode_exit = {} };
+                                            exit_copy = true;
                                         },
+                                        0x1b => { // Escape
+                                            maybe_req = .{ .copy_mode_exit = {} };
+                                            exit_copy = true;
+                                        },
+
                                         else => {},
                                     }
                                 }
 
-                                if (!handled) {
-                                    // Forward mouse event to application
-                                    const input_req = protocol.Request{ .input = .{ .input = remaining[0..mouse.len] } };
-                                    const req_data = try input_req.encode(&req_buf);
+                                if (maybe_req) |req| {
+                                    const req_data = try req.encode(&req_buf);
                                     try stream.write(req_data, sock_fd);
                                 }
 
-                                // Consume parsed bytes and continue processing
-                                remaining = remaining[mouse.len..];
-                                continue;
-                            }
-
-                            // If input looks like an incomplete mouse sequence, forward it to the app
-                            // The app can handle escape sequences with its own timeout logic
-                            // (This allows ESC key to work properly)
-
-                            // Check for prefix key (Ctrl-b = 0x02)
-                            if (remaining.len == 1 and remaining[0] == 0x02) {
-                                mode = .prefix;
-                                // Notify server that prefix mode is active
-                                const prefix_req = protocol.Request{ .set_prefix_mode = .{ .enabled = true } };
-                                const prefix_data = try prefix_req.encode(&req_buf);
-                                try stream.write(prefix_data, sock_fd);
-                                break;
-                            }
-
-                            // Forward all other input to server
-                            const input_req = protocol.Request{ .input = .{ .input = remaining } };
-                            const req_data = try input_req.encode(&req_buf);
-                            try stream.write(req_data, sock_fd);
-                            break;
-                        }
-                    },
-                    .prefix, .prefix_repeatable => {
-                        const was_repeatable = (mode == .prefix_repeatable);
-                        var stay_in_prefix = false;
-                        var maybe_req: ?protocol.Request = null;
-
-                        switch (user_input[0]) {
-                            // Pane splitting (exits prefix mode)
-                            '\\' => maybe_req = .{ .split_pane = .{ .direction = .vertical } },
-                            '-' => maybe_req = .{ .split_pane = .{ .direction = .horizontal } },
-
-                            // Pane focus (repeatable)
-                            'h' => {
-                                maybe_req = .{ .focus_pane = .{ .direction = .left } };
-                                stay_in_prefix = true;
-                            },
-                            'j' => {
-                                maybe_req = .{ .focus_pane = .{ .direction = .down } };
-                                stay_in_prefix = true;
-                            },
-                            'k' => {
-                                maybe_req = .{ .focus_pane = .{ .direction = .up } };
-                                stay_in_prefix = true;
-                            },
-                            'l' => {
-                                maybe_req = .{ .focus_pane = .{ .direction = .right } };
-                                stay_in_prefix = true;
-                            },
-
-                            // Pane swap (repeatable)
-                            'H' => {
-                                maybe_req = .{ .swap_pane = .{ .direction = .left } };
-                                stay_in_prefix = true;
-                            },
-                            'J' => {
-                                maybe_req = .{ .swap_pane = .{ .direction = .down } };
-                                stay_in_prefix = true;
-                            },
-                            'K' => {
-                                maybe_req = .{ .swap_pane = .{ .direction = .up } };
-                                stay_in_prefix = true;
-                            },
-                            'L' => {
-                                maybe_req = .{ .swap_pane = .{ .direction = .right } };
-                                stay_in_prefix = true;
-                            },
-
-                            // Pane resize (repeatable)
-                            '>' => {
-                                maybe_req = .{ .resize_pane = .{ .grow = true } };
-                                stay_in_prefix = true;
-                            },
-                            '<' => {
-                                maybe_req = .{ .resize_pane = .{ .grow = false } };
-                                stay_in_prefix = true;
-                            },
-
-                            // Close pane
-                            'x' => maybe_req = .{ .close_pane = {} },
-
-                            // Workspace operations
-                            'n' => maybe_req = .{ .new_workspace = {} },
-                            'f' => maybe_req = .{ .toggle_floating = {} },
-
-                            // Workspace cycling (repeatable)
-                            'i' => {
-                                maybe_req = .{ .cycle_workspace = .{ .next = true } };
-                                stay_in_prefix = true;
-                            },
-                            'u' => {
-                                maybe_req = .{ .cycle_workspace = .{ .next = false } };
-                                stay_in_prefix = true;
-                            },
-
-                            // Switch to workspace by number
-                            '1'...'9' => |ws_char| maybe_req = .{ .switch_workspace = .{ .index = ws_char - '1' } },
-
-                            // Move pane to workspace (enter move_pane mode)
-                            'm' => {
-                                mode = .move_pane;
-                                continue;
-                            },
-
-                            // Scroll mode
-                            's' => {
-                                mode = .scroll;
-                                const req = protocol.Request{ .scroll_mode_start = {} };
-                                const req_data = try req.encode(&req_buf);
-                                try stream.write(req_data, sock_fd);
-                                continue;
-                            },
-
-                            // Copy mode
-                            'c' => {
-                                mode = .copy;
-                                const req = protocol.Request{ .copy_mode_start = {} };
-                                const req_data = try req.encode(&req_buf);
-                                try stream.write(req_data, sock_fd);
-                                continue;
-                            },
-
-                            // Paste
-                            'p' => maybe_req = .{ .paste = {} },
-
-                            // Quit
-                            'q' => {
-                                const req = protocol.Request{ .detach = {} };
-                                const req_data = try req.encode(&req_buf);
-                                try stream.write(req_data, sock_fd);
-
-                                break :outer;
-                            },
-
-                            // Unknown key also cancels prefix mode
-                            else => {},
-                        }
-
-                        // Send the request if any
-                        if (maybe_req) |req| {
-                            const req_data = try req.encode(&req_buf);
-                            try stream.write(req_data, sock_fd);
-                        }
-
-                        // Update mode
-                        if (stay_in_prefix) {
-                            mode = .prefix_repeatable;
-                        } else if (!was_repeatable or !stay_in_prefix) {
-                            // Exit prefix mode and notify server
-                            mode = .normal;
-                            const prefix_off_req = protocol.Request{ .set_prefix_mode = .{ .enabled = false } };
-                            const prefix_off_data = try prefix_off_req.encode(&req_buf);
-                            try stream.write(prefix_off_data, sock_fd);
-                        }
-                    },
-                    .move_pane => {
-                        // Expecting a workspace number 1-9
-                        switch (user_input[0]) {
-                            '1'...'9' => |ws_char| {
-                                const req = protocol.Request{ .move_pane_to_workspace = .{ .index = ws_char - '1' } };
-                                const req_data = try req.encode(&req_buf);
-                                try stream.write(req_data, sock_fd);
-                            },
-                            else => {},
-                        }
-                        // Exit to normal mode and turn off prefix
-                        mode = .normal;
-                        const prefix_off_req = protocol.Request{ .set_prefix_mode = .{ .enabled = false } };
-                        const prefix_off_data = try prefix_off_req.encode(&req_buf);
-                        try stream.write(prefix_off_data, sock_fd);
-                    },
-                    .scroll => {
-                        var maybe_req: ?protocol.Request = null;
-
-                        // Check for mouse scroll first
-                        if (parseSgrMouse(user_input)) |mouse| {
-                            if (!mouse.event.is_release) {
-                                switch (mouse.event.button) {
-                                    MouseEvent.WHEEL_UP => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
-                                    MouseEvent.WHEEL_DOWN => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
-                                    else => {},
+                                if (exit_copy) {
+                                    mode = .normal;
                                 }
-                            }
-                        } else switch (user_input[0]) {
-                            // Scroll navigation
-                            'j' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_down } },
-                            'k' => maybe_req = .{ .scroll_mode_input = .{ .key = .scroll_up } },
-
-                            // Half page scroll (Ctrl-u, Ctrl-d)
-                            0x15 => maybe_req = .{ .scroll_mode_input = .{ .key = .half_page_up } }, // Ctrl-u
-                            0x04 => maybe_req = .{ .scroll_mode_input = .{ .key = .half_page_down } }, // Ctrl-d
-
-                            // Exit scroll mode
-                            '\r' => {
-                                mode = .normal;
-                                maybe_req = .{ .scroll_mode_exit = {} };
                             },
-                            0x1b => { // Escape
-                                mode = .normal;
-                                maybe_req = .{ .scroll_mode_exit = {} };
-                            },
-                            'q' => {
-                                mode = .normal;
-                                maybe_req = .{ .scroll_mode_exit = {} };
-                            },
-
-                            else => {},
-                        }
-
-                        if (maybe_req) |req| {
-                            const req_data = try req.encode(&req_buf);
-                            try stream.write(req_data, sock_fd);
                         }
                     },
-                    .copy => {
-                        var maybe_req: ?protocol.Request = null;
-                        var exit_copy = false;
-
-                        // Check for mouse wheel events (scrolling only)
-                        if (parseSgrMouse(user_input)) |mouse| {
-                            if (!mouse.event.is_release) {
-                                switch (mouse.event.button) {
-                                    MouseEvent.WHEEL_UP => {
-                                        maybe_req = .{ .copy_mode_input = .{ .key = .half_page_up } };
-                                    },
-                                    MouseEvent.WHEEL_DOWN => {
-                                        maybe_req = .{ .copy_mode_input = .{ .key = .half_page_down } };
-                                    },
-                                    else => {},
-                                }
-                            }
-                        } else if (user_input.len == 1) {
-                            switch (user_input[0]) {
-                                // Movement
-                                'h' => maybe_req = .{ .copy_mode_input = .{ .key = .move_left } },
-                                'j' => maybe_req = .{ .copy_mode_input = .{ .key = .move_down } },
-                                'k' => maybe_req = .{ .copy_mode_input = .{ .key = .move_up } },
-                                'l' => maybe_req = .{ .copy_mode_input = .{ .key = .move_right } },
-
-                                // Word movement
-                                'w' => maybe_req = .{ .copy_mode_input = .{ .key = .next_word } },
-                                'b' => maybe_req = .{ .copy_mode_input = .{ .key = .prev_word } },
-
-                                // Line movement
-                                '0' => maybe_req = .{ .copy_mode_input = .{ .key = .begin_of_line } },
-                                '$' => maybe_req = .{ .copy_mode_input = .{ .key = .end_of_line } },
-
-                                // Screen movement
-                                'g' => maybe_req = .{ .copy_mode_input = .{ .key = .top_of_screen } },
-                                'G' => maybe_req = .{ .copy_mode_input = .{ .key = .bottom_of_screen } },
-
-                                // Half page movement (Ctrl-u, Ctrl-d)
-                                0x15 => maybe_req = .{ .copy_mode_input = .{ .key = .half_page_up } }, // Ctrl-u
-                                0x04 => maybe_req = .{ .copy_mode_input = .{ .key = .half_page_down } }, // Ctrl-d
-
-                                // Selection
-                                'v' => maybe_req = .{ .copy_mode_input = .{ .key = .start_selection } },
-
-                                // Yank (y or Ctrl+C) - copy and exit
-                                'y', 0x03 => {
-                                    maybe_req = .{ .clipboard_copy = {} };
-                                    exit_copy = true;
-                                },
-
-                                // Exit copy mode
-                                'q' => {
-                                    maybe_req = .{ .copy_mode_exit = {} };
-                                    exit_copy = true;
-                                },
-                                0x1b => { // Escape
-                                    maybe_req = .{ .copy_mode_exit = {} };
-                                    exit_copy = true;
-                                },
-
-                                else => {},
-                            }
-                        }
-
-                        if (maybe_req) |req| {
-                            const req_data = try req.encode(&req_buf);
-                            try stream.write(req_data, sock_fd);
-                        }
-
-                        if (exit_copy) {
-                            mode = .normal;
-                        }
-                    },
-                }
-            } else if (fd == sock_fd) {
-                // Read available data from socket into buffer
-                stream.receiveData(sock_fd) catch |err| {
-                    if (err == error.Closed) break :outer;
-                    return err;
-                };
-
-                // Process all complete messages in the buffer
-                while (stream.nextMessage()) |output| {
-                    try stdout.writeAll(output);
-                    try stdout.flush();
-                }
+                    else => {},
+                },
             }
         }
     }
