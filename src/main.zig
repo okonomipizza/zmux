@@ -179,15 +179,14 @@ fn startServerAndAttach(alloc: std.mem.Allocator, socket_path: []const u8) !void
         // Child: become session leader and run server
         _ = posix.setsid() catch {};
 
-        // Close stdin/stdout/stderr
-        posix.close(0);
-        posix.close(1);
-        posix.close(2);
-
-        // Reopen as /dev/null
-        _ = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {};
-        _ = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {};
-        _ = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch {};
+        // Detach stdio: dup2 a single /dev/null fd onto 0/1/2 so the
+        // assignment is explicit instead of relying on "open returns the
+        // lowest free fd" after a sequence of close()/open() calls.
+        const devnull = posix.open("/dev/null", .{ .ACCMODE = .RDWR }, 0) catch posix.exit(1);
+        posix.dup2(devnull, 0) catch {};
+        posix.dup2(devnull, 1) catch {};
+        posix.dup2(devnull, 2) catch {};
+        if (devnull > 2) posix.close(devnull);
 
         Server.server(alloc, socket_path, original_termios) catch {};
         posix.exit(0);
