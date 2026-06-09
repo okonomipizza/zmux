@@ -111,8 +111,12 @@ const EPoll = struct {
             }
 
             const tag: usize = @intCast(val);
-            const disconnect_mask = linux.EPOLL.RDHUP | linux.EPOLL.HUP | linux.EPOLL.ERR;
-            if (ev.events & disconnect_mask != 0) return .{ .disconnect = tag };
+            if (ev.events & linux.EPOLL.ERR != 0) return .{ .disconnect = tag };
+            // Drain readable data before reporting disconnect so trailing
+            // bytes aren't dropped when EPOLLIN and EPOLLRDHUP/HUP arrive together.
+            if (ev.events & linux.EPOLL.IN != 0) return .{ .readable = tag };
+            const hup_mask = linux.EPOLL.RDHUP | linux.EPOLL.HUP;
+            if (ev.events & hup_mask != 0) return .{ .disconnect = tag };
             return .{ .readable = tag };
         }
     };
@@ -190,7 +194,10 @@ const KQueue = struct {
 
             const ev = self.ready_list[self.index];
             if (ev.filter == std.c.EVFILT.SIGNAL) return .{ .signal = ev.udata };
-            if (ev.flags & (std.c.EV.EOF | std.c.EV.ERROR) != 0) return .{ .disconnect = ev.udata };
+            if (ev.flags & std.c.EV.ERROR != 0) return .{ .disconnect = ev.udata };
+            // EV_EOF can be set while bytes are still buffered (ev.data > 0).
+            // Drain those bytes first; the next wait will redeliver EV_EOF.
+            if (ev.flags & std.c.EV.EOF != 0 and ev.data == 0) return .{ .disconnect = ev.udata };
             return .{ .readable = ev.udata };
         }
     };
