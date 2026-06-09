@@ -54,7 +54,7 @@ const ServerState = struct {
     clipboard: ?[]u8 = null,
 };
 
-pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.termios) !void {
+pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.termios, ready_fd: ?posix.fd_t) !void {
     // Ignore SIGPIPE to prevent crash when writing to closed sockets
     // This can happen when sessionExists() checks for session existence
     // by connecting and immediately disconnecting
@@ -81,6 +81,14 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
 
     try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
     try posix.listen(listen_fd, 128);
+
+    // Signal readiness to the parent (if any) now that the socket is accepting.
+    // On any earlier failure the fd stays open and the kernel closes it on
+    // process exit, so the parent sees EOF instead of a ready byte.
+    if (ready_fd) |fd| {
+        _ = posix.write(fd, "\x01") catch {};
+        posix.close(fd);
+    }
 
     var loop = try Loop.init();
     defer loop.deinit();

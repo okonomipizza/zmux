@@ -173,9 +173,16 @@ fn startServerAndAttach(alloc: std.mem.Allocator, socket_path: []const u8) !void
     var original_termios: c.termios = undefined;
     _ = c.tcgetattr(c.STDIN_FILENO, &original_termios);
 
+    // Ready-pipe: child writes 1 byte after listen() succeeds. Parent blocks
+    // on read() until that arrives (success) or the child dies and the kernel
+    // closes the write end (EOF = failure).
+    const ready_pipe = try posix.pipe();
+
     const pid = try posix.fork();
 
     if (pid == 0) {
+        posix.close(ready_pipe[0]);
+
         // Child: become session leader and run server
         _ = posix.setsid() catch {};
 
@@ -188,26 +195,23 @@ fn startServerAndAttach(alloc: std.mem.Allocator, socket_path: []const u8) !void
         posix.dup2(devnull, 2) catch {};
         if (devnull > 2) posix.close(devnull);
 
-        Server.server(alloc, socket_path, original_termios) catch {};
+        Server.server(alloc, socket_path, original_termios, ready_pipe[1]) catch {};
         posix.exit(0);
     } else {
-        // Parent process: wait a bit for server to start, then attach
-        std.Thread.sleep(100 * std.time.ns_per_ms);
+        posix.close(ready_pipe[1]);
+        defer posix.close(ready_pipe[0]);
 
-        // Retry connection a few times
-        var attempts: u8 = 0;
-        while (attempts < 10) : (attempts += 1) {
-            if (sessionExists(socket_path)) {
-                try client(socket_path);
-                return;
-            }
-            std.Thread.sleep(50 * std.time.ns_per_ms);
+        var b: [1]u8 = undefined;
+        const n = posix.read(ready_pipe[0], &b) catch 0;
+        if (n == 0) {
+            var buf: [256]u8 = undefined;
+            var writer = std.fs.File.stderr().writer(&buf);
+            try writer.interface.writeAll("Failed to start session\n");
+            try writer.interface.flush();
+            return;
         }
 
-        var buf: [256]u8 = undefined;
-        var writer = std.fs.File.stderr().writer(&buf);
-        try writer.interface.writeAll("Failed to start session\n");
-        try writer.interface.flush();
+        try client(socket_path);
     }
 }
 
