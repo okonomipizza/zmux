@@ -169,9 +169,17 @@ fn startServerAndAttach(alloc: std.mem.Allocator, socket_path: []const u8) !void
     // Create socket directory if it doesn't exist
     std.fs.cwd().makePath(SOCKET_DIR) catch {};
 
-    // Get termios BEFORE forking (while we still have a valid terminal)
+    // Get termios BEFORE forking (while we still have a valid terminal).
+    // If stdin isn't a TTY (e.g. redirected), tcgetattr fails and we
+    // refuse to start rather than handing undefined termios to the child.
     var original_termios: c.termios = undefined;
-    _ = c.tcgetattr(c.STDIN_FILENO, &original_termios);
+    if (c.tcgetattr(c.STDIN_FILENO, &original_termios) != 0) {
+        var buf: [256]u8 = undefined;
+        var writer = std.fs.File.stderr().writer(&buf);
+        try writer.interface.writeAll("zmux: stdin is not a terminal\n");
+        try writer.interface.flush();
+        return error.NotATerminal;
+    }
 
     // Ready-pipe: child writes 1 byte after listen() succeeds. Parent blocks
     // on read() until that arrives (success) or the child dies and the kernel
