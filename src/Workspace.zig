@@ -220,13 +220,13 @@ fn relayout(alloc: std.mem.Allocator, node: *PaneNode, cols: u16, rows: u16, x: 
         .split => |s| {
             switch (s.dir) {
                 .vertical => {
-                    const first_cols = @as(u16, @intFromFloat(@as(f32, @floatFromInt(cols)) * s.ratio)) -| 1;
+                    const first_cols: u16 = @intFromFloat(@as(f32, @floatFromInt(cols)) * s.ratio);
                     const second_cols = cols - first_cols - 1; // 1 is for border width
                     try relayout(alloc, s.first, first_cols, rows, x, y);
                     try relayout(alloc, s.second, second_cols, rows, x + first_cols + 1, y);
                 },
                 .horizontal => {
-                    const first_rows = @as(u16, @intFromFloat(@as(f32, @floatFromInt(rows)) * s.ratio)) -| 1;
+                    const first_rows: u16 = @intFromFloat(@as(f32, @floatFromInt(rows)) * s.ratio);
                     const second_rows = rows - first_rows - 1; // 1 is for border height
                     try relayout(alloc, s.first, cols, first_rows, x, y);
                     try relayout(alloc, s.second, cols, second_rows, x, y + first_rows + 1);
