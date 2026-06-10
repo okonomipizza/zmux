@@ -145,11 +145,20 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                     } else if (tag & TAG_PANE != 0) {
                         const pane: *Pane = @ptrFromInt(tag & ~TAG_PANE);
                         var pty_buf: [4096]u8 = undefined;
-                        const n = posix.read(pane.pty.master_fd, &pty_buf) catch continue;
-                        if (n > 0) {
-                            pane.feed(pty_buf[0..n]);
-                            renderAndBroadcast(&state, false) catch {};
+                        // Stop polling on EOF or any error; otherwise the
+                        // level-triggered loop redelivers the event forever
+                        // and the server pegs a core. We leave the pane in
+                        // place so the user still sees the final output.
+                        const n = posix.read(pane.pty.master_fd, &pty_buf) catch {
+                            state.loop.remove(pane.pty.master_fd);
+                            continue;
+                        };
+                        if (n == 0) {
+                            state.loop.remove(pane.pty.master_fd);
+                            continue;
                         }
+                        pane.feed(pty_buf[0..n]);
+                        renderAndBroadcast(&state, false) catch {};
                     } else {
                         const client = activeClient(&state, tag) orelse continue;
                         client.stream.receiveData(client.fd) catch |err| {
@@ -170,11 +179,14 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                     }
                 },
                 .disconnect => |tag| {
-                    // ignore PTY EOF (shell exited) and listen fd; only remove clients
-                    if (tag != LISTEN_TAG and tag & TAG_PANE == 0) {
-                        if (activeClient(&state, tag)) |client| {
-                            removeClient(&state, client);
-                        }
+                    if (tag == LISTEN_TAG) continue;
+                    if (tag & TAG_PANE != 0) {
+                        // Shell exited. Stop polling the PTY but leave the
+                        // pane alive so the final output stays on screen.
+                        const pane: *Pane = @ptrFromInt(tag & ~TAG_PANE);
+                        state.loop.remove(pane.pty.master_fd);
+                    } else if (activeClient(&state, tag)) |client| {
+                        removeClient(&state, client);
                     }
                 },
                 .signal => {},
