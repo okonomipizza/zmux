@@ -157,8 +157,7 @@ pub fn renderAll(
         self.full_redraw = true;
     }
 
-    // TODO Consider appropriate maximum number of panes
-    var buf: [64]*Pane = undefined;
+    var buf: [Workspace.MAX_PANES]*Pane = undefined;
     const panes = workspace.getPanes(&buf);
 
     // Collect dirty regions from panes

@@ -3,6 +3,10 @@ const Pane = @import("Pane.zig");
 const c = @import("c.zig").c;
 pub const Workspace = @This();
 
+/// Upper bound on tiled panes per workspace. Shared with Renderer so its
+/// fixed-size pane buffer can never silently truncate.
+pub const MAX_PANES = 64;
+
 active_pane: *Pane,
 floating_pane: *Pane,
 cols: u16,
@@ -124,6 +128,8 @@ fn findPane(node: *PaneNode, fd: c_int) ?*Pane {
 /// Split panes and returns new pane's master_fd
 /// New pane will be a next active pane
 pub fn splitPane(self: *Workspace, alloc: std.mem.Allocator, dir: SplitDir) !c_int {
+    if (countPanes(self.root) >= MAX_PANES) return error.TooManyPanes;
+
     // Find the active pane node
     const leaf_node = findLeafNode(self.root, self.active_pane) orelse return error.ActivePaneLost;
     const active = leaf_node.leaf;
@@ -258,6 +264,13 @@ pub fn getPanes(self: *Workspace, buf: []*Pane) []*Pane {
     var count: usize = 0;
     collectLeavesInner(self.root, buf, &count);
     return buf[0..count];
+}
+
+fn countPanes(node: *PaneNode) usize {
+    return switch (node.*) {
+        .leaf => 1,
+        .split => |s| countPanes(s.first) + countPanes(s.second),
+    };
 }
 
 fn collectLeavesInner(node: *PaneNode, buf: []*Pane, count: *usize) void {
