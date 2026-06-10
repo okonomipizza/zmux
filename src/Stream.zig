@@ -16,20 +16,6 @@ pub fn Stream(comptime buf_size: usize) type {
             return .{};
         }
 
-        pub fn read(self: *Self, socket: posix.socket_t) ![]u8 {
-            while (true) {
-                if (try self.bufferedMessage()) |msg| {
-                    return msg;
-                }
-                const pos = self.pos;
-                const n = try posix.read(socket, self.buf[pos..]);
-                if (n == 0) {
-                    return error.Closed;
-                }
-                self.pos = pos + n;
-            }
-        }
-
         /// Read data from socket into buffer (non-blocking, call when epoll signals data available)
         pub fn receiveData(self: *Self, socket: posix.socket_t) !void {
             const pos = self.pos;

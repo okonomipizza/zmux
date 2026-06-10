@@ -152,13 +152,21 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                         }
                     } else {
                         const client = activeClient(&state, tag) orelse continue;
-                        const data = client.stream.read(client.fd) catch {
+                        client.stream.receiveData(client.fd) catch |err| {
+                            // EAGAIN/EWOULDBLOCK is benign with level-triggered
+                            // events: the kernel will redeliver once more data
+                            // arrives. Anything else means the connection is
+                            // unusable.
+                            if (err == error.WouldBlock) continue;
                             removeClient(&state, client);
                             continue;
                         };
-                        handleClient(&state, client, data) catch {
-                            removeClient(&state, client);
-                        };
+                        while (client.stream.nextMessage()) |msg| {
+                            handleClient(&state, client, msg) catch {
+                                removeClient(&state, client);
+                                break;
+                            };
+                        }
                     }
                 },
                 .disconnect => |tag| {
@@ -176,6 +184,17 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
 }
 
 fn addClient(state: *ServerState, fd: posix.fd_t) void {
+    // Switch to non-blocking so the event-loop path never accidentally
+    // blocks the server when a client sends a partial message.
+    const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch {
+        posix.close(fd);
+        return;
+    };
+    _ = posix.fcntl(fd, posix.F.SETFL, flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true }))) catch {
+        posix.close(fd);
+        return;
+    };
+
     for (&state.clients.*) |*slot| {
         if (slot.* == null) {
             slot.* = Client{ .fd = fd, .stream = Stream(BUF_SIZE).init() };
