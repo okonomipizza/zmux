@@ -229,7 +229,6 @@ pub fn client(socket_path: []const u8) !void {
                                 }
                             },
                             .prefix, .prefix_repeatable => {
-                                const was_repeatable = (mode == .prefix_repeatable);
                                 var stay_in_prefix = false;
                                 var maybe_req: ?protocol.Request = null;
 
@@ -353,7 +352,7 @@ pub fn client(socket_path: []const u8) !void {
                                 // Update mode
                                 if (stay_in_prefix) {
                                     mode = .prefix_repeatable;
-                                } else if (!was_repeatable or !stay_in_prefix) {
+                                } else {
                                     // Exit prefix mode and notify server
                                     mode = .normal;
                                     const prefix_off_req = protocol.Request{ .set_prefix_mode = .{ .enabled = false } };
