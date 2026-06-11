@@ -77,6 +77,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
 
     var addr = posix.sockaddr.un{ .family = posix.AF.UNIX, .path = undefined };
     @memset(&addr.path, 0);
+    if (socket_path.len >= addr.path.len) return error.SocketPathTooLong;
     @memcpy(addr.path[0..socket_path.len], socket_path);
 
     try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));

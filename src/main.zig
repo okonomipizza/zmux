@@ -13,6 +13,15 @@ const version = "1.1.0";
 /// server and client threads occurring via unix domain socket.
 const SOCKET_DIR = "/tmp/zmux";
 
+/// Maximum length of a unix-socket path that fits in sockaddr.un. The kernel
+/// requires a trailing NUL so we reserve one byte. Derived at comptime from
+/// std's sockaddr definition, which already varies across platforms (~108 on
+/// Linux, ~104 on macOS).
+pub const MAX_SOCKET_PATH_LEN: usize = blk: {
+    const path_field = @FieldType(posix.sockaddr.un, "path");
+    break :blk @typeInfo(path_field).array.len - 1;
+};
+
 pub fn main() !void {
     const alloc = std.heap.page_allocator;
 
@@ -102,7 +111,12 @@ fn printHelp() void {
 }
 
 fn getSocketPath(alloc: std.mem.Allocator, session_name: []const u8) ![]u8 {
-    return std.fmt.allocPrint(alloc, "{s}/{s}.sock", .{ SOCKET_DIR, session_name });
+    const path = try std.fmt.allocPrint(alloc, "{s}/{s}.sock", .{ SOCKET_DIR, session_name });
+    if (path.len > MAX_SOCKET_PATH_LEN) {
+        alloc.free(path);
+        return error.SocketPathTooLong;
+    }
+    return path;
 }
 
 fn sessionExists(socket_path: []const u8) bool {
@@ -275,7 +289,7 @@ fn killSession(session_name: []const u8) !void {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    var path_buf: [256]u8 = undefined;
+    var path_buf: [MAX_SOCKET_PATH_LEN]u8 = undefined;
     const socket_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.sock", .{ SOCKET_DIR, session_name }) catch {
         try stderr.writeAll("Session name too long\n");
         try stderr.flush();
