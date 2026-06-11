@@ -110,8 +110,16 @@ fn warn(comptime fmt: []const u8, args: anytype) void {
 }
 
 pub fn load(allocator: std.mem.Allocator) Config {
-    const home = std.posix.getenv("HOME") orelse return .{};
-    const path = std.fmt.allocPrint(allocator, "{s}/.config/zmux/zmux.jsonc", .{home}) catch return .{};
+    // XDG Base Directory: prefer $XDG_CONFIG_HOME, fall back to $HOME/.config.
+    const path = blk: {
+        if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
+            if (xdg.len > 0) {
+                break :blk std.fmt.allocPrint(allocator, "{s}/zmux/zmux.jsonc", .{xdg}) catch return .{};
+            }
+        }
+        const home = std.posix.getenv("HOME") orelse return .{};
+        break :blk std.fmt.allocPrint(allocator, "{s}/.config/zmux/zmux.jsonc", .{home}) catch return .{};
+    };
     defer allocator.free(path);
 
     const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
