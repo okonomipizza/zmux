@@ -159,6 +159,16 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                             continue;
                         }
                         pane.feed(pty_buf[0..n]);
+                        // Forward any OSC 52 (clipboard) sequences the pane
+                        // intercepted so they reach the user's real terminal.
+                        if (pane.pending_clipboard.items.len > 0) {
+                            for (&state.clients.*) |*slot| {
+                                if (slot.*) |*cli| {
+                                    cli.stream.write(pane.pending_clipboard.items, cli.fd) catch {};
+                                }
+                            }
+                            pane.pending_clipboard.clearRetainingCapacity();
+                        }
                         renderAndBroadcast(&state, false) catch {};
                     } else {
                         const client = activeClient(&state, tag) orelse continue;
