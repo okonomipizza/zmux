@@ -129,7 +129,9 @@ pub fn load(allocator: std.mem.Allocator) Config {
     };
     defer file.close();
 
-    const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
+    // 64 KiB is far more than zmux.jsonc will ever need (only a handful of
+    // color fields today) and still leaves room for comments and growth.
+    const content = file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
         warn("could not read {s}: {s}", .{ path, @errorName(err) });
         return .{};
     };
