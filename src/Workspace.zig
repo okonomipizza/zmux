@@ -399,7 +399,7 @@ pub fn swapPane(self: *Workspace, alloc: std.mem.Allocator, dir: Direction) !voi
 }
 
 fn findAdjacentPane(root: *PaneNode, active: *Pane, dir: Direction) ?*Pane {
-    var buf: [64]*Pane = undefined;
+    var buf: [MAX_PANES]*Pane = undefined;
     const leaves = collectLeaves(root, &buf);
 
     var best: ?*Pane = null;

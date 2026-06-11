@@ -51,6 +51,10 @@ config: Config,
 dirty_rects: [MAX_DIRTY_RECTS]DirtyRect,
 dirty_count: u8,
 full_redraw: bool,
+// Active pane on the previous frame. Tiled borders only change on layout
+// changes (which set full_redraw) or focus moves (which recolor the
+// active border), so tracking this lets us skip drawBorders otherwise.
+last_active_pane: ?*Pane,
 
 pub fn init(
     alloc: std.mem.Allocator,
@@ -76,6 +80,7 @@ pub fn init(
         .dirty_rects = undefined,
         .dirty_count = 0,
         .full_redraw = true, // Start with full redraw
+        .last_active_pane = null,
     };
 }
 
@@ -178,7 +183,12 @@ pub fn renderAll(
         pane.is_dirty = false;
     }
 
-    try self.drawBorders(workspace, writer);
+    // Borders only change on layout changes (full redraw) or focus moves
+    // (active border recolor); skip the full repaint on ordinary frames.
+    if (self.full_redraw or self.last_active_pane != workspace.active_pane) {
+        try self.drawBorders(workspace, writer);
+    }
+    self.last_active_pane = workspace.active_pane;
 
     if (workspace.show_floating) {
         try self.renderFloatingPane(workspace.floating_pane, workspace.active_pane == workspace.floating_pane, writer);
@@ -421,7 +431,7 @@ fn drawBorders(
     const active_border = self.active_border_buf;
     @memset(active_border, false);
 
-    var buf: [64]*Pane = undefined;
+    var buf: [Workspace.MAX_PANES]*Pane = undefined;
     const panes = workspace.getPanes(&buf);
 
     for (panes) |pane| {

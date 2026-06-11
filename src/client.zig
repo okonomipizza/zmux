@@ -159,12 +159,15 @@ pub fn client(socket_path: []const u8) !void {
                         }
                     },
                     TAG_STDIN => {
-                        var buf: [64]u8 = undefined;
+                        // Large enough that a paste doesn't degrade into
+                        // 64-byte round trips; req_buf must fit the whole
+                        // chunk plus the input-request header.
+                        var buf: [4096]u8 = undefined;
                         const n = try posix.read(stdin_fd, &buf);
                         if (n == 0) break :outer;
 
                         const user_input = buf[0..n];
-                        var req_buf: [256]u8 = undefined;
+                        var req_buf: [4224]u8 = undefined;
 
                         switch (mode) {
                             .normal => {

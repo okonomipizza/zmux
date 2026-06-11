@@ -15,6 +15,15 @@ const CopyMode = @import("CopyMode.zig").CopyMode;
 const MAX_CLIENTS = 64;
 const BUF_SIZE = 64 * 1024;
 
+/// Frames are chunked so a single rendered screen can never exceed the
+/// client's receive buffer (a frame larger than it wedges the client).
+const MAX_FRAME_SIZE = 60 * 1024;
+
+/// Worst-case bytes emitted per cell on a full redraw (cursor move +
+/// style reset with truecolor fg/bg + UTF-8 glyph), used to size the
+/// render buffer from the terminal dimensions.
+const RENDER_BYTES_PER_CELL = 64;
+
 // Tag encoding for the event loop (server-specific).
 // bit 0 set  → *Pane  (real ptr = tag & ~TAG_PANE)
 // bit 0 clear, non-zero → *Client
@@ -111,9 +120,8 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
     var renderer = try Renderer.init(alloc, term_cols, term_rows, config);
     defer renderer.deinit();
 
-    // Allocate render buffer
+    // Allocate render buffer (grown on attach/resize to fit the terminal)
     const render_buf = try alloc.alloc(u8, RENDER_BUF_SIZE);
-    defer alloc.free(render_buf);
 
     const active_ws = workspace_manager.getActiveWorkspace() orelse return error.NoActiveWorkspace;
     try loop.addFd(active_ws.active_pane.pty.master_fd, @intFromPtr(active_ws.active_pane) | TAG_PANE, false);
@@ -134,9 +142,14 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
         .term_rows = term_rows,
         .prefix_mode = false,
     };
+    defer alloc.free(state.render_buf);
 
     while (true) {
         var iter = loop.wait(-1);
+        // Coalesce pane output: feed every readable PTY in this batch
+        // first and render once at the end, instead of running a full
+        // diff render per read.
+        var panes_fed = false;
         while (iter.next()) |event| {
             switch (event) {
                 .readable => |tag| {
@@ -145,7 +158,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                         addClient(&state, client_fd);
                     } else if (tag & TAG_PANE != 0) {
                         const pane: *Pane = @ptrFromInt(tag & ~TAG_PANE);
-                        var pty_buf: [4096]u8 = undefined;
+                        var pty_buf: [64 * 1024]u8 = undefined;
                         // Stop polling on EOF or any error; otherwise the
                         // level-triggered loop redelivers the event forever
                         // and the server pegs a core. We leave the pane in
@@ -162,14 +175,10 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                         // Forward any OSC 52 (clipboard) sequences the pane
                         // intercepted so they reach the user's real terminal.
                         if (pane.pending_clipboard.items.len > 0) {
-                            for (&state.clients.*) |*slot| {
-                                if (slot.*) |*cli| {
-                                    cli.stream.write(pane.pending_clipboard.items, cli.fd) catch {};
-                                }
-                            }
+                            broadcast(&state, pane.pending_clipboard.items);
                             pane.pending_clipboard.clearRetainingCapacity();
                         }
-                        renderAndBroadcast(&state, false) catch {};
+                        panes_fed = true;
                     } else {
                         const client = activeClient(&state, tag) orelse continue;
                         client.stream.receiveData(client.fd) catch |err| {
@@ -203,6 +212,27 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                 .signal => {},
             }
         }
+        if (panes_fed) renderAndBroadcast(&state, false) catch {};
+    }
+}
+
+/// Send data to every attached client, split into frames the client's
+/// receive buffer can always hold. A client whose socket cannot accept
+/// the data is dropped: continuing after a truncated frame would desync
+/// the length-prefixed protocol for good.
+fn broadcast(state: *ServerState, data: []const u8) void {
+    for (&state.clients.*) |*slot| {
+        if (slot.*) |*client| {
+            var off: usize = 0;
+            while (off < data.len) {
+                const end = @min(off + MAX_FRAME_SIZE, data.len);
+                client.stream.write(data[off..end], client.fd) catch {
+                    removeClient(state, client);
+                    break;
+                };
+                off = end;
+            }
+        }
     }
 }
 
@@ -230,12 +260,16 @@ fn addClient(state: *ServerState, fd: posix.fd_t) void {
     posix.close(fd);
 }
 
+// Idempotent: the fd is only closed when the client still occupies a
+// slot, so a second remove (e.g. broadcast dropped the client and the
+// caller removes it again on error) can't close an unrelated fd that
+// reused the number.
 fn removeClient(state: *ServerState, client: *Client) void {
-    state.loop.remove(client.fd);
-    posix.close(client.fd);
     for (&state.clients.*) |*slot| {
         if (slot.*) |*cl| {
             if (cl.fd == client.fd) {
+                state.loop.remove(cl.fd);
+                posix.close(cl.fd);
                 slot.* = null;
                 return;
             }
@@ -279,12 +313,22 @@ fn renderAndBroadcast(state: *ServerState, clear_screen: bool) !void {
     );
 
     const rendered = writer.buffered();
+    broadcast(state, rendered);
+}
 
-    for (&state.clients.*) |*slot| {
-        if (slot.*) |*client| {
-            client.stream.write(rendered, client.fd) catch {};
-        }
+/// Replace the renderer and grow the render buffer for a new terminal
+/// size. The new renderer is built before the old one is torn down so a
+/// failure leaves the previous (still valid) state in place.
+fn reinitRenderer(state: *ServerState, cols: u16, rows: u16) !void {
+    const cells = @as(usize, cols) * @as(usize, rows);
+    const needed = @max(RENDER_BUF_SIZE, cells * RENDER_BYTES_PER_CELL);
+    if (needed > state.render_buf.len) {
+        state.render_buf = try state.alloc.realloc(state.render_buf, needed);
     }
+
+    const new_renderer = try Renderer.init(state.alloc, cols, rows, state.config);
+    state.renderer.deinit();
+    state.renderer.* = new_renderer;
 }
 
 fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
@@ -306,8 +350,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
                 try ws.resizeWorkspace(state.alloc, d.cols, pane_rows);
             }
 
-            state.renderer.deinit();
-            state.renderer.* = try Renderer.init(state.alloc, d.cols, d.rows, state.config);
+            try reinitRenderer(state, d.cols, d.rows);
 
             var resp_buf: [256]u8 = undefined;
             const resp = protocol.Response{ .attach_ok = .{ .cols = d.cols, .rows = d.rows } };
@@ -339,8 +382,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
                 try ws.resizeWorkspace(state.alloc, d.cols, pane_rows);
             }
 
-            state.renderer.deinit();
-            state.renderer.* = try Renderer.init(state.alloc, d.cols, d.rows, state.config);
+            try reinitRenderer(state, d.cols, d.rows);
 
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
@@ -591,13 +633,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
                         // Send OSC 52 to set system clipboard
                         var osc_buf: [65536]u8 = undefined;
                         const encoded = encodeOsc52(text, &osc_buf);
-                        if (encoded.len > 0) {
-                            for (&state.clients.*) |*slot| {
-                                if (slot.*) |*cli| {
-                                    cli.stream.write(encoded, cli.fd) catch {};
-                                }
-                            }
-                        }
+                        if (encoded.len > 0) broadcast(state, encoded);
                     } else |_| {}
                 }
             }

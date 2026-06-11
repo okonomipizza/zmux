@@ -90,7 +90,25 @@ pub fn Stream(comptime buf_size: usize) type {
         fn writeAllVectored(socket: posix.socket_t, vec: []posix.iovec_const) !void {
             var i: usize = 0;
             while (true) {
-                var n = try posix.writev(socket, vec[i..]);
+                var n = posix.writev(socket, vec[i..]) catch |err| switch (err) {
+                    // A frame must never be cut short mid-write: the peer
+                    // reads length-prefixed frames, so a partial frame
+                    // desyncs the protocol permanently. On a full
+                    // non-blocking socket, wait briefly for it to drain;
+                    // if the peer stays stuck, fail so the caller can
+                    // drop the connection cleanly.
+                    error.WouldBlock => {
+                        var pfd = [1]posix.pollfd{.{
+                            .fd = socket,
+                            .events = posix.POLL.OUT,
+                            .revents = 0,
+                        }};
+                        const ready = posix.poll(&pfd, 1000) catch 0;
+                        if (ready == 0) return error.WouldBlock;
+                        continue;
+                    },
+                    else => return err,
+                };
                 while (n >= vec[i].len) {
                     n -= vec[i].len;
                     i += 1;
