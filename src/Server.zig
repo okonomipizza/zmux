@@ -37,6 +37,9 @@ const Client = struct {
     stream: Stream(BUF_SIZE),
     cols: u16 = 80,
     rows: u16 = 24,
+    // Only attached clients participate in layout sizing; probe
+    // connections (e.g. sessionExists) never send an attach request.
+    attached: bool = false,
 };
 
 /// Mode of operation for input handling
@@ -61,6 +64,9 @@ const ServerState = struct {
     input_mode: InputMode = .normal,
     copy_mode: ?CopyMode = null,
     clipboard: ?[]u8 = null,
+    // Set when a client leaves so the layout can grow back to the
+    // remaining clients' minimum outside of broadcast iteration.
+    layout_stale: bool = false,
 };
 
 pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.termios, ready_fd: ?posix.fd_t) !void {
@@ -212,6 +218,14 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
                 .signal => {},
             }
         }
+        if (state.layout_stale) {
+            state.layout_stale = false;
+            if (applyClientLayout(&state) catch false) {
+                state.renderer.invalidate();
+                renderAndBroadcast(&state, false) catch {};
+                panes_fed = false;
+            }
+        }
         if (panes_fed) renderAndBroadcast(&state, false) catch {};
     }
 }
@@ -271,6 +285,10 @@ fn removeClient(state: *ServerState, client: *Client) void {
                 state.loop.remove(cl.fd);
                 posix.close(cl.fd);
                 slot.* = null;
+                // The layout may grow back to the remaining clients'
+                // minimum; recomputed at the end of the event batch to
+                // avoid re-entering render paths from here.
+                state.layout_stale = true;
                 return;
             }
         }
@@ -316,6 +334,46 @@ fn renderAndBroadcast(state: *ServerState, clear_screen: bool) !void {
     broadcast(state, rendered);
 }
 
+/// Size the session to the smallest attached client (tmux-style) so
+/// every attached client can display the full layout. Returns true if
+/// the size changed and a full redraw is needed.
+fn applyClientLayout(state: *ServerState) !bool {
+    var min_cols: u16 = 0;
+    var min_rows: u16 = 0;
+    var any = false;
+    for (state.clients.*) |slot| {
+        const cl = slot orelse continue;
+        if (!cl.attached) continue;
+        if (!any) {
+            min_cols = cl.cols;
+            min_rows = cl.rows;
+            any = true;
+        } else {
+            min_cols = @min(min_cols, cl.cols);
+            min_rows = @min(min_rows, cl.rows);
+        }
+    }
+
+    if (!any) return false;
+
+    // Guard against degenerate sizes from misreported terminals
+    min_cols = @max(min_cols, 10);
+    min_rows = @max(min_rows, 4);
+
+    if (min_cols == state.term_cols and min_rows == state.term_rows) return false;
+
+    state.term_cols = min_cols;
+    state.term_rows = min_rows;
+    const pane_rows = min_rows - 1; // status bar takes the last row
+    state.workspace_manager.cols = min_cols;
+    state.workspace_manager.rows = pane_rows;
+    for (state.workspace_manager.workspaces.items) |*ws| {
+        try ws.resizeWorkspace(state.alloc, min_cols, pane_rows);
+    }
+    try reinitRenderer(state, min_cols, min_rows);
+    return true;
+}
+
 /// Replace the renderer and grow the render buffer for a new terminal
 /// size. The new renderer is built before the old one is torn down so a
 /// failure leaves the previous (still valid) state in place.
@@ -338,25 +396,19 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
         .attach => |d| {
             client.cols = d.cols;
             client.rows = d.rows;
-            state.term_cols = d.cols;
-            state.term_rows = d.rows;
-            const pane_rows = d.rows -| 1;
+            client.attached = true;
 
-            state.workspace_manager.cols = d.cols;
-            state.workspace_manager.rows = pane_rows;
-
-            // Resize all workspaces to match client terminal size
-            for (state.workspace_manager.workspaces.items) |*ws| {
-                try ws.resizeWorkspace(state.alloc, d.cols, pane_rows);
-            }
-
-            try reinitRenderer(state, d.cols, d.rows);
+            // Session size follows the smallest attached client so the
+            // layout stays visible everywhere.
+            _ = try applyClientLayout(state);
 
             var resp_buf: [256]u8 = undefined;
             const resp = protocol.Response{ .attach_ok = .{ .cols = d.cols, .rows = d.rows } };
             const resp_data = try resp.encode(&resp_buf);
             try client.stream.write(resp_data, client.fd);
 
+            // Full redraw even when the size didn't change: the new
+            // client starts from an empty screen.
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
@@ -370,20 +422,11 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
         .resize => |d| {
             client.cols = d.cols;
             client.rows = d.rows;
-            state.term_cols = d.cols;
-            state.term_rows = d.rows;
-            const pane_rows = d.rows -| 1;
 
-            state.workspace_manager.cols = d.cols;
-            state.workspace_manager.rows = pane_rows;
+            _ = try applyClientLayout(state);
 
-            // Resize all workspaces to match new terminal size
-            for (state.workspace_manager.workspaces.items) |*ws| {
-                try ws.resizeWorkspace(state.alloc, d.cols, pane_rows);
-            }
-
-            try reinitRenderer(state, d.cols, d.rows);
-
+            // The resized client's terminal cleared its content, so
+            // force a full redraw even if the session size is unchanged.
             state.renderer.invalidate();
             try renderAndBroadcast(state, false);
         },
@@ -564,16 +607,17 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
         },
         .mouse_select_start => |d| {
             const active_ws = state.workspace_manager.getActiveWorkspace() orelse return;
-            const pane = active_ws.activePane();
 
-            // Convert screen coordinates to pane-relative coordinates
-            // Mouse coordinates are 0-indexed from client
-            const pane_x = d.x -| pane.x;
-            const pane_y = d.y -| pane.y;
+            // Select in the pane that was clicked, not whichever pane
+            // happens to be active. Clicks on borders or the status bar
+            // hit no pane and are ignored.
+            const pane = active_ws.paneAt(d.x, d.y) orelse return;
+            active_ws.active_pane = pane;
 
-            // Clamp to pane bounds
-            const x = @min(pane_x, pane.cols -| 1);
-            const y = @min(pane_y, pane.rows -| 1);
+            // Convert screen coordinates to pane-relative coordinates;
+            // paneAt guarantees they are in bounds.
+            const x = d.x - pane.x;
+            const y = d.y - pane.y;
 
             // Enter copy mode with selection started at mouse position
             state.input_mode = .copy;

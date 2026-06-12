@@ -108,6 +108,23 @@ pub fn activePane(self: *Workspace) *Pane {
     return self.active_pane;
 }
 
+/// Returns the visible pane containing the absolute cell (x, y).
+/// While the floating pane is shown it is the only click target since
+/// it renders on top of the tiled layout. Border cells and the status
+/// bar row return null.
+pub fn paneAt(self: *Workspace, x: u16, y: u16) ?*Pane {
+    if (self.show_floating) {
+        const fp = self.floating_pane;
+        if (x >= fp.x and x < fp.x + fp.cols and y >= fp.y and y < fp.y + fp.rows) return fp;
+        return null;
+    }
+    var buf: [MAX_PANES]*Pane = undefined;
+    for (self.getPanes(&buf)) |pane| {
+        if (x >= pane.x and x < pane.x + pane.cols and y >= pane.y and y < pane.y + pane.rows) return pane;
+    }
+    return null;
+}
+
 pub fn getPane(self: *Workspace, fd: c_int) ?*Pane {
     if (self.floating_pane.pty.master_fd == fd) return self.floating_pane;
     return findPane(self.root, fd);
