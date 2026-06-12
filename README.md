@@ -15,13 +15,66 @@ A terminal multiplexer written in Zig, powered by [Ghostty](https://github.com/g
 
 ## Requirements
 
-- Zig >= 0.15.1
-- Linux (uses epoll and POSIX PTY)
+- Linux (epoll) or macOS (kqueue); `x86_64-linux`, `aarch64-linux`, `x86_64-darwin`, and `aarch64-darwin` are supported
 - A terminal emulator that supports OSC 52 for clipboard (e.g. Ghostty, iTerm2, kitty)
+
+## Install
+
+### Nix
+
+Try it without installing:
+
+```sh
+nix run github:okonomipizza/zmux
+```
+
+Install into your profile:
+
+```sh
+nix profile install github:okonomipizza/zmux
+```
+
+### Home Manager (flakes)
+
+Add zmux to your flake inputs and reference its package from
+`home.packages`:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    zmux.url = "github:okonomipizza/zmux";
+  };
+
+  outputs = { nixpkgs, home-manager, zmux, ... }: {
+    homeConfigurations."you" = home-manager.lib.homeManagerConfiguration {
+      pkgs = nixpkgs.legacyPackages.aarch64-linux; # match your system
+      modules = [
+        {
+          home.packages = [
+            zmux.packages.aarch64-linux.default # match your system
+          ];
+        }
+      ];
+    };
+  };
+}
+```
 
 ## Build
 
+With nix (sandboxed, reproducible):
+
 ```sh
+nix build
+./result/bin/zmux
+```
+
+For iterative development, use the dev shell (Zig >= 0.15.1):
+
+```sh
+nix develop
 zig build
 ```
 

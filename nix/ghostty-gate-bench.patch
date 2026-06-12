@@ -1,0 +1,19 @@
+--- a/build.zig
++++ b/build.zig
+@@ -99,9 +99,13 @@
+     const webdata = try buildpkg.GhosttyWebdata.init(b, &deps);
+     if (config.emit_webdata) webdata.install();
+ 
+-    // Ghostty bench tools
+-    const bench = try buildpkg.GhosttyBench.init(b, &deps);
+-    if (config.emit_bench) bench.install();
++    // Ghostty bench tools. Only wired up when requested: configuring
++    // the bench exes probes for a native libc/SDK, which fails in
++    // sandboxed builds that only consume libghostty-vt.
++    if (config.emit_bench) {
++        const bench = try buildpkg.GhosttyBench.init(b, &deps);
++        bench.install();
++    }
+ 
+     // Ghostty dist tarball
+     const dist = try buildpkg.GhosttyDist.init(b, &config);

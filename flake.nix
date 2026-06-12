@@ -35,16 +35,24 @@
       builtins.map (
         system: let
           pkgs = nixpkgs.legacyPackages.${system};
+          # Gate ghostty's bench tools behind -Demit-bench: configuring
+          # them probes for the native libc/SDK, which fails inside the
+          # nix build sandbox where only libghostty-vt is needed.
+          ghosttySrc = pkgs.applyPatches {
+            name = "ghostty-src-patched";
+            src = ghostty;
+            patches = [./nix/ghostty-gate-bench.patch];
+          };
         in {
           devShell.${system} = pkgs.callPackage ./nix/devShell.nix {
             zig = zig.packages.${system}."0.15.2";
             zls = zls.packages.${system}.zls;
-            ghosttySrc = ghostty;
+            inherit ghosttySrc;
           };
 
           packages.${system}.default = pkgs.callPackage ./nix/packages.nix {
             zig = zig.packages.${system}."0.15.2";
-            ghosttySrc = ghostty;
+            inherit ghosttySrc;
           };
 
           formatter.${system} = pkgs.alejandra;

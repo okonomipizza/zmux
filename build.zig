@@ -13,6 +13,10 @@ pub fn build(b: *std.Build) void {
     if (b.lazyDependency("ghostty", .{
         .simd = false,
         .@"emit-xcframework" = false,
+        // lib-vt-only build: without this, ghostty's build graph wires
+        // up its full exe and probes for the Darwin SDK at configure
+        // time, which fails inside the nix build sandbox.
+        .@"emit-lib-vt" = true,
     })) |dep| {
         exe_mod.addImport(
             "ghostty-vt",
