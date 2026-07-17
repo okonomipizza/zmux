@@ -80,7 +80,7 @@ fn ptyFork(slave_name: [:0]u8, termios: c.termios, ws: std.posix.winsize) !Pty {
     _ = std.c.dup2(slave_fd, c.STDIN_FILENO);
     _ = std.c.dup2(slave_fd, c.STDOUT_FILENO);
     _ = std.c.dup2(slave_fd, c.STDERR_FILENO);
-    _ = c.close(slave_fd);
+    if (slave_fd > c.STDERR_FILENO) _ = c.close(slave_fd);
 
     _ = c.setenv("TERM", "xterm-256color", 1);
 
