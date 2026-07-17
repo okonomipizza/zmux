@@ -4,14 +4,10 @@ const posix = std.posix;
 
 const Server = @import("Server.zig");
 const client = @import("client.zig").client;
+const session = @import("session.zig");
 
 /// zmux app version
 const version = "1.1.0";
-
-/// Base directory for zmux sockets
-/// The session runs as a daemon in forked threads, with communication between
-/// server and client threads occurring via unix domain socket.
-const SOCKET_DIR = "/tmp/zmux";
 
 /// Maximum length of a unix-socket path that fits in sockaddr.un. The kernel
 /// requires a trailing NUL so we reserve one byte. Derived at comptime from
@@ -116,7 +112,7 @@ fn printHelp() void {
 }
 
 fn getSocketPath(alloc: std.mem.Allocator, session_name: []const u8) ![]u8 {
-    const path = try std.fmt.allocPrint(alloc, "{s}/{s}.sock", .{ SOCKET_DIR, session_name });
+    const path = try session.socketPath(alloc, session_name);
     if (path.len > MAX_SOCKET_PATH_LEN) {
         alloc.free(path);
         return error.SocketPathTooLong;
@@ -185,8 +181,9 @@ fn attachSession(alloc: std.mem.Allocator, session_name: []const u8) !void {
 }
 
 fn startServerAndAttach(alloc: std.mem.Allocator, socket_path: []const u8) !void {
-    // Create socket directory if it doesn't exist
-    std.fs.cwd().makePath(SOCKET_DIR) catch {};
+    const socket_dir = try session.socketDir(alloc);
+    defer alloc.free(socket_dir);
+    try session.ensureSocketDir(socket_dir);
 
     // Get termios BEFORE forking (while we still have a valid terminal).
     // If stdin isn't a TTY (e.g. redirected), tcgetattr fails and we
@@ -247,7 +244,14 @@ fn listSessions(alloc: std.mem.Allocator) !void {
     var writer = std.fs.File.stdout().writer(&buf);
     const stdout = &writer.interface;
 
-    var dir = std.fs.cwd().openDir(SOCKET_DIR, .{ .iterate = true }) catch {
+    const socket_dir = session.socketDir(alloc) catch {
+        try stdout.writeAll("No sessions found.\n");
+        try stdout.flush();
+        return;
+    };
+    defer alloc.free(socket_dir);
+
+    var dir = std.fs.cwd().openDir(socket_dir, .{ .iterate = true }) catch {
         try stdout.writeAll("No sessions found.\n");
         try stdout.flush();
         return;
@@ -290,7 +294,14 @@ fn stopAllSessions(alloc: std.mem.Allocator) !void {
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &stdout_writer.interface;
 
-    var dir = std.fs.cwd().openDir(SOCKET_DIR, .{ .iterate = true }) catch {
+    const socket_dir = session.socketDir(alloc) catch {
+        try stdout.writeAll("No active sessions.\n");
+        try stdout.flush();
+        return;
+    };
+    defer alloc.free(socket_dir);
+
+    var dir = std.fs.cwd().openDir(socket_dir, .{ .iterate = true }) catch {
         try stdout.writeAll("No active sessions.\n");
         try stdout.flush();
         return;
@@ -331,8 +342,15 @@ fn killSession(session_name: []const u8) !void {
     var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
     const stderr = &stderr_writer.interface;
 
+    var dir_buf: [512]u8 = undefined;
+    const socket_dir = session.socketDirStack(&dir_buf) catch {
+        try stderr.writeAll("Cannot resolve socket directory\n");
+        try stderr.flush();
+        return;
+    };
+
     var path_buf: [MAX_SOCKET_PATH_LEN]u8 = undefined;
-    const socket_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.sock", .{ SOCKET_DIR, session_name }) catch {
+    const socket_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.sock", .{ socket_dir, session_name }) catch {
         try stderr.writeAll("Session name too long\n");
         try stderr.flush();
         return;

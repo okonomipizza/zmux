@@ -11,6 +11,8 @@ const Pane = @import("Pane.zig");
 const Renderer = @import("Renderer.zig").Renderer;
 const Config = @import("Config.zig");
 const CopyMode = @import("CopyMode.zig").CopyMode;
+const limits = @import("limits.zig");
+const session = @import("session.zig");
 
 const MAX_CLIENTS = 64;
 const BUF_SIZE = 64 * 1024;
@@ -67,6 +69,7 @@ const ServerState = struct {
     // Set when a client leaves so the layout can grow back to the
     // remaining clients' minimum outside of broadcast iteration.
     layout_stale: bool = false,
+    owner_uid: posix.uid_t,
 };
 
 pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.termios, ready_fd: ?posix.fd_t) !void {
@@ -86,7 +89,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
 
     // Create parent directory if it doesn't exist
     if (std.fs.path.dirname(socket_path)) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
+        try session.ensureSocketDir(dir);
     }
     posix.unlink(socket_path) catch {};
 
@@ -100,6 +103,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
     @memcpy(addr.path[0..socket_path.len], socket_path);
 
     try posix.bind(listen_fd, @ptrCast(&addr), @sizeOf(posix.sockaddr.un));
+    try session.restrictSocketMode(listen_fd);
     try posix.listen(listen_fd, 128);
 
     // Signal readiness to the parent (if any) now that the socket is accepting.
@@ -151,6 +155,7 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
         .term_cols = term_cols,
         .term_rows = term_rows,
         .prefix_mode = false,
+        .owner_uid = posix.getuid(),
     };
     defer alloc.free(state.render_buf);
 
@@ -255,6 +260,15 @@ fn broadcast(state: *ServerState, data: []const u8) void {
 }
 
 fn addClient(state: *ServerState, fd: posix.fd_t) void {
+    const uid = session.peerUid(fd) catch {
+        posix.close(fd);
+        return;
+    };
+    if (uid != state.owner_uid) {
+        posix.close(fd);
+        return;
+    }
+
     // Switch to non-blocking so the event-loop path never accidentally
     // blocks the server when a client sends a partial message.
     const flags = posix.fcntl(fd, posix.F.GETFL, 0) catch {
@@ -360,9 +374,9 @@ fn applyClientLayout(state: *ServerState) !bool {
 
     if (!any) return false;
 
-    // Guard against degenerate sizes from misreported terminals
-    min_cols = @max(min_cols, 10);
-    min_rows = @max(min_rows, 4);
+    const clamped = limits.clampTermSize(min_cols, min_rows);
+    min_cols = clamped.cols;
+    min_rows = clamped.rows;
 
     if (min_cols == state.term_cols and min_rows == state.term_rows) return false;
 
@@ -398,8 +412,9 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
 
     switch (request) {
         .attach => |d| {
-            client.cols = d.cols;
-            client.rows = d.rows;
+            const size = limits.clampTermSize(d.cols, d.rows);
+            client.cols = size.cols;
+            client.rows = size.rows;
             client.attached = true;
 
             // Session size follows the smallest attached client so the
@@ -407,7 +422,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             _ = try applyClientLayout(state);
 
             var resp_buf: [256]u8 = undefined;
-            const resp = protocol.Response{ .attach_ok = .{ .cols = d.cols, .rows = d.rows } };
+            const resp = protocol.Response{ .attach_ok = .{ .cols = size.cols, .rows = size.rows } };
             const resp_data = try resp.encode(&resp_buf);
             try client.stream.write(resp_data, client.fd);
 
@@ -424,8 +439,9 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             try active_ws.activePane().pty.write(d.input);
         },
         .resize => |d| {
-            client.cols = d.cols;
-            client.rows = d.rows;
+            const size = limits.clampTermSize(d.cols, d.rows);
+            client.cols = size.cols;
+            client.rows = size.rows;
 
             _ = try applyClientLayout(state);
 
@@ -473,6 +489,7 @@ fn handleClient(state: *ServerState, client: *Client, data: []const u8) !void {
             try renderAndBroadcast(state, true);
         },
         .new_workspace => {
+            if (state.workspace_manager.workspaces.items.len >= limits.MAX_WORKSPACES) return;
             try state.workspace_manager.appendWorkspace(state.alloc);
             state.workspace_manager.switchWorkspace(state.workspace_manager.workspaces.items.len - 1);
 

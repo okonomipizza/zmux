@@ -1,5 +1,6 @@
 const std = @import("std");
 const Workspace = @import("Workspace.zig");
+const limits = @import("limits.zig");
 const c = @import("c.zig").c;
 
 pub const WorkspaceManager = @This();
@@ -60,6 +61,7 @@ pub fn prevWorkspace(self: *WorkspaceManager) ?*Workspace {
 }
 
 pub fn appendWorkspace(self: *WorkspaceManager, alloc: std.mem.Allocator) !void {
+    if (self.workspaces.items.len >= limits.MAX_WORKSPACES) return error.TooManyWorkspaces;
     const new_ws: Workspace = try Workspace.init(alloc, self.cols, self.rows, self.termios);
     try self.workspaces.append(alloc, new_ws);
 }

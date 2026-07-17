@@ -4,6 +4,7 @@ const c = @import("c.zig").c;
 const Stream = @import("Stream.zig").Stream;
 const protocol = @import("protocol.zig");
 const Loop = @import("loop.zig").Loop;
+const limits = @import("limits.zig");
 
 const TAG_STDIN: usize = 1;
 const TAG_SOCK: usize = 2;
@@ -54,7 +55,8 @@ pub fn client(socket_path: []const u8) !void {
     const stdin_fd: posix.fd_t = posix.STDIN_FILENO;
 
     // Get terminal size
-    var term_size = getTermSize();
+    const raw_term_size = getTermSize();
+    var term_size = limits.clampTermSize(raw_term_size.cols, raw_term_size.rows);
 
     const sock_fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
     defer posix.close(sock_fd);
@@ -135,7 +137,8 @@ pub fn client(socket_path: []const u8) !void {
             switch (event) {
                 .disconnect => break :outer,
                 .signal => {
-                    const new_size = getTermSize();
+                    const raw = getTermSize();
+                    const new_size = limits.clampTermSize(raw.cols, raw.rows);
                     if (new_size.cols != term_size.cols or new_size.rows != term_size.rows) {
                         term_size = new_size;
                         var resize_buf: [256]u8 = undefined;
