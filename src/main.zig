@@ -71,6 +71,9 @@ pub fn main() !void {
             return;
         };
         return killSession(session_name);
+    } else if (std.mem.eql(u8, command, "stop")) {
+        // zmux stop
+        return stopAllSessions(alloc);
     } else {
         var buf: [256]u8 = undefined;
         var writer = std.fs.File.stdout().writer(&buf);
@@ -93,6 +96,7 @@ fn printHelp() void {
         \\  attach, -a [name] Attach to an existing session
         \\  list, ls          List all sessions
         \\  kill <name>       Kill a session
+        \\  stop              Stop all sessions
         \\  help, -h          Show this help
         \\  version, -v       Show version
         \\
@@ -105,6 +109,7 @@ fn printHelp() void {
         \\  zmux attach work  Attach to "work" session
         \\  zmux ls           List all sessions
         \\  zmux kill work    Kill "work" session
+        \\  zmux stop         Stop all sessions
         \\
     ) catch {};
     writer.interface.flush() catch {};
@@ -278,6 +283,43 @@ fn listSessions(alloc: std.mem.Allocator) !void {
         try stdout.writeAll("No active sessions.\n");
     }
     try stdout.flush();
+}
+
+fn stopAllSessions(alloc: std.mem.Allocator) !void {
+    var stdout_buf: [256]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_writer.interface;
+
+    var dir = std.fs.cwd().openDir(SOCKET_DIR, .{ .iterate = true }) catch {
+        try stdout.writeAll("No active sessions.\n");
+        try stdout.flush();
+        return;
+    };
+    defer dir.close();
+
+    var stopped = false;
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind == .unix_domain_socket or
+            (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".sock")))
+        {
+            const name = entry.name[0 .. entry.name.len - 5];
+            const socket_path = try getSocketPath(alloc, name);
+            defer alloc.free(socket_path);
+
+            if (sessionExists(socket_path)) {
+                try killSession(name);
+                stopped = true;
+            } else {
+                dir.deleteFile(entry.name) catch {};
+            }
+        }
+    }
+
+    if (!stopped) {
+        try stdout.writeAll("No active sessions.\n");
+        try stdout.flush();
+    }
 }
 
 fn killSession(session_name: []const u8) !void {
