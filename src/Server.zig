@@ -80,6 +80,10 @@ pub fn server(alloc: std.mem.Allocator, socket_path: []const u8, termios: c.term
     };
     posix.sigaction(posix.SIG.PIPE, &act, null);
 
+    // Reap PTY shell children automatically so they never become zombies.
+    // Shell exit is detected via master fd EOF instead of SIGCHLD.
+    posix.sigaction(posix.SIG.CHLD, &act, null);
+
     // Create parent directory if it doesn't exist
     if (std.fs.path.dirname(socket_path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
