@@ -49,6 +49,8 @@
 
         buildPhase = ''
           runHook preBuild
+          export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
+          export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
           zig build --prefix $out -Doptimize=ReleaseSafe
           runHook postBuild
         '';
