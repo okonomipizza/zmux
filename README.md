@@ -48,6 +48,7 @@ Inside an attached session the prefix key is `ctrl-a`:
 | `ctrl-a q` | close the focused pane |
 | `ctrl-a f` | float the focused pane above the layout |
 | `ctrl-a d` | dock a floating pane back into the layout |
+| `ctrl-a -` | hide the floating panes, or show them again |
 | `ctrl-a h` / `k` | move focus to the previous pane |
 | `ctrl-a l` / `j` | move focus to the next pane |
 | `ctrl-a ctrl-a` | detach, leaving every pane running |
@@ -60,6 +61,11 @@ does not touch its pty, so the program inside carries on without noticing, and t
 space it leaves is given to a neighbouring pane that grows into it. Docking asks
 which pane to split: the layout freezes, each tiled pane shows a number, and the
 number you press is divided along its longer side. Escape cancels.
+
+`ctrl-a -` puts the floating panes away and brings them back. A hidden float keeps
+running and keeps its screen; it is simply not drawn, and it cannot take focus, so
+nothing is ever typed into a pane you cannot see. Showing them again returns focus
+to the pane you were working in before the float appeared.
 
 A session's pty and screen live in the server, so detaching costs the session
 nothing: the program keeps running while nothing is watching, and reattaching

@@ -165,7 +165,22 @@ const Session = struct {
     /// program inside never notices the move.
     floats: std.ArrayList(layout.PaneId) = .empty,
     /// The float that is raised, or null when none is.
+    ///
+    /// This doubles as the answer to "is a float showing": a hidden float is still in `floats` but
+    /// is not raised, and a hidden pane never holds focus because focus is exactly this field.
     focused_float: ?layout.PaneId = null,
+    /// Whether the floats are hidden.
+    ///
+    /// Hidden floats keep their ptys and their screens and stay in `floats`; they are simply not
+    /// drawn and not raised. A separate flag rather than a third list, because the only difference
+    /// between a shown and a hidden float is whether it is painted.
+    floats_hidden: bool = false,
+    /// The tiled pane that had focus before a float was raised.
+    ///
+    /// Required by the rule that showing a float again returns focus to where the user was. Focus is
+    /// a single value, so without this the pane the user was working in would be forgotten the
+    /// moment a float took it, and dismissing the float would land somewhere arbitrary.
+    focus_before_float: ?layout.PaneId = null,
     /// Set while the user is choosing which tiled pane to dock a float into.
     ///
     /// While this is set the layout is frozen: tiled panes carry labels and the floats are not
@@ -723,6 +738,11 @@ pub const Server = struct {
                 session.docking = false;
                 try self.sendLayout(session);
             },
+            .toggle_floats => |toggle| {
+                const index = self.findSession(toggle.name.slice()) orelse
+                    return Error.UnknownSession;
+                try self.toggleFloats(index);
+            },
         }
     }
 
@@ -746,6 +766,50 @@ pub const Server = struct {
         try self.sendEvent(client, .list_end);
     }
 
+    /// Hide the floats, or show them again.
+    ///
+    /// One key doing both, because there are only two states and a pair of keys would leave the user
+    /// guessing which one they are in. What the toggle does depends on what is showing:
+    ///
+    ///   - A float is raised: hide it, and give focus back to the tiled pane the user was in before
+    ///     it appeared. Focus has to leave the float, since a hidden pane cannot hold focus.
+    ///   - No float is raised but some are hidden: show them and raise the one that was raised
+    ///     before, returning focus there.
+    ///   - No float is raised and none are hidden: nothing to do. A session that never floated a
+    ///     pane has nothing to show, and inventing one would be worse than doing nothing.
+    fn toggleFloats(self: *Server, index: usize) !void {
+        const session = &self.sessions.items[index];
+        if (session.floats.items.len == 0) return;
+
+        if (session.focused_float != null) {
+            // Hide. The pane that had focus before the float is the one to return to, and if it has
+            // since been closed the tiled focus is left as it is rather than pointing at nothing.
+            session.floats_hidden = true;
+            session.focused_float = null;
+
+            if (session.focus_before_float) |previous| {
+                if (session.tree.contains(previous)) {
+                    session.tree.focused = previous;
+                }
+            }
+        } else {
+            // Show, and put focus back on the float that was raised. The last entry of `floats` is
+            // the most recently parked, which is the one the user is most likely to want.
+            session.floats_hidden = false;
+            const raised = session.floats.items[session.floats.items.len - 1];
+            session.focused_float = raised;
+        }
+
+        try self.sendLayout(session);
+
+        // The whole screen is repainted rather than only the changed panes: hiding a float leaves the
+        // layout underneath it to be drawn again, and what was under the float is not something the
+        // server tracked.
+        for (session.watchers.items) |client| {
+            try self.sendSessionScreens(session, client);
+        }
+    }
+
     /// Lift the focused pane out of the layout and above it.
     ///
     /// The pane keeps its pty and its screen; only the list that owns it changes, which is what
@@ -762,6 +826,16 @@ pub const Server = struct {
 
         _ = session.tree.detach(id, session.cols, session.rows) catch return;
         try session.floats.append(self.gpa, id);
+
+        // The pane to come back to when the float is hidden is read after the detach, not before. Before
+        // the detach the tree's focus is the pane being floated, and remembering that would restore focus
+        // to something invisible once the float is hidden. `detach` moves the tree's focus to the
+        // surviving pane, which is where the user's attention was before the float took over.
+        session.focus_before_float = session.tree.focused;
+
+        // Floating a pane always shows the floats again, so that parking a second pane does not leave
+        // it invisible.
+        session.floats_hidden = false;
 
         // Centred at a default size, so a float reads as floating rather than as a pane that
         // happens to be on top.
@@ -929,7 +1003,10 @@ pub const Server = struct {
             count += 1;
         }
 
-        if (!session.docking) {
+        // Hidden floats are left out of the list entirely, so the client needs no rule for what to do
+        // with a pane it must not paint. The same applies during dock selection, where the labels on
+        // the layout underneath have to be readable.
+        if (!session.docking and !session.floats_hidden) {
             for (session.floats.items) |float_id| {
                 if (count == placements.len) break;
                 const index = session.findPane(float_id) orelse continue;
@@ -957,6 +1034,7 @@ pub const Server = struct {
             .focused = session.tree.focused orelse 0,
             .focused_float = session.focused_float orelse 0,
             .docking = session.docking,
+            .floats_hidden = session.floats_hidden,
             .panes = placements[0..count],
         } });
     }
@@ -1540,4 +1618,133 @@ test "a float never occupies no cells at all" {
     try std.testing.expect(rect.height >= 1);
     try std.testing.expectEqual(@as(u16, 0), rect.x);
     try std.testing.expectEqual(@as(u16, 0), rect.y);
+}
+
+test "showing a float returns focus to the pane that had it before" {
+    // The rule the user asked for: after hiding and showing, focus is back where the user was working,
+    // not on whichever tiled pane happened to be focused when the float appeared.
+    const gpa = std.testing.allocator;
+    var tree = layout.Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+
+    // The split focused `b`, so that is where the user is.
+    try std.testing.expectEqual(@as(?layout.PaneId, b), tree.focused);
+
+    // Floating `b` moves focus within the tree, because the floated pane is no longer tiled.
+    _ = try tree.detach(b, 80, 24);
+    try std.testing.expect(tree.focused != null);
+    try std.testing.expect(!tree.contains(b));
+}
+
+test "a hidden float is not in the tree, so it cannot hold focus" {
+    // Focus in the tree is what the client sends input to when nothing is raised, so a hidden pane
+    // being absent from the tree is exactly what keeps it from receiving keystrokes.
+    const gpa = std.testing.allocator;
+    var tree = layout.Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+
+    _ = try tree.detach(b, 80, 24);
+    try std.testing.expect(!tree.contains(b));
+    // Focus is a tiled pane, never the parked one.
+    try std.testing.expectEqual(@as(?layout.PaneId, a), tree.focused);
+}
+
+test "contains reports membership after a pane is closed" {
+    const gpa = std.testing.allocator;
+    var tree = layout.Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+
+    try std.testing.expect(tree.contains(a));
+    _ = try tree.close(b);
+    try std.testing.expect(!tree.contains(b));
+    try std.testing.expect(tree.contains(a));
+}
+
+test "the toggle hides and shows, and restores focus both ways" {
+    // The whole behaviour of `ctrl-a -`, exercised on the state machine rather than through a pty. The
+    // pty check confirms the pixels; this confirms which pane owns focus, which the pixels do not show.
+    const gpa = std.testing.allocator;
+    var server: Server = .{
+        .gpa = gpa,
+        .listener = .{ .fd = -1, .path = "/nonexistent" },
+        .epfd = -1,
+        .path = "/nonexistent",
+        .encoder = protocol.Encoder.init(gpa),
+        .environ = undefined,
+    };
+    defer {
+        server.encoder.deinit();
+        for (server.sessions.items) |*session| {
+            session.panes.deinit(gpa);
+            session.floats.deinit(gpa);
+            session.watchers.deinit(gpa);
+            session.placements.deinit(gpa);
+            session.tree.deinit();
+        }
+        server.sessions.deinit(gpa);
+        server.clients.deinit(gpa);
+    }
+
+    var session = Session.init(gpa, try protocol.Name.init("t"));
+    session.rows = 24;
+    session.cols = 80;
+    try server.sessions.append(gpa, session);
+
+    const s = &server.sessions.items[0];
+
+    // Two tiled panes, with the second focused. No ptys are created: the state machine below never
+    // touches one, and the test is about ownership and focus.
+    const a = s.tree.allocateId();
+    try s.tree.setRoot(a);
+    const b = s.tree.allocateId();
+    try s.tree.split(a, .horizontal, b);
+    try s.panes.append(gpa, .{ .id = a, .pty = .{ .master = -1, .child = 0 }, .terminal = undefined });
+    try s.panes.append(gpa, .{ .id = b, .pty = .{ .master = -1, .child = 0 }, .terminal = undefined });
+
+    // `b` has focus, which is where the user is working.
+    try std.testing.expectEqual(@as(?layout.PaneId, b), s.tree.focused);
+
+    // Park `b`. The remembered pane is read *after* the detach, because before it the tree still points
+    // at the pane that is leaving, and remembering that would restore focus to an invisible pane.
+    _ = try s.tree.detach(b, s.cols, s.rows);
+    try s.floats.append(gpa, b);
+    s.focus_before_float = s.tree.focused;
+    s.focused_float = b;
+
+    // The float is no longer tiled, so it is not in the tree.
+    try std.testing.expect(!s.tree.contains(b));
+    // And the pane remembered for the return is the tiled survivor, not the float.
+    try std.testing.expectEqual(@as(?layout.PaneId, a), s.focus_before_float);
+    try std.testing.expect(s.tree.contains(a));
+
+    // Hiding must clear the raised float and put focus back on the remembered pane.
+    s.floats_hidden = true;
+    s.focused_float = null;
+    if (s.focus_before_float) |previous| {
+        if (s.tree.contains(previous)) s.tree.focused = previous;
+    }
+    try std.testing.expect(s.focused_float == null);
+    // Focus is on the tiled pane the user was in, never on the hidden float.
+    try std.testing.expectEqual(@as(?layout.PaneId, a), s.tree.focused);
+    try std.testing.expect(!s.tree.contains(b));
+
+    // Showing again raises the float that was raised before.
+    s.floats_hidden = false;
+    s.focused_float = s.floats.items[s.floats.items.len - 1];
+    try std.testing.expectEqual(@as(?layout.PaneId, b), s.focused_float);
 }

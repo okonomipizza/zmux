@@ -404,6 +404,35 @@ lookup.
 A park that would leave no tiled panes is refused: a session with no layout has nothing to
 dock back into, and the tree would be empty while a float still needed somewhere to belong.
 
+### Hiding a float without closing it
+
+`ctrl-a -` puts the floating panes away and brings them back. One key for both directions,
+because there are only two states and a pair of keys would leave the user working out which
+one they are in.
+
+A hidden float is still a live pane: the program runs, the pty is open, and the screen keeps
+being parsed. It is simply not drawn. That falls out of the existing design rather than
+needing new machinery — `focused_float` already means "which float is showing", so hiding is
+clearing it and setting a flag, and showing is setting it again.
+
+Two rules the user set shape the implementation. A hidden pane never holds focus, which is
+free: the layout event omits hidden floats entirely, so there is nothing for the client to
+focus and nothing for input to reach. And showing a float again returns focus to the pane the
+user was working in beforehand, which needs `focus_before_float`.
+
+That second rule had a bug worth recording. The remembered pane was read from the tree
+*before* the pane was detached — but at that moment the tree's focus is the pane being
+floated, so hiding would have restored focus to the very pane being hidden. It contradicts the
+first rule, and it is invisible in the code that looks responsible, because every piece is
+doing what it says. The remembered pane is now read after the detach, when the tree has
+already moved focus to the surviving tiled pane. The test that caught it asserts focus is the
+tiled survivor and that the float is not in the tree, which is the property that makes the two
+rules consistent rather than merely both present.
+
+One consequence worth noting: a raised float now takes input in preference to the tiled pane.
+Before this, input went to the tiled focus whatever was drawn on top, so a floated pane could
+be seen but not typed into.
+
 ### A flaky test, and what it was
 
 `pty.test.spawn a child on the pty and read its output` failed about one run in three. The

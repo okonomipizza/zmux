@@ -143,6 +143,13 @@ pub const Request = union(enum) {
     dock_cancel: struct {
         name: Name,
     },
+    /// Hide the floating panes, or show them again.
+    ///
+    /// One request for both directions, because the server already knows which state it is in.
+    /// Sending "hide" or "show" separately would mean the client tracking a fact it does not own.
+    toggle_floats: struct {
+        name: Name,
+    },
 };
 
 /// Where one pane sits in the session's area, in cells.
@@ -235,6 +242,13 @@ pub const Layout = struct {
     /// name one. Floating panes are not drawn: the choice is about the layout underneath them,
     /// and a float covering it would hide the labels being read.
     docking: bool,
+    /// Set while the floating panes are hidden.
+    ///
+    /// A hidden float is still a live pane: its program runs and its screen is parsed. It is simply
+    /// not drawn, and it does not hold focus, which is why `focused_float` is zero whenever this is
+    /// set. The list below omits hidden floats entirely rather than flagging them, so the client
+    /// needs no rule for what to do with a pane it must not paint.
+    floats_hidden: bool,
     /// Tiled panes first, then floating ones. The order of this list is the z-order, with
     /// later entries drawn on top.
     panes: []const PanePlacement,
@@ -279,6 +293,7 @@ pub const Tag = struct {
     pub const float: u8 = 12;
     pub const dock: u8 = 13;
     pub const dock_cancel: u8 = 14;
+    pub const toggle_floats: u8 = 15;
     // Events, 64..=127. The gap leaves room to add either kind later without
     // renumbering.
     pub const session: u8 = 64;
@@ -436,6 +451,10 @@ pub const Encoder = struct {
                 try self.begin(Tag.dock_cancel);
                 try self.name(&cancel.name);
             },
+            .toggle_floats => |toggle| {
+                try self.begin(Tag.toggle_floats);
+                try self.name(&toggle.name);
+            },
         }
         return self.finish();
     }
@@ -487,6 +506,7 @@ pub const Encoder = struct {
                 try self.u64le(layout.focused);
                 try self.u64le(layout.focused_float);
                 try self.u8le(if (layout.docking) 1 else 0);
+                try self.u8le(if (layout.floats_hidden) 1 else 0);
                 if (layout.panes.len > std.math.maxInt(u16)) return Error.BadLength;
                 try self.u16le(@intCast(layout.panes.len));
                 for (layout.panes) |placement| {
@@ -633,6 +653,7 @@ pub const Decoder = struct {
                 .target = try self.u64le(),
             } },
             Tag.dock_cancel => Request{ .dock_cancel = .{ .name = try self.name() } },
+            Tag.toggle_floats => Request{ .toggle_floats = .{ .name = try self.name() } },
             else => Error.UnknownTag,
         };
     }
@@ -675,6 +696,7 @@ pub const Decoder = struct {
                     const focused = try self.u64le();
                     const focused_float = try self.u64le();
                     const docking = (try self.u8le()) != 0;
+                    const floats_hidden = (try self.u8le()) != 0;
                     const count = try self.u16le();
 
                     // The placements are decoded field by field into the caller's
@@ -705,6 +727,7 @@ pub const Decoder = struct {
                         .focused = focused,
                         .focused_float = focused_float,
                         .docking = docking,
+                        .floats_hidden = floats_hidden,
                         .panes = self.placements[0..index],
                     };
                 },
@@ -762,6 +785,7 @@ test "a layout event round-trips with every pane's rectangle intact" {
         .focused = 3,
         .focused_float = 0,
         .docking = false,
+        .floats_hidden = false,
         .panes = &placements,
     } });
 
@@ -801,6 +825,7 @@ test "a layout event with no panes round-trips" {
         .focused = 0,
         .focused_float = 0,
         .docking = false,
+        .floats_hidden = false,
         .panes = &.{},
     } });
 
@@ -828,6 +853,7 @@ test "a truncated layout event is rejected rather than read past its end" {
         .focused = 1,
         .focused_float = 0,
         .docking = false,
+        .floats_hidden = false,
         .panes = &placements,
     } });
 
@@ -853,11 +879,12 @@ fn paneCountOffset(bytes: []const u8) !usize {
     _ = try decoder.tag();
     decoder.offset = 1;
     _ = try decoder.name();
-    _ = try decoder.u16le();
-    _ = try decoder.u16le();
-    _ = try decoder.u64le();
-    _ = try decoder.u64le();
-    _ = try decoder.u8le();
+    _ = try decoder.u16le(); // area_rows
+    _ = try decoder.u16le(); // area_cols
+    _ = try decoder.u64le(); // focused
+    _ = try decoder.u64le(); // focused_float
+    _ = try decoder.u8le(); // docking
+    _ = try decoder.u8le(); // floats_hidden
     return decoder.offset;
 }
 
@@ -901,6 +928,7 @@ test "a layout event carries floats and labels" {
         .focused = 11,
         .focused_float = 12,
         .docking = true,
+        .floats_hidden = false,
         .panes = &placements,
     } });
 
@@ -1193,4 +1221,56 @@ test "an argument containing NUL is rejected" {
         Error.BadValue,
         joinProgram(&joined, gpa, &.{ "echo", "a\x00b" }),
     );
+}
+
+test "a layout event reports hidden floats by omitting them" {
+    // While the floats are hidden the list carries only the tiled panes. The flag is what tells the
+    // client that floats exist but are put away, since otherwise "hidden" and "none" look identical.
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const placements = [_]PanePlacement{
+        .{
+            .id = 1,
+            .rect = .{ .x = 0, .y = 0, .width = 80, .height = 24 },
+            .exited = false,
+            .floating = false,
+            .label = 0,
+        },
+    };
+
+    const frame = try encoder.writeEvent(.{ .layout = .{
+        .name = try Name.init("hidden"),
+        .area_rows = 24,
+        .area_cols = 80,
+        .focused = 1,
+        .focused_float = 0,
+        .docking = false,
+        .floats_hidden = true,
+        .panes = &placements,
+    } });
+
+    var decoder = Decoder.init(frame);
+    const event = try decoder.event();
+    try std.testing.expect(event.layout.floats_hidden);
+    try std.testing.expectEqual(@as(usize, 1), event.layout.panes.len);
+    // A hidden pane holds no focus, so the raised float is zero.
+    try std.testing.expectEqual(@as(u64, 0), event.layout.focused_float);
+}
+
+test "the toggle request round-trips" {
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const frame = try encoder.writeRequest(.{ .toggle_floats = .{
+        .name = try Name.init("work"),
+    } });
+
+    var decoder = Decoder.init(frame);
+    const request = try decoder.request();
+    try std.testing.expect(request.toggle_floats.name.eql("work"));
 }

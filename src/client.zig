@@ -108,6 +108,11 @@ pub const Client = struct {
     focused_float: u64 = 0,
     /// Set while the server is labelling the tiled panes for a dock target.
     docking: bool = false,
+    /// Set while the floating panes are hidden, so the status line can say so.
+    ///
+    /// Hidden floats are not in the layout event at all, so without this the client cannot tell
+    /// "no floats exist" from "the floats are put away", and the status line would be wrong.
+    floats_hidden: bool = false,
     /// Set between the prefix key and the key that follows it.
     prefix_armed: bool = false,
     /// Output that arrived for panes this client has not been told about yet.
@@ -357,9 +362,24 @@ pub const Client = struct {
             ) catch buffer[0..0];
         }
 
+        // Hidden floats are not in the layout, so the status line is the only place that says they
+        // still exist. Without this a user would think they had been closed.
+        if (self.floats_hidden) {
+            return std.fmt.bufPrint(
+                buffer,
+                " zmux | {s} | {d}x{d} | floats hidden, ctrl-a - shows them | {s}",
+                .{
+                    name,
+                    self.area_cols,
+                    self.area_rows,
+                    state,
+                },
+            ) catch buffer[0..0];
+        }
+
         return std.fmt.bufPrint(
             buffer,
-            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close f float d dock h/j/k/l focus | {s}",
+            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close f float d dock - hide h/j/k/l focus | {s}",
             .{
                 name,
                 self.area_cols,
@@ -369,16 +389,11 @@ pub const Client = struct {
         ) catch buffer[0..0];
     }
 
-    /// Repaint the screen and the status line from the last state the server sent.
-    ///
-    /// `window` and `session` are carried rather than read back from `self`,
-    /// because the status row is the window's last row while the screen is the
-    /// session's, and the two differ by exactly that row.
     /// Repaint every pane and then the status line.
     ///
-    /// Each pane is drawn into its own rectangle, which the server computed. The panes
-    /// tile the session's area, so nothing overlaps and no clearing is needed between
-    /// them; the status line is drawn last because it owns the one row below the area.
+    /// The tiled panes tile the session's area, so nothing overlaps between them and no clearing is
+    /// needed; the floats are drawn after them, on top. The status line goes last because it owns the
+    /// one row below the area.
     fn draw(self: *Client, window: terminal_mod.vtSize) void {
         const local = self.local orelse return;
 
@@ -661,6 +676,12 @@ pub const Client = struct {
                 } });
                 return false;
             },
+            // `-` hides the floats or brings them back, depending on the state the server is in. One
+            // key for both directions because the client does not track which state that is.
+            '-' => {
+                try self.sendRequest(.{ .toggle_floats = .{ .name = self.watching } });
+                return false;
+            },
             // h/j/k/l move focus. They all map onto the tree's own order for now, which
             // walks left to right and wraps; a direction-aware move needs the geometry the
             // server already has and can come later.
@@ -698,13 +719,21 @@ pub const Client = struct {
         }
     }
 
-    /// Send keystrokes to the focused pane.
+    /// Send keystrokes to whichever pane has focus.
+    ///
+    /// A raised float takes input in preference to the tiled pane: it is drawn on top and is what the
+    /// user is looking at, so typing has to reach it. When no float is raised -- including while the
+    /// floats are hidden -- input goes to the tiled focus, which is the only thing on screen.
     fn sendInput(self: *Client, data: []const u8) !void {
         if (data.len == 0) return;
-        if (self.watching.len == 0 or self.focused == 0) return;
+        if (self.watching.len == 0) return;
+
+        const target = if (self.focused_float != 0) self.focused_float else self.focused;
+        if (target == 0) return;
+
         try self.sendRequest(.{ .input = .{
             .name = self.watching,
-            .pane = self.focused,
+            .pane = target,
             .data = data,
         } });
     }
@@ -833,6 +862,7 @@ pub const Client = struct {
         self.focused = layout.focused;
         self.focused_float = layout.focused_float;
         self.docking = layout.docking;
+        self.floats_hidden = layout.floats_hidden;
         self.area_rows = layout.area_rows;
         self.area_cols = layout.area_cols;
 

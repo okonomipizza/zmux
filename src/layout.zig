@@ -119,6 +119,16 @@ pub const Tree = struct {
         return self.root == null;
     }
 
+    /// Whether a pane is still in the tree.
+    ///
+    /// Needed by callers that remember a pane's identifier across a change and must check it is still
+    /// there before pointing anything at it. The tree is the authority on which panes are tiled; a
+    /// pane that has been floated or closed is not.
+    pub fn contains(self: *Tree, id: PaneId) bool {
+        const root = self.root orelse return false;
+        return findLeafIn(root, id) != null;
+    }
+
     /// Allocate an identifier for a new pane.
     ///
     /// Identifiers are never reused within a session, so a stale reference from a
