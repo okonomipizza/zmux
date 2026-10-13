@@ -323,6 +323,61 @@ pub const RowIterator = struct {
     }
 };
 
+/// A colour, as the terminal should draw it.
+///
+/// The library hands back a colour per channel. A renderer writing SGR wants the numbers, so
+/// keeping them in this shape avoids a conversion on the drawing path.
+pub const Rgb = struct {
+    r: u8,
+    g: u8,
+    b: u8,
+};
+
+/// How one cell should look.
+///
+/// The colours are resolved: what the library reports is what to draw, whether the program asked
+/// for a palette entry or gave an explicit RGB value. A null colour means the cell does not set
+/// one and the terminal's default applies, which the renderer expresses by not emitting that
+/// part of the sequence at all rather than by choosing a colour of its own.
+pub const Style = struct {
+    fg: ?Rgb = null,
+    bg: ?Rgb = null,
+    bold: bool = false,
+    faint: bool = false,
+    italic: bool = false,
+    underline: bool = false,
+    blink: bool = false,
+    inverse: bool = false,
+    invisible: bool = false,
+    strikethrough: bool = false,
+
+    /// Whether this style asks for anything at all.
+    ///
+    /// Used to skip emitting a reset sequence for a cell that needs no styling, which is most of
+    /// them.
+    pub fn isDefault(self: Style) bool {
+        return self.fg == null and self.bg == null and
+            !self.bold and !self.faint and !self.italic and
+            !self.underline and !self.blink and !self.inverse and
+            !self.invisible and !self.strikethrough;
+    }
+
+    pub fn eql(self: Style, other: Style) bool {
+        return rgbEql(self.fg, other.fg) and rgbEql(self.bg, other.bg) and
+            self.bold == other.bold and self.faint == other.faint and
+            self.italic == other.italic and self.underline == other.underline and
+            self.blink == other.blink and self.inverse == other.inverse and
+            self.invisible == other.invisible and
+            self.strikethrough == other.strikethrough;
+    }
+};
+
+fn rgbEql(a: ?Rgb, b: ?Rgb) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.?.r == b.?.r and a.?.g == b.?.g and a.?.b == b.?.b;
+}
+
 pub const CellIterator = struct {
     handle: c.GhosttyRenderStateRowCells,
 
@@ -399,6 +454,31 @@ pub const CellIterator = struct {
         );
         if (result != c.GHOSTTY_SUCCESS) return null;
         return value;
+    }
+
+    /// Everything needed to draw this cell, gathered in one call.
+    ///
+    /// The colours come from the resolved accessors rather than from the style's own fields,
+    /// because those may hold palette indices while these are RGB. A renderer would otherwise have
+    /// to carry a palette and keep it matching the terminal's, which is a way to get the colours
+    /// subtly wrong rather than to get them right.
+    pub fn resolvedStyle(self: CellIterator) Style {
+        const raw = self.style();
+        const fg = self.foregroundColor();
+        const bg = self.backgroundColor();
+
+        return .{
+            .fg = if (fg) |colour| Rgb{ .r = colour.r, .g = colour.g, .b = colour.b } else null,
+            .bg = if (bg) |colour| Rgb{ .r = colour.r, .g = colour.g, .b = colour.b } else null,
+            .bold = raw.bold,
+            .faint = raw.faint,
+            .italic = raw.italic,
+            .underline = raw.underline != c.GHOSTTY_SGR_UNDERLINE_NONE,
+            .blink = raw.blink,
+            .inverse = raw.inverse,
+            .invisible = raw.invisible,
+            .strikethrough = raw.strikethrough,
+        };
     }
 };
 

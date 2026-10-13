@@ -471,6 +471,52 @@ returns nothing. Only the first is a reason to stop. The loop now reads until th
 closes, and the reap is retried rather than treated as a failure at the first look. Five
 consecutive runs are clean.
 
+## Phase 5.1 — colour (done)
+
+Draw the styles the library reports, and stop telling programs the terminal cannot do
+colour.
+
+The client's pane painter took each cell's grapheme and discarded everything else. No
+colour was emitted at all, for anything: a shell's prompt, `ls --color`, an editor's
+syntax highlighting and a shell's dimmed autosuggestion were all drawn as plain text.
+A user reported it as being unable to tell how much of a fish autosuggestion they had
+typed, because the suggestion and their own input were the same colour. That was the
+visible symptom of a painter that had never drawn a style.
+
+The library resolves palette indices to RGB for us, so the painter asks for the
+resolved foreground and background rather than carrying a palette of its own, and
+writes them as 24-bit colour. A colour the cell does not set is written as the
+terminal's *default* (39 or 49) rather than an RGB guess: zmux does not know the user's
+theme, and guessing white-on-black would override it.
+
+Each sequence starts from a reset, and the sequence is only written when a cell's style
+differs from the one before it, so a run of text in one colour costs one escape rather
+than one per character.
+
+Two things had to change around it that were not obviously part of the job:
+
+**The row buffer is no longer clipped by length.** It used to be truncated to the
+pane's width, which was correct when it held only glyphs and became wrong the moment it
+also held escape sequences: cutting at a byte offset splits a sequence and corrupts the
+terminal. Cells are counted instead, and the row ends with a reset so a colour cannot
+bleed into the cursor move that follows or into the pane beside it.
+
+**`TERM=dumb` is no longer passed to a session.** A program told the terminal is `dumb`
+disables colour, so a user whose environment says that saw no colour however well the
+painter worked. zmux parses VT and draws colour, so `dumb` is untrue about the terminal
+the program is on; a session is given `xterm-256color` instead. Any other `TERM` is the
+user's own information and is passed through untouched, and a missing `TERM` is left
+missing rather than invented.
+
+Verified: a shell printing `\033[31m` red and `\033[38;2;0;200;0m` green renders both,
+with the red resolved by the library to the terminal's own palette entry. A fish
+session with `TERM=dumb` in the environment that started the server shows seven distinct
+styles, including the grey `38;2;102;102;102` of its autosuggestion. `zig build test`
+passes 103 tests, including the SGR encoder and the `TERM` substitution, and the tests
+caught two bugs on the way: an introducer written as `3;2` instead of `38;2`, which
+draws the 8-colour form with stray parameters, and a replacement value missing its
+`TERM=` prefix, which would have handed the child a bare word where a variable belongs.
+
 ## Phase 6 — hardening
 
 - A client disconnecting mid-write must not take down the session

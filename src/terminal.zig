@@ -230,6 +230,83 @@ pub const Renderer = struct {
 ///
 /// The line is drawn in inverse video so that it reads as chrome rather than as
 /// part of the program's output.
+/// Writes the escape sequence that puts a terminal into a given style.
+///
+/// Colour is what makes a terminal usable: a shell colours its prompt, an editor colours syntax, and
+/// a shell's autosuggestion is drawn in a dimmed colour that is the only thing distinguishing it
+/// from what the user has already typed. Dropping the style makes all of those read as
+/// undifferentiated text.
+///
+/// Each sequence starts from a reset (`0`) rather than being a delta from the previous cell's style.
+/// A delta would be shorter but needs the previous style tracked across rows and panes, and getting
+/// it wrong bleeds a colour into the rest of the screen. The reset costs a few bytes per styled cell
+/// and cannot be wrong.
+pub const SgrWriter = struct {
+    /// Append the sequence for `style` to `buffer`.
+    ///
+    /// A default style writes nothing, because a cell with no styling should inherit whatever the
+    /// terminal is already doing rather than being forced to something explicit. That also keeps the
+    /// common case, a screenful of plain text, free of escapes.
+    ///
+    /// A colour the cell does not set is written as the terminal's *default* (39 or 49) rather than
+    /// as an RGB value. zmux does not know the user's palette, so guessing white-on-black would
+    /// override the theme the terminal was configured with; and the reset clears the attributes but
+    /// does not by itself restore the default colour.
+    pub fn write(buffer: *std.ArrayList(u8), gpa: std.mem.Allocator, style: vt.Style) !void {
+        if (style.isDefault()) return;
+
+        try buffer.appendSlice(gpa, "\x1b[0");
+
+        if (style.bold) try buffer.appendSlice(gpa, ";1");
+        if (style.faint) try buffer.appendSlice(gpa, ";2");
+        if (style.italic) try buffer.appendSlice(gpa, ";3");
+        if (style.underline) try buffer.appendSlice(gpa, ";4");
+        if (style.blink) try buffer.appendSlice(gpa, ";5");
+        if (style.inverse) try buffer.appendSlice(gpa, ";7");
+        if (style.invisible) try buffer.appendSlice(gpa, ";8");
+        if (style.strikethrough) try buffer.appendSlice(gpa, ";9");
+
+        if (style.fg) |colour| {
+            try writeColor(buffer, gpa, 38, colour);
+        } else {
+            try buffer.appendSlice(gpa, ";39");
+        }
+
+        if (style.bg) |colour| {
+            try writeColor(buffer, gpa, 48, colour);
+        } else {
+            try buffer.appendSlice(gpa, ";49");
+        }
+
+        try buffer.append(gpa, 'm');
+    }
+
+    /// Write one colour as a 24-bit value.
+    ///
+    /// Truecolor is used rather than the nearest palette entry. The library has already resolved
+    /// palette indices to RGB, so the colour is exact, and a terminal running zmux supports 24-bit
+    /// colour; quantising here would throw away information that was handed to us.
+    ///
+    /// The parameter is the whole introducer, 38 or 48, not its leading digit. The extended-colour
+    /// form is `38;2;r;g;b`, where the `2` is a separate field; writing `3` and then a literal `2`
+    /// produces `3;2;r;g;b`, which is the 8-colour form with stray parameters and draws a different
+    /// colour than intended.
+    fn writeColor(
+        buffer: *std.ArrayList(u8),
+        gpa: std.mem.Allocator,
+        introducer: u8,
+        colour: vt.Rgb,
+    ) !void {
+        var sequence: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(
+            &sequence,
+            ";{d};2;{d};{d};{d}",
+            .{ introducer, colour.r, colour.g, colour.b },
+        ) catch return;
+        try buffer.appendSlice(gpa, text);
+    }
+};
+
 pub const StatusLine = struct {
     /// A scratch buffer for composing the row, reused between frames.
     buffer: std.ArrayList(u8) = .empty,
@@ -295,4 +372,77 @@ test "writeAll writes every byte" {
     var buffer: [32]u8 = undefined;
     const read = std.posix.read(fds[0], &buffer) catch return error.ReadFailed;
     try std.testing.expectEqualStrings("hello, terminal", buffer[0..read]);
+}
+
+test "a default style writes nothing at all" {
+    // Most cells are unstyled, and a screenful of plain text should not carry an escape per cell.
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+
+    try SgrWriter.write(&buffer, gpa, .{});
+    try std.testing.expectEqualStrings("", buffer.items);
+}
+
+test "colours are written as truecolor with the whole introducer" {
+    // 38 and 48, not 3 and 4: the extended form is `38;2;r;g;b` and the 2 is a separate field.
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+
+    try SgrWriter.write(
+        &buffer,
+        gpa,
+        .{ .fg = .{ .r = 1, .g = 2, .b = 3 }, .bg = .{ .r = 4, .g = 5, .b = 6 } },
+    );
+
+    try std.testing.expectEqualStrings("\x1b[0;38;2;1;2;3;48;2;4;5;6m", buffer.items);
+}
+
+test "a colour the cell does not set falls back to the terminal default" {
+    // 39 and 49, not an RGB guess: zmux does not know the user's theme, and the reset alone does not
+    // restore the default colour.
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+
+    try SgrWriter.write(&buffer, gpa, .{ .bold = true });
+    try std.testing.expectEqualStrings("\x1b[0;1;39;49m", buffer.items);
+}
+
+test "only the set colour falls back" {
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+
+    try SgrWriter.write(&buffer, gpa, .{ .fg = .{ .r = 255, .g = 0, .b = 0 } });
+    try std.testing.expectEqualStrings("\x1b[0;38;2;255;0;0;49m", buffer.items);
+}
+
+test "attributes are written in one sequence, in a fixed order" {
+    const gpa = std.testing.allocator;
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(gpa);
+
+    try SgrWriter.write(&buffer, gpa, .{
+        .bold = true,
+        .faint = true,
+        .italic = true,
+        .underline = true,
+        .blink = true,
+        .inverse = true,
+        .invisible = true,
+        .strikethrough = true,
+    });
+
+    try std.testing.expectEqualStrings("\x1b[0;1;2;3;4;5;7;8;9;39;49m", buffer.items);
+}
+
+test "a style is not default when only a colour is set" {
+    // `isDefault` decides whether an escape is written at all, so a colour alone must make it false
+    // or every coloured cell would be drawn in the default colour.
+    try std.testing.expect(!(vt.Style{ .fg = .{ .r = 1, .g = 2, .b = 3 } }).isDefault());
+    try std.testing.expect(!(vt.Style{ .bg = .{ .r = 1, .g = 2, .b = 3 } }).isDefault());
+    try std.testing.expect(!(vt.Style{ .underline = true }).isDefault());
+    try std.testing.expect((vt.Style{}).isDefault());
 }

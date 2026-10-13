@@ -69,6 +69,13 @@ running and keeps its screen; it is simply not drawn, and it cannot take focus, 
 nothing is ever typed into a pane you cannot see. Showing them again returns focus
 to the pane you were working in before the float appeared.
 
+Colour is drawn, including 24-bit colour, so a shell's prompt, an editor's syntax
+highlighting and a shell's dimmed autosuggestion all look as they should. A session
+is given `TERM=xterm-256color` when the environment it would otherwise inherit says
+`dumb`: zmux parses VT and draws colour, so `dumb` would tell the programs inside
+something untrue about the terminal they are on. Any other `TERM` is passed through
+untouched.
+
 A session's pty and screen live in the server, so detaching costs the session
 nothing: the program keeps running while nothing is watching, and reattaching
 redraws the screen as it stands. A server is started on first use and keeps

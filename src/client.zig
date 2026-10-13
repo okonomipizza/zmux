@@ -485,6 +485,14 @@ pub const Client = struct {
             rect: protocol.Rect,
             row_index: *u16,
             gpa: std.mem.Allocator,
+            /// The style the terminal is currently in, which decides when the next cell has to
+            /// write a new escape. Reset at the start of every row, because each row is written
+            /// after a cursor move and the terminal keeps whatever the last cell of the previous
+            /// row left it in.
+            current_style: vt.Style = .{},
+            /// How many cells of this row have been written, which is how the row is clipped to the
+            /// rectangle without cutting into the escape sequences sharing the buffer.
+            columns_written: u16 = 0,
 
             fn visit(painter: *@This(), row: *vt.RowIterator) bool {
                 defer painter.row_index.* += 1;
@@ -502,21 +510,44 @@ pub const Client = struct {
                 painter.local.writeAll(move) catch return false;
 
                 painter.pane.line.clearRetainingCapacity();
+
+                // Both are per row: the terminal's style after this row's cursor move is whatever
+                // the previous row's last cell left it in, so the first cell of this row has to
+                // consider itself unstyled until it says otherwise.
+                painter.current_style = .{};
+                painter.columns_written = 0;
                 _ = row.forEachCell(painter, collect) catch return false;
 
-                // Clipped to the rectangle so that a wide row cannot run into the pane
-                // beside it, which would corrupt the neighbour's screen. A pane's terminal
-                // is made exactly as wide as the rectangle, so this only bites when the two
-                // disagree, which is the case worth defending against.
-                const text = if (painter.pane.line.items.len > painter.rect.width)
-                    painter.pane.line.items[0..painter.rect.width]
-                else
-                    painter.pane.line.items;
-                painter.local.writeAll(text) catch return false;
+                // The buffer holds escape sequences as well as glyphs, so it is not clipped by
+                // length: doing that would cut a sequence in half and corrupt the terminal. The
+                // cells are counted instead, and `collect` stops adding once the rectangle is full.
+                // A pane's terminal is made exactly as wide as the rectangle, so this only bites
+                // when the two disagree, which is the case worth defending against.
+                painter.local.writeAll(painter.pane.line.items) catch return false;
+                // The row ends with a reset, so that a colour cannot bleed into the cursor move
+                // that follows or into the pane next to this one.
+                painter.local.writeAll("\x1b[0m") catch return false;
                 return true;
             }
 
             fn collect(painter: *@This(), cell: *vt.CellIterator) void {
+                // Cells beyond the rectangle are dropped rather than written and clipped. A wide
+                // glyph or a mis-sized terminal would otherwise run into the pane beside this one.
+                if (painter.columns_written >= painter.rect.width) return;
+                painter.columns_written += 1;
+                // Styling is emitted before the glyph, and only when it differs from the cell
+                // before it. A run of text in one colour therefore costs one escape rather than one
+                // per character, which matters for a screenful of a shell's output.
+                const style = cell.resolvedStyle();
+                if (!style.eql(painter.current_style)) {
+                    terminal_mod.SgrWriter.write(
+                        &painter.pane.line,
+                        painter.gpa,
+                        style,
+                    ) catch {};
+                    painter.current_style = style;
+                }
+
                 var codepoints: [8]u32 = undefined;
                 var utf8: [32]u8 = undefined;
                 const bytes = cell.graphemesUtf8(&codepoints, &utf8);

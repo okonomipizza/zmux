@@ -416,7 +416,21 @@ pub const Server = struct {
         }
         vector[count] = null;
 
-        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+        // The environment is the server's own, with one correction: a `TERM` of `dumb` is replaced.
+        // `dumb` tells a program that the terminal can do nothing, so fish drops its colours, `ls
+        // --color` stops colouring and an editor loses its syntax highlighting. zmux parses VT and
+        // draws colour, so a child inheriting `dumb` is being told something untrue about the
+        // terminal it is on. A `TERM` that names a real terminal is passed through untouched, since
+        // it is the user's and better information than anything zmux could substitute.
+        var environment: std.ArrayList(?[*:0]const u8) = .empty;
+        defer environment.deinit(self.gpa);
+
+        try environment.appendSlice(self.gpa, environmentEntries());
+        replaceUselessTerm(&environment);
+        // `execve` wants a null-terminated vector; the terminator is not counted in `items`.
+        try environment.append(self.gpa, null);
+
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(environment.items.ptr);
 
         const pty = pty_mod.Pty.spawn(@ptrCast(&vector), envp, size) catch
             return Error.SpawnFailed;
@@ -1522,6 +1536,52 @@ fn fullArea(rows: u16, cols: u16) pty_mod.Size {
     return .{ .rows = rows, .cols = cols };
 }
 
+/// The server's own environment, as the list `execve` wants.
+///
+/// `std.c.environ` is the process's real environment, already in this shape. It is copied into a
+/// list by the caller so that one entry can be replaced without disturbing the process's own view
+/// of its environment, which is what the server itself is still using.
+fn environmentEntries() []const ?[*:0]const u8 {
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+    var count: usize = 0;
+    while (envp[count] != null) count += 1;
+    return envp[0..count];
+}
+
+/// The terminal type to give a child when the inherited one says the terminal cannot do anything.
+///
+/// The whole assignment, not just the value: this entry replaces a `TERM=...` already in the
+/// environment, so it has to carry its own name. Substituting a bare value would hand the child a
+/// word where a variable belongs, which `execve` accepts and every program then ignores.
+pub const fallback_term = "TERM=xterm-256color";
+
+/// Whether a `TERM` value is one that disables colour and cursor movement.
+///
+/// `dumb` is the value that means "no capabilities"; an empty value means the same in practice,
+/// since a program that cannot identify the terminal will not use escape sequences it cannot be
+/// sure of.
+fn termIsUseless(value: []const u8) bool {
+    return value.len == 0 or std.mem.eql(u8, value, "dumb");
+}
+
+/// Replace a useless `TERM` in `environment`, if there is one.
+///
+/// The replacement is a static literal, so it outlives the `execve` in the forked child without
+/// needing to be freed, and without the caller having to keep a buffer alive. An environment with
+/// no `TERM` at all is left alone: adding one would be guessing at a case the user may have set up
+/// deliberately.
+fn replaceUselessTerm(environment: *std.ArrayList(?[*:0]const u8)) void {
+    const prefix = "TERM=";
+
+    for (environment.items) |*entry| {
+        const text = std.mem.span(entry.* orelse continue);
+        if (!std.mem.startsWith(u8, text, prefix)) continue;
+        if (!termIsUseless(text[prefix.len..])) return;
+        entry.* = fallback_term;
+        return;
+    }
+}
+
 /// This runs inside `vt_write`, so it may only append to a buffer. Writing to
 /// the pty from here would reenter the parser.
 fn onWritePty(
@@ -1778,4 +1838,51 @@ test "the toggle hides and shows, and restores focus both ways" {
     s.floats_hidden = false;
     s.focused_float = s.floats.items[s.floats.items.len - 1];
     try std.testing.expectEqual(@as(?layout.PaneId, b), s.focused_float);
+}
+
+test "a useless TERM is replaced and a real one is left alone" {
+    const gpa = std.testing.allocator;
+
+    // `dumb` says the terminal can do nothing, which is untrue of a terminal zmux is drawing on.
+    var entries: std.ArrayList(?[*:0]const u8) = .empty;
+    defer entries.deinit(gpa);
+    try entries.appendSlice(gpa, &.{ "PATH=/bin", "TERM=dumb", "HOME=/root" });
+    replaceUselessTerm(&entries);
+    try std.testing.expectEqualStrings("TERM=xterm-256color", std.mem.span(entries.items[1].?));
+    // The entries around it are untouched, and stay in place.
+    try std.testing.expectEqualStrings("PATH=/bin", std.mem.span(entries.items[0].?));
+    try std.testing.expectEqualStrings("HOME=/root", std.mem.span(entries.items[2].?));
+
+    // A TERM that names a real terminal is the user's information and is better than a substitute.
+    var good: std.ArrayList(?[*:0]const u8) = .empty;
+    defer good.deinit(gpa);
+    try good.appendSlice(gpa, &.{ "TERM=foot", "COLORTERM=truecolor" });
+    replaceUselessTerm(&good);
+    try std.testing.expectEqualStrings("TERM=foot", std.mem.span(good.items[0].?));
+
+    // An empty TERM is as useless as `dumb`.
+    var empty: std.ArrayList(?[*:0]const u8) = .empty;
+    defer empty.deinit(gpa);
+    try empty.appendSlice(gpa, &.{"TERM="});
+    replaceUselessTerm(&empty);
+    try std.testing.expectEqualStrings("TERM=xterm-256color", std.mem.span(empty.items[0].?));
+
+    // No TERM at all is left alone: adding one would guess at a case the user may have arranged.
+    var absent: std.ArrayList(?[*:0]const u8) = .empty;
+    defer absent.deinit(gpa);
+    try absent.appendSlice(gpa, &.{"PATH=/bin"});
+    replaceUselessTerm(&absent);
+    try std.testing.expectEqual(@as(usize, 1), absent.items.len);
+}
+
+test "TERM is matched by prefix, not by substring" {
+    // A variable that merely ends in `TERM` must not be touched, or `COLORTERM=dumb` would rewrite
+    // the wrong entry.
+    const gpa = std.testing.allocator;
+    var entries: std.ArrayList(?[*:0]const u8) = .empty;
+    defer entries.deinit(gpa);
+    try entries.appendSlice(gpa, &.{ "COLORTERM=dumb", "TERM=xterm" });
+    replaceUselessTerm(&entries);
+    try std.testing.expectEqualStrings("COLORTERM=dumb", std.mem.span(entries.items[0].?));
+    try std.testing.expectEqualStrings("TERM=xterm", std.mem.span(entries.items[1].?));
 }
