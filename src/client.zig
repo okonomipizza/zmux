@@ -55,6 +55,14 @@ const RemotePane = struct {
     rect: protocol.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     /// Set when the server reports this pane's program has exited.
     exited: bool = false,
+    /// Whether this pane floats above the layout rather than being tiled by it.
+    ///
+    /// A float is drawn after the tiled panes and may overlap them, and its rectangle is absolute
+    /// window cells rather than a slice of the tiled area.
+    floating: bool = false,
+    /// The number the server wants drawn on this pane while a dock target is being chosen, or
+    /// zero when nothing is being numbered.
+    label: u8 = 0,
     /// Bytes this pane's terminal wants sent to its program, waiting for the socket.
     reply: std.ArrayList(u8) = .empty,
     /// The handle the terminal holds; heap-allocated and owned here.
@@ -96,6 +104,10 @@ pub const Client = struct {
     panes: std.ArrayList(RemotePane) = .empty,
     /// The pane the server says has focus, by identifier. Input is addressed to it.
     focused: u64 = 0,
+    /// The raised floating pane, by identifier, or zero when none is raised.
+    focused_float: u64 = 0,
+    /// Set while the server is labelling the tiled panes for a dock target.
+    docking: bool = false,
     /// Set between the prefix key and the key that follows it.
     prefix_armed: bool = false,
     /// Output that arrived for panes this client has not been told about yet.
@@ -334,14 +346,24 @@ pub const Client = struct {
     fn statusText(self: *Client, buffer: []u8) []const u8 {
         const name = if (self.watching.len > 0) self.watching.slice() else "-";
         const state = if (self.exited) "exited" else "running";
+
+        // While a dock target is being chosen the status line is the instruction for the mode, since
+        // the whole window is now a menu.
+        if (self.docking) {
+            return std.fmt.bufPrint(
+                buffer,
+                " zmux | dock {s} into which pane? press 1-9, esc to cancel",
+                .{name},
+            ) catch buffer[0..0];
+        }
+
         return std.fmt.bufPrint(
             buffer,
-            " zmux | {s} | {d}x{d} | {d} pane(s) | {s} | ctrl-a: s/v split, q close, h/j/k/l focus",
+            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close f float d dock h/j/k/l focus | {s}",
             .{
                 name,
                 self.area_cols,
                 self.area_rows,
-                self.panes.items.len,
                 state,
             },
         ) catch buffer[0..0];
@@ -364,8 +386,24 @@ pub const Client = struct {
         // they belong to, before anything is painted.
         self.flushPaneReplies();
 
+        // Tiled panes first, then the floats over them. The server sends the panes in z-order and
+        // the flag on each one says which is which, so the two passes are what put the floats on
+        // top rather than merely beside.
         for (self.panes.items) |*pane| {
+            if (pane.floating) continue;
             self.drawPane(pane);
+        }
+        for (self.panes.items) |*pane| {
+            if (!pane.floating) continue;
+            self.drawPane(pane);
+        }
+
+        // While a dock target is being chosen, each tiled pane shows its number.
+        if (self.docking) {
+            for (self.panes.items) |*pane| {
+                if (pane.floating or pane.label == 0) continue;
+                self.drawPaneLabel(pane);
+            }
         }
 
         if (self.status) |*status| {
@@ -373,6 +411,27 @@ pub const Client = struct {
             const text = self.statusText(&text_buffer);
             status.render(self.gpa, local, window.rows - 1, text, window.cols) catch {};
         }
+    }
+
+    /// Draw a pane's number in the middle of its top row, while a dock target is being chosen.
+    ///
+    /// The label is drawn in inverse video and in the pane's own cells rather than at a fixed
+    /// place, so that a user looking at a small pane still reads it. It is written after the
+    /// pane's screen, so nothing the program does can cover it up.
+    fn drawPaneLabel(self: *Client, pane: *RemotePane) void {
+        const local = self.local orelse return;
+        const rect = pane.rect;
+        if (rect.width < 4 or rect.height == 0) return;
+
+        var buffer: [48]u8 = undefined;
+        // Centre the two-character cell: the number with a space either side.
+        const column = rect.x + (rect.width / 2) - 1;
+        const move = std.fmt.bufPrint(
+            &buffer,
+            "\x1b[{d};{d}H\x1b[7m {d} \x1b[0m",
+            .{ rect.y + 1, column + 1, pane.label },
+        ) catch return;
+        local.writeAll(move) catch {};
     }
 
     /// Paint one pane's screen inside its rectangle.
@@ -506,6 +565,34 @@ pub const Client = struct {
             return self.handleCommand(byte);
         }
 
+        // While a dock target is being chosen, a digit picks one. The keystroke is consumed rather
+        // than forwarded: the labels belong to zmux, and sending the number to a pane's program
+        // would be sending it a character the user typed at a menu.
+        if (self.docking) {
+            if (byte >= '1' and byte <= '9') {
+                const target = self.labeledPane(byte - '0');
+                if (target) |id| {
+                    // The mode ends when the server answers with the new layout. Asking twice would
+                    // split twice, so the request is sent once and the mode is cleared here.
+                    self.docking = false;
+                    try self.sendRequest(.{ .dock = .{
+                        .name = self.watching,
+                        .target = id,
+                    } });
+                }
+                return false;
+            }
+            // Escape leaves the choice without moving anything.
+            if (byte == 0x1B) {
+                self.docking = false;
+                try self.sendRequest(.{ .dock_cancel = .{ .name = self.watching } });
+                return false;
+            }
+            // Anything else is ignored rather than forwarded, so that a stray keystroke cannot be
+            // typed into a program the user is not looking at.
+            return false;
+        }
+
         if (byte == 0x01) {
             // The prefix takes effect on the next byte; a prefix that is never followed
             // by anything means the user pressed ctrl-a and stopped, which detaches so
@@ -519,6 +606,19 @@ pub const Client = struct {
         // terminal have already agreed on.
         try payload.append(self.gpa, byte);
         return false;
+    }
+
+    /// The pane carrying a given label, while a dock target is being chosen.
+    ///
+    /// Zero is not a label: an unnumbered pane carries zero, so matching it would let a caller name
+    /// a float, which cannot be docked into. The check belongs here rather than at the call site,
+    /// because this is the function that would get it wrong.
+    fn labeledPane(self: *Client, label: u8) ?u64 {
+        if (label == 0) return null;
+        for (self.panes.items) |pane| {
+            if (pane.label == label) return pane.id;
+        }
+        return null;
     }
 
     /// Act on the key that followed the prefix.
@@ -545,6 +645,20 @@ pub const Client = struct {
             },
             'q' => {
                 try self.sendRequest(.{ .close = .{ .name = self.watching } });
+                return false;
+            },
+            // `f` parks the focused pane above the layout, `d` puts the raised float back.
+            'f' => {
+                try self.sendRequest(.{ .float = .{ .name = self.watching } });
+                return false;
+            },
+            'd' => {
+                // No target: the server freezes the layout and labels the panes, and the number
+                // typed next chooses one.
+                try self.sendRequest(.{ .dock = .{
+                    .name = self.watching,
+                    .target = 0,
+                } });
                 return false;
             },
             // h/j/k/l move focus. They all map onto the tree's own order for now, which
@@ -700,6 +814,8 @@ pub const Client = struct {
             };
             pane.rect = placement.rect;
             pane.exited = placement.exited;
+            pane.floating = placement.floating;
+            pane.label = placement.label;
             // The terminal is resized to match, so that the client's idea of the pane's
             // shape agrees with the server's. Skipping this would leave a pane's screen
             // wrapped for a width it no longer has.
@@ -715,6 +831,8 @@ pub const Client = struct {
         }
 
         self.focused = layout.focused;
+        self.focused_float = layout.focused_float;
+        self.docking = layout.docking;
         self.area_rows = layout.area_rows;
         self.area_cols = layout.area_cols;
 
@@ -892,4 +1010,55 @@ test "the client detaches on the prefix key" {
     // test without a socket: a client with no terminal still routes Ctrl-a to a
     // detach request.
     _ = Client;
+}
+
+test "a label finds the pane the server numbered" {
+    // The number the user types is matched against the labels the server assigned, which are the
+    // positions of the tiled panes in the layout event. Getting this wrong would dock a float into
+    // a pane the user was not looking at.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // Two panes with labels, and a float with none. The float must not be reachable by number,
+    // since docking into a float is not a thing the server will do.
+    for ([_]struct { id: u64, label: u8 }{
+        .{ .id = 100, .label = 1 },
+        .{ .id = 200, .label = 2 },
+        .{ .id = 300, .label = 0 },
+    }) |entry| {
+        var terminal = try vt.Terminal.init(.{ .cols = 10, .rows = 5 });
+        errdefer terminal.deinit();
+        var render = try terminal.createRenderState();
+        errdefer render.deinit();
+        var renderer = try terminal_mod.Renderer.init(gpa, 5);
+        errdefer renderer.deinit();
+        const route = try gpa.create(PaneRoute);
+        route.* = .{ .client = &client, .pane = entry.id };
+        try client.panes.append(gpa, .{
+            .id = entry.id,
+            .terminal = terminal,
+            .render = render,
+            .renderer = renderer,
+            .label = entry.label,
+            .route = route,
+        });
+    }
+    defer for (client.panes.items) |*pane| pane.deinit(gpa);
+
+    try std.testing.expectEqual(@as(?u64, 100), client.labeledPane(1));
+    try std.testing.expectEqual(@as(?u64, 200), client.labeledPane(2));
+    // Nothing is numbered zero or above the number of tiled panes.
+    try std.testing.expectEqual(@as(?u64, null), client.labeledPane(0));
+    try std.testing.expectEqual(@as(?u64, null), client.labeledPane(9));
 }

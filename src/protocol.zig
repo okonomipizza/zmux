@@ -121,6 +121,28 @@ pub const Request = union(enum) {
         name: Name,
         backwards: bool,
     },
+    /// Park the focused pane, lifting it out of the layout and above it.
+    ///
+    /// The pane keeps its pty and its screen: parking changes which list owns it and nothing
+    /// else, so the program inside never notices. The space it leaves is handed to a
+    /// neighbour, which is why a parked pane does not leave a hole.
+    float: struct {
+        name: Name,
+    },
+    /// Put a floating pane back into the layout.
+    ///
+    /// Without a target the server enters dock-select mode, freezing the layout and labelling
+    /// the tiled panes so the user can choose; `dock` with a target does the move. Splitting
+    /// along the chosen pane's longer side is what keeps the two halves roughly square.
+    dock: struct {
+        name: Name,
+        /// The tiled pane to split, or zero to begin choosing one.
+        target: u64,
+    },
+    /// Leave dock-select mode without moving anything.
+    dock_cancel: struct {
+        name: Name,
+    },
 };
 
 /// Where one pane sits in the session's area, in cells.
@@ -199,22 +221,42 @@ pub const Event = union(enum) {
 /// The whole arrangement of a session's panes.
 pub const Layout = struct {
     name: Name,
-    /// The rectangle all the panes share, which is the area the client has for the
-    /// session. Panes are positioned inside it.
+    /// The rectangle all the tiled panes share. Floating panes are positioned in absolute
+    /// window cells instead and may overlap it.
     area_rows: u16,
     area_cols: u16,
-    /// The pane holding focus, or zero when there is none.
+    /// The tiled pane holding focus, or zero when there is none.
     focused: u64,
+    /// The floating pane that is on top, or zero when none is raised.
+    focused_float: u64,
+    /// Set while the user is choosing where to put a floating pane back into the layout.
+    ///
+    /// In this mode the layout is frozen and every tiled pane carries a label, so the user can
+    /// name one. Floating panes are not drawn: the choice is about the layout underneath them,
+    /// and a float covering it would hide the labels being read.
+    docking: bool,
+    /// Tiled panes first, then floating ones. The order of this list is the z-order, with
+    /// later entries drawn on top.
     panes: []const PanePlacement,
 };
 
 /// One pane's identity and position within a session.
 pub const PanePlacement = struct {
     id: u64,
+    /// Window cells. For a tiled pane these come from the tree; for a floating one they are
+    /// wherever the float has been put.
     rect: Rect,
-    /// Whether the pane's program is still running. A pane whose child has exited
-    /// keeps its screen until it is closed.
+    /// Whether the pane's program is still running. A pane whose child has exited keeps its
+    /// screen until the pane is closed.
     exited: bool,
+    /// Whether this pane floats above the layout rather than being tiled by it.
+    ///
+    /// Carried explicitly so that the client does not have to infer it from the list order,
+    /// which would break as soon as there were two floats or the ordering changed.
+    floating: bool,
+    /// The number drawn on this pane while a dock target is being chosen, or zero when nothing
+    /// is being numbered.
+    label: u8,
 };
 
 /// Wire tags.
@@ -234,6 +276,9 @@ pub const Tag = struct {
     pub const split: u8 = 9;
     pub const close: u8 = 10;
     pub const focus: u8 = 11;
+    pub const float: u8 = 12;
+    pub const dock: u8 = 13;
+    pub const dock_cancel: u8 = 14;
     // Events, 64..=127. The gap leaves room to add either kind later without
     // renumbering.
     pub const session: u8 = 64;
@@ -378,6 +423,19 @@ pub const Encoder = struct {
                 try self.name(&focus.name);
                 try self.u8le(if (focus.backwards) 1 else 0);
             },
+            .float => |float| {
+                try self.begin(Tag.float);
+                try self.name(&float.name);
+            },
+            .dock => |dock| {
+                try self.begin(Tag.dock);
+                try self.name(&dock.name);
+                try self.u64le(dock.target);
+            },
+            .dock_cancel => |cancel| {
+                try self.begin(Tag.dock_cancel);
+                try self.name(&cancel.name);
+            },
         }
         return self.finish();
     }
@@ -427,6 +485,8 @@ pub const Encoder = struct {
                 try self.u16le(layout.area_rows);
                 try self.u16le(layout.area_cols);
                 try self.u64le(layout.focused);
+                try self.u64le(layout.focused_float);
+                try self.u8le(if (layout.docking) 1 else 0);
                 if (layout.panes.len > std.math.maxInt(u16)) return Error.BadLength;
                 try self.u16le(@intCast(layout.panes.len));
                 for (layout.panes) |placement| {
@@ -436,6 +496,8 @@ pub const Encoder = struct {
                     try self.u16le(placement.rect.width);
                     try self.u16le(placement.rect.height);
                     try self.u8le(if (placement.exited) 1 else 0);
+                    try self.u8le(if (placement.floating) 1 else 0);
+                    try self.u8le(placement.label);
                 }
             },
             .failure => |failure| {
@@ -565,6 +627,12 @@ pub const Decoder = struct {
                 .name = try self.name(),
                 .backwards = (try self.u8le()) != 0,
             } },
+            Tag.float => Request{ .float = .{ .name = try self.name() } },
+            Tag.dock => Request{ .dock = .{
+                .name = try self.name(),
+                .target = try self.u64le(),
+            } },
+            Tag.dock_cancel => Request{ .dock_cancel = .{ .name = try self.name() } },
             else => Error.UnknownTag,
         };
     }
@@ -605,6 +673,8 @@ pub const Decoder = struct {
                     const area_rows = try self.u16le();
                     const area_cols = try self.u16le();
                     const focused = try self.u64le();
+                    const focused_float = try self.u64le();
+                    const docking = (try self.u8le()) != 0;
                     const count = try self.u16le();
 
                     // The placements are decoded field by field into the caller's
@@ -624,6 +694,8 @@ pub const Decoder = struct {
                                 .height = try self.u16le(),
                             },
                             .exited = (try self.u8le()) != 0,
+                            .floating = (try self.u8le()) != 0,
+                            .label = try self.u8le(),
                         };
                     }
                     break :blk .{
@@ -631,6 +703,8 @@ pub const Decoder = struct {
                         .area_rows = area_rows,
                         .area_cols = area_cols,
                         .focused = focused,
+                        .focused_float = focused_float,
+                        .docking = docking,
                         .panes = self.placements[0..index],
                     };
                 },
@@ -676,9 +750,9 @@ test "a layout event round-trips with every pane's rectangle intact" {
     defer encoder.deinit();
 
     const placements = [_]PanePlacement{
-        .{ .id = 1, .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 }, .exited = false },
-        .{ .id = 2, .rect = .{ .x = 40, .y = 0, .width = 40, .height = 12 }, .exited = true },
-        .{ .id = 3, .rect = .{ .x = 40, .y = 12, .width = 40, .height = 12 }, .exited = false },
+        .{ .id = 1, .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 }, .exited = false, .floating = false, .label = 0 },
+        .{ .id = 2, .rect = .{ .x = 40, .y = 0, .width = 40, .height = 12 }, .exited = true, .floating = false, .label = 0 },
+        .{ .id = 3, .rect = .{ .x = 40, .y = 12, .width = 40, .height = 12 }, .exited = false, .floating = false, .label = 0 },
     };
 
     const frame = try encoder.writeEvent(.{ .layout = .{
@@ -686,6 +760,8 @@ test "a layout event round-trips with every pane's rectangle intact" {
         .area_rows = 24,
         .area_cols = 80,
         .focused = 3,
+        .focused_float = 0,
+        .docking = false,
         .panes = &placements,
     } });
 
@@ -723,6 +799,8 @@ test "a layout event with no panes round-trips" {
         .area_rows = 24,
         .area_cols = 80,
         .focused = 0,
+        .focused_float = 0,
+        .docking = false,
         .panes = &.{},
     } });
 
@@ -739,7 +817,7 @@ test "a truncated layout event is rejected rather than read past its end" {
     defer encoder.deinit();
 
     const placements = [_]PanePlacement{
-        .{ .id = 1, .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 }, .exited = false },
+        .{ .id = 1, .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 }, .exited = false, .floating = false, .label = 0 },
     };
 
     // Claim two placements but supply one, so the second read runs off the end.
@@ -748,18 +826,143 @@ test "a truncated layout event is rejected rather than read past its end" {
         .area_rows = 24,
         .area_cols = 80,
         .focused = 1,
+        .focused_float = 0,
+        .docking = false,
         .panes = &placements,
     } });
 
     var bytes = try gpa.dupe(u8, frame);
     defer gpa.free(bytes);
-    // The count is the last two bytes of the fixed part, just after the name and
-    // the three scalars.
-    const count_offset = 1 + 1 + 4 + 2 + 2 + 8;
+
+    // The pane count sits at the end of the layout's fixed part. Rather than hardcoding that
+    // length -- which silently rots the moment a field is added, as it did once already -- it is
+    // measured by walking the frame with a decoder.
+    const count_offset = try paneCountOffset(bytes);
     std.mem.writeInt(u16, bytes[count_offset..][0..2], 2, .little);
 
     var decoder = Decoder.init(bytes);
     try std.testing.expectError(Error.BadLength, decoder.event());
+}
+
+/// Where the pane count sits in an encoded layout event.
+///
+/// Found by walking the frame field by field, so that adding a field to the layout does not mean
+/// editing a magic number here.
+fn paneCountOffset(bytes: []const u8) !usize {
+    var decoder = Decoder.init(bytes);
+    _ = try decoder.tag();
+    decoder.offset = 1;
+    _ = try decoder.name();
+    _ = try decoder.u16le();
+    _ = try decoder.u16le();
+    _ = try decoder.u64le();
+    _ = try decoder.u64le();
+    _ = try decoder.u8le();
+    return decoder.offset;
+}
+
+test "a layout event carries floats and labels" {
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    // Two tiled panes and one floating above them, with the layout in dock-select mode so every
+    // tiled pane carries a label. This is the message with the most fields, and the one where a
+    // field-order mistake would show up as labels attached to the wrong panes.
+    const placements = [_]PanePlacement{
+        .{
+            .id = 10,
+            .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 },
+            .exited = false,
+            .floating = false,
+            .label = 1,
+        },
+        .{
+            .id = 11,
+            .rect = .{ .x = 40, .y = 0, .width = 40, .height = 24 },
+            .exited = false,
+            .floating = false,
+            .label = 2,
+        },
+        .{
+            .id = 12,
+            .rect = .{ .x = 20, .y = 5, .width = 40, .height = 12 },
+            .exited = true,
+            .floating = true,
+            .label = 0,
+        },
+    };
+
+    const frame = try encoder.writeEvent(.{ .layout = .{
+        .name = try Name.init("floats"),
+        .area_rows = 24,
+        .area_cols = 80,
+        .focused = 11,
+        .focused_float = 12,
+        .docking = true,
+        .panes = &placements,
+    } });
+
+    var decoder = Decoder.init(frame);
+    const event = try decoder.event();
+    try std.testing.expect(event.layout.name.eql("floats"));
+    try std.testing.expectEqual(@as(u64, 11), event.layout.focused);
+    try std.testing.expectEqual(@as(u64, 12), event.layout.focused_float);
+    try std.testing.expect(event.layout.docking);
+    try std.testing.expectEqual(@as(usize, 3), event.layout.panes.len);
+
+    for (placements, event.layout.panes) |expected, got| {
+        try std.testing.expectEqual(expected.id, got.id);
+        try std.testing.expectEqual(expected.floating, got.floating);
+        try std.testing.expectEqual(expected.label, got.label);
+        try std.testing.expectEqual(expected.exited, got.exited);
+        // A float's rectangle is absolute window cells and overlaps the tiled ones, so it has to
+        // survive the round trip exactly rather than being clipped to the area.
+        try std.testing.expectEqual(expected.rect.x, got.rect.x);
+        try std.testing.expectEqual(expected.rect.y, got.rect.y);
+        try std.testing.expectEqual(expected.rect.width, got.rect.width);
+        try std.testing.expectEqual(expected.rect.height, got.rect.height);
+    }
+}
+
+test "float, dock and dock-cancel requests round-trip" {
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const name = try Name.init("work");
+
+    {
+        const frame = try encoder.writeRequest(.{ .float = .{ .name = name } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expect(request.float.name.eql("work"));
+    }
+
+    {
+        // A target of zero means "start choosing", which must survive as zero rather than being
+        // mistaken for an unset field.
+        const frame = try encoder.writeRequest(.{ .dock = .{ .name = name, .target = 0 } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expectEqual(@as(u64, 0), request.dock.target);
+    }
+
+    {
+        const frame = try encoder.writeRequest(.{ .dock = .{ .name = name, .target = 7 } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expectEqual(@as(u64, 7), request.dock.target);
+    }
+
+    {
+        const frame = try encoder.writeRequest(.{ .dock_cancel = .{ .name = name } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expect(request.dock_cancel.name.eql("work"));
+    }
 }
 
 test "split, close and focus requests round-trip" {

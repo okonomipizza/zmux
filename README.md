@@ -17,7 +17,7 @@ and the TUI. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and
 
 ## Status
 
-Phases 0, 0.5, 1, 2, 3 and 4 of the roadmap are complete. Escape sequence handling
+Phases 0, 0.5, 1, 2, 3, 4 and 5 of the roadmap are complete. Escape sequence handling
 comes from libghostty-vt, the command line is parsed with
 [zig-clap](https://github.com/Hejsil/zig-clap), and there is a server that owns
 the sessions.
@@ -46,12 +46,20 @@ Inside an attached session the prefix key is `ctrl-a`:
 | `ctrl-a s` | split the focused pane side by side |
 | `ctrl-a v` | split it into stacked halves |
 | `ctrl-a q` | close the focused pane |
+| `ctrl-a f` | float the focused pane above the layout |
+| `ctrl-a d` | dock a floating pane back into the layout |
 | `ctrl-a h` / `k` | move focus to the previous pane |
 | `ctrl-a l` / `j` | move focus to the next pane |
 | `ctrl-a ctrl-a` | detach, leaving every pane running |
 
 Each pane is its own program on its own pty, so a split gives two shells side by
 side. A pane whose program exits keeps its last screen until the pane is closed.
+
+A floating pane is drawn above the layout, centred, and can be put back. Parking it
+does not touch its pty, so the program inside carries on without noticing, and the
+space it leaves is given to a neighbouring pane that grows into it. Docking asks
+which pane to split: the layout freezes, each tiled pane shows a number, and the
+number you press is divided along its longer side. Escape cancels.
 
 A session's pty and screen live in the server, so detaching costs the session
 nothing: the program keeps running while nothing is watching, and reattaching
@@ -73,7 +81,7 @@ is useful for inspecting what zmux makes of a byte stream:
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-Not yet built: floating panes, copy mode, and configuration. `zmux detach` outside
+Not yet built: copy mode and configuration. `zmux detach` outside
 an attached client reports that, because the prefix key is how a client detaches.
 See [ROADMAP.md](ROADMAP.md).
 
@@ -134,7 +142,7 @@ src/pty.zig         pty allocation, child spawning, raw fd I/O
 src/terminal.zig    the local terminal: raw mode, the screen renderer, and the
                     status line
 src/session.zig     the single-pane event loop from phase 1
-src/layout.zig      the pane tree: splits, ratios, and rectangle computation
+src/layout.zig      the pane tree: splits, ratios, rectangle computation, and parking
 src/socket.zig      unix sockets and length-prefixed message framing
 src/protocol.zig    the client/server message set and its encoding
 src/runtime.zig     where the socket lives, and starting a server on demand

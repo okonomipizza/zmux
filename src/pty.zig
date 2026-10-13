@@ -279,25 +279,45 @@ test "spawn a child on the pty and read its output" {
     defer pty.deinit();
     pty.setNonBlocking();
 
-    // Read until the slave closes. The child's output is only a few bytes, but
-    // the read may race with its exit, so poll a bounded number of times.
+    // Read until the slave closes, which is how a pty reports that the child is finished. The loop
+    // must not stop at the first empty read: a child that has already exited returns end of file,
+    // and one that has not yet written returns nothing, and the two are only told apart by
+    // continuing. Stopping at the first empty read is what made this test flaky.
     var collected: [256]u8 = undefined;
     var len: usize = 0;
+    var open = true;
     var attempts: usize = 0;
-    while (attempts < 10_000 and len == 0) : (attempts += 1) {
-        len = pty.read(&collected) catch |err| switch (err) {
-            Error.Closed => break,
+    while (open and attempts < 10_000) : (attempts += 1) {
+        const read = pty.read(collected[len..]) catch |err| switch (err) {
+            Error.Closed => {
+                open = false;
+                continue;
+            },
             else => return err,
         };
-        if (len == 0) sleepMillis(1);
+        if (read == 0) {
+            sleepMillis(1);
+            continue;
+        }
+        len += read;
+        if (len == collected.len) break;
     }
 
     try std.testing.expect(len > 0);
     try std.testing.expect(std.mem.indexOf(u8, collected[0..len], "pty works") != null);
 
-    const status = pty.reap() orelse return error.TestChildNotReaped;
-    try std.testing.expectEqual(@as(u8, 0), status.code);
-    try std.testing.expect(!status.signaled);
+    // The child's output can arrive before it has been collected, so the reap is retried rather
+    // than treated as a failure at the first look.
+    var status: ?ExitStatus = null;
+    attempts = 0;
+    while (status == null and attempts < 10_000) : (attempts += 1) {
+        status = pty.reap();
+        if (status == null) sleepMillis(1);
+    }
+
+    const reaped = status orelse return error.TestChildNotReaped;
+    try std.testing.expectEqual(@as(u8, 0), reaped.code);
+    try std.testing.expect(!reaped.signaled);
 }
 
 test "a child runs when the parent is a session leader without a terminal" {

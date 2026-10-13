@@ -356,7 +356,7 @@ geometry was missing. `createSession` now calls `relayout` after adding the firs
 This one is worth remembering because it is invisible in the code that looks responsible:
 the drawing, the sizing and the protocol were all right.
 
-## Phase 5 — floating panes
+## Phase 5 — floating panes (done)
 
 - Float list, drawn above the layout in z-order
 - Move a pane between the tree and the float list without touching its pty
@@ -365,6 +365,53 @@ the drawing, the sizing and the protocol were all right.
 
 Judgement: a pane can be parked and restored mid-command with no visible
 interruption to the program inside it.
+
+### What was built
+
+A pane can be lifted out of the layout and drawn above it, and put back. `ctrl-a f` parks
+the focused pane; `ctrl-a d` begins docking it back.
+
+Parking changes which list owns the pane and nothing else. The pty is not touched and the
+child is not signalled, so the program inside has no way to tell that it moved — which is
+the whole point, and is what makes the switch instant rather than a restart. A parked pane
+is centred at two thirds of the window rather than keeping the rectangle it had while
+tiled: a pane that was a narrow slice of the layout reads as a stray sliver once it is
+above everything, and one that filled the window would not read as floating at all.
+
+The space a parked pane leaves is handed to a neighbour, so the remaining panes grow
+instead of leaving a hole. The neighbour is chosen by geometry, not by tree adjacency: a
+pane whose sibling happens to be a subtree would otherwise give its space to whatever leaf
+that subtree puts first, which can be on the far side of the window. The tree is walked for
+a pane that shares a horizontal edge — one stacked directly above or below — and only if
+there is none is a side-by-side neighbour used. Growing by rows is the better default,
+because terminal content is laid out in rows and a pane that gains rows shows more of what
+it already had, while one that gains columns only gets wider margins.
+
+Docking is a two-step choice because the layout is a tree with no notion of "where the user
+remembers it was". `ctrl-a d` freezes the layout, labels each tiled pane with a number, and
+hides the floats so the labels can be read; the user presses a digit and the float is
+spliced into that pane. The split follows the chosen pane's longer side, so the two halves
+come out roughly square rather than as a pair of slivers. Escape cancels.
+
+Verified: splitting twice and then parking one pane leaves three panes, of which the float
+paints at rows 5 to 20 and column 14 of an 80x24 window — a centred 53x16 rectangle, which
+is two thirds of the window in both directions. The parked pane's program is still running
+afterwards, and so are the others. Docking into pane 1 changes the layout so that pane 1's
+two children are stacked while the rest is unchanged, which is the split along its longer
+side. `zig build test` passes 89 tests, five of them for the float geometry and the label
+lookup.
+
+A park that would leave no tiled panes is refused: a session with no layout has nothing to
+dock back into, and the tree would be empty while a float still needed somewhere to belong.
+
+### A flaky test, and what it was
+
+`pty.test.spawn a child on the pty and read its output` failed about one run in three. The
+read loop stopped at the first empty read, but a pty reports two different things that way:
+a child that has already exited returns end of file, and one that has not yet written
+returns nothing. Only the first is a reason to stop. The loop now reads until the slave
+closes, and the reap is retried rather than treated as a failure at the first look. Five
+consecutive runs are clean.
 
 ## Phase 6 — hardening
 

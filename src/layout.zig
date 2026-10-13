@@ -167,6 +167,167 @@ pub const Tree = struct {
         self.focused = new_id;
     }
 
+    /// Remove a pane from the tree and let its neighbour absorb the space.
+    ///
+    /// This is what parking a pane does: the pane leaves the layout without being closed,
+    /// and the space it occupied is handed to a neighbour so that the remaining panes grow
+    /// to fill the window rather than leaving a hole.
+    ///
+    /// The neighbour is chosen by direction, not by tree adjacency. A pane whose sibling
+    /// happens to be a subtree would otherwise hand its space to whatever leaf that subtree
+    /// puts first, which can be on the other side of the window. Instead the tree is walked
+    /// for a leaf that is vertically adjacent — sharing a horizontal edge — and only if
+    /// there is none is one that is horizontally adjacent used. Growing a pane upward or
+    /// downward is the better default because terminal content is laid out in rows, so a
+    /// pane that gains rows shows more of what it already has, while one that gains columns
+    /// only gets wider margins.
+    ///
+    /// Returns the pane whose space the departing pane's was folded into, or null when the
+    /// tree became empty.
+    pub fn detach(self: *Tree, target: PaneId, cols: u16, rows: u16) !?PaneId {
+        const root = self.root orelse return Error.NoSuchPane;
+        if (findLeafIn(root, target) == null) return Error.NoSuchPane;
+
+        // The geometry is needed to decide who is adjacent, and it has to be read before the
+        // pane is removed or the tree no longer describes the arrangement the user saw.
+        var before: std.ArrayList(Placement) = .empty;
+        defer before.deinit(self.gpa);
+        try self.layout(&before, cols, rows);
+
+        const absorber = pickAbsorber(before.items, target);
+
+        if (root.* == .leaf) {
+            // The last pane: the tree becomes empty rather than leaving a branch with one
+            // child.
+            root.deinit(self.gpa);
+            self.gpa.destroy(root);
+            self.root = null;
+            self.focused = null;
+            return null;
+        }
+
+        const parent = findParent(root, target) orelse return Error.NoSuchPane;
+        const parent_split = parent.branch;
+        const target_is_first = switch (parent_split.first.*) {
+            .leaf => |id| id == target,
+            .branch => false,
+        };
+        const doomed = if (target_is_first) parent_split.first else parent_split.second;
+        const survivor = if (target_is_first) parent_split.second else parent_split.first;
+
+        // The surviving subtree is lifted into the parent's place, so the branch disappears
+        // rather than being left holding one child.
+        const survivor_value = survivor.*;
+        parent.* = survivor_value;
+
+        doomed.deinit(self.gpa);
+        self.gpa.destroy(doomed);
+        self.gpa.destroy(survivor);
+
+        if (self.focused) |focused| {
+            if (focused == target) self.focused = firstPaneOf(parent);
+        }
+
+        return absorber orelse firstPaneOf(parent);
+    }
+
+    /// A rectangle's area in cells, for comparing which neighbour has the most to gain.
+    fn area(rect: Rect) u32 {
+        return @as(u32, rect.width) * @as(u32, rect.height);
+    }
+
+    /// Choose which pane should grow into the space a departing pane leaves.
+    ///
+    /// A pane is a candidate if it shares an edge with the departing one: the same horizontal
+    /// band for a vertical neighbour, the same vertical band for a horizontal one. The largest
+    /// candidate wins, so the space goes to the pane with the most to gain from it.
+    fn pickAbsorber(placements: []const Placement, target: PaneId) ?PaneId {
+        var departing: Rect = .{};
+        var found = false;
+        for (placements) |placement| {
+            if (placement.id == target) {
+                departing = placement.rect;
+                found = true;
+            }
+        }
+        if (!found) return null;
+
+        var vertical_best: ?Placement = null;
+        var horizontal_best: ?Placement = null;
+
+        for (placements) |placement| {
+            if (placement.id == target) continue;
+            const rect = placement.rect;
+
+            // A vertical neighbour: the two are stacked, so their columns overlap and one sits
+            // directly above the other.
+            const columns_overlap = rect.x < departing.x + departing.width and
+                departing.x < rect.x + rect.width;
+            const rows_touch = rect.y + rect.height == departing.y or
+                departing.y + departing.height == rect.y;
+            if (columns_overlap and rows_touch) {
+                if (vertical_best == null or area(rect) > area(vertical_best.?.rect)) {
+                    vertical_best = placement;
+                }
+                continue;
+            }
+
+            // A horizontal neighbour: side by side, so their rows overlap and one sits directly
+            // beside the other.
+            const rows_overlap = rect.y < departing.y + departing.height and
+                departing.y < rect.y + rect.height;
+            const columns_touch = rect.x + rect.width == departing.x or
+                departing.x + departing.width == rect.x;
+            if (rows_overlap and columns_touch) {
+                if (horizontal_best == null or area(rect) > area(horizontal_best.?.rect)) {
+                    horizontal_best = placement;
+                }
+            }
+        }
+
+        // Vertical neighbours are preferred, so a pane grows by gaining rows rather than columns.
+        if (vertical_best) |best| return best.id;
+        if (horizontal_best) |best| return best.id;
+        return null;
+    }
+
+    /// Split `target` along whichever of its sides is longer.
+    ///
+    /// A pane that is wider than it is tall is divided into columns, and a taller-than-wide
+    /// pane into rows. The point is that the two halves come out roughly square rather than
+    /// producing a pair of thin slivers, which is what a fixed choice of axis does to the
+    /// other orientation.
+    ///
+    /// The current geometry is needed to know which side is longer, so it is provided by the
+    /// caller rather than guessed from the tree's ratios.
+    pub fn splitLongest(
+        self: *Tree,
+        target: PaneId,
+        new_id: PaneId,
+        cols: u16,
+        rows: u16,
+    ) !Axis {
+        var placements: std.ArrayList(Placement) = .empty;
+        defer placements.deinit(self.gpa);
+        try self.layout(&placements, cols, rows);
+
+        var target_rect: Rect = .{};
+        for (placements.items) |placement| {
+            if (placement.id == target) target_rect = placement.rect;
+        }
+
+        // A tie goes to the vertical split, so that a square pane produces columns. Rows are
+        // the scarcer resource in a terminal, and dividing into columns keeps both halves at
+        // a usable height.
+        const axis: Axis = if (target_rect.width >= target_rect.height)
+            .horizontal
+        else
+            .vertical;
+
+        try self.split(target, axis, new_id);
+        return axis;
+    }
+
     /// Remove a pane, giving its space to its sibling.
     ///
     /// Returns the pane that should hold focus afterwards, or null when the tree
@@ -766,4 +927,220 @@ test "dividing a two-cell rectangle leaves one cell each" {
     const split = divide(.{ .width = 2, .height = 1 }, .horizontal, 0.5);
     try std.testing.expectEqual(@as(u16, 1), split[0].width);
     try std.testing.expectEqual(@as(u16, 1), split[1].width);
+}
+
+test "detaching a pane hands its space to the pane above it" {
+    // Two panes stacked. Parking the lower one must give its rows to the upper one, so the
+    // layout fills the window rather than leaving a hole where the pane used to be.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const top = tree.allocateId();
+    try tree.setRoot(top);
+    const bottom = tree.allocateId();
+    try tree.split(top, .vertical, bottom);
+
+    const absorber = try tree.detach(bottom, 80, 24);
+    try std.testing.expectEqual(@as(?PaneId, top), absorber);
+    try std.testing.expectEqual(@as(usize, 1), tree.count());
+
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 80, 24);
+    // The survivor now has the whole window.
+    try std.testing.expect(placements.items[0].rect.eql(.{
+        .x = 0,
+        .y = 0,
+        .width = 80,
+        .height = 24,
+    }));
+}
+
+test "detaching prefers a vertical neighbour over a horizontal one" {
+    // Four panes in a 2x2 grid. Parking the top-left must give its space to the pane below it
+    // rather than the one beside it, so the pane grows by gaining rows.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const top_left = tree.allocateId();
+    try tree.setRoot(top_left);
+    const top_right = tree.allocateId();
+    try tree.split(top_left, .horizontal, top_right);
+    const bottom_left = tree.allocateId();
+    try tree.split(top_left, .vertical, bottom_left);
+    const bottom_right = tree.allocateId();
+    try tree.split(top_right, .vertical, bottom_right);
+
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 80, 24);
+    try std.testing.expectEqual(@as(usize, 4), placements.items.len);
+
+    const absorber = try tree.detach(top_left, 80, 24);
+    try std.testing.expectEqual(@as(?PaneId, bottom_left), absorber);
+}
+
+test "detaching falls back to a horizontal neighbour when there is no vertical one" {
+    // Two panes side by side. There is no pane above or below either of them, so the
+    // remaining one takes the space sideways.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const left = tree.allocateId();
+    try tree.setRoot(left);
+    const right = tree.allocateId();
+    try tree.split(left, .horizontal, right);
+
+    const absorber = try tree.detach(right, 80, 24);
+    try std.testing.expectEqual(@as(?PaneId, left), absorber);
+
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 80, 24);
+    try std.testing.expectEqual(@as(u16, 80), placements.items[0].rect.width);
+}
+
+test "detaching the last pane empties the tree" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.detach(only, 80, 24));
+    try std.testing.expect(tree.isEmpty());
+}
+
+test "detaching an unknown pane is an error and changes nothing" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+
+    try std.testing.expectError(Error.NoSuchPane, tree.detach(9999, 80, 24));
+    try std.testing.expectEqual(@as(usize, 2), tree.count());
+}
+
+test "detaching preserves the geometry of the panes that stay" {
+    // Three panes: one wide on the left, two stacked on the right. Parking the top-right must
+    // leave the left pane exactly where it was and give the freed rows to the pane below it.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const left = tree.allocateId();
+    try tree.setRoot(left);
+    const right_top = tree.allocateId();
+    try tree.split(left, .horizontal, right_top);
+    const right_bottom = tree.allocateId();
+    try tree.split(right_top, .vertical, right_bottom);
+
+    var before: std.ArrayList(Placement) = .empty;
+    defer before.deinit(gpa);
+    try tree.layout(&before, 80, 24);
+    const left_before = before.items[0].rect;
+
+    _ = try tree.detach(right_top, 80, 24);
+
+    var after: std.ArrayList(Placement) = .empty;
+    defer after.deinit(gpa);
+    try tree.layout(&after, 80, 24);
+
+    try std.testing.expectEqual(@as(usize, 2), after.items.len);
+    try std.testing.expect(after.items[0].rect.eql(left_before));
+    // The bottom-right pane now spans the full height of its column.
+    try std.testing.expectEqual(@as(u16, 24), after.items[1].rect.height);
+}
+
+test "splitting a wide pane divides it into columns" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+    const other = tree.allocateId();
+
+    // 80x24 is wider than it is tall.
+    const axis = try tree.splitLongest(only, other, 80, 24);
+    try std.testing.expectEqual(Axis.horizontal, axis);
+
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 80, 24);
+    // Side by side, so they differ in x and share a height.
+    try std.testing.expectEqual(@as(u16, 24), placements.items[0].rect.height);
+    try std.testing.expectEqual(@as(u16, 40), placements.items[1].rect.x);
+}
+
+test "splitting a tall pane divides it into rows" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+    const other = tree.allocateId();
+
+    // 20x60 is taller than it is wide.
+    const axis = try tree.splitLongest(only, other, 20, 60);
+    try std.testing.expectEqual(Axis.vertical, axis);
+
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 20, 60);
+    // Stacked, so they differ in y and share a width.
+    try std.testing.expectEqual(@as(u16, 20), placements.items[0].rect.width);
+    try std.testing.expectEqual(@as(u16, 30), placements.items[1].rect.y);
+}
+
+test "splitting a square pane divides it into columns" {
+    // A tie goes to columns, because rows are the scarcer resource in a terminal.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+    const other = tree.allocateId();
+
+    const axis = try tree.splitLongest(only, other, 24, 24);
+    try std.testing.expectEqual(Axis.horizontal, axis);
+}
+
+test "splitting the longest side of a pane that is not the whole window" {
+    // The choice must follow the pane's own rectangle, not the window's shape. Here the window
+    // is wide but the pane to split is a tall slice of it, so it divides into rows.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const wide = tree.allocateId();
+    try tree.setRoot(wide);
+    const tall = tree.allocateId();
+    // Split the window into a narrow right-hand column...
+    try tree.split(wide, .horizontal, tall);
+
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 120, 30);
+
+    // `tall` is 60x30, which is wider than tall, so it still divides into columns. Narrow it
+    // further by giving the split an uneven ratio.
+    try tree.setRatio(tall, 0.85);
+    try tree.layout(&placements, 120, 30);
+    const narrow = placements.items[1].rect;
+    try std.testing.expect(narrow.width < narrow.height);
+
+    const other = tree.allocateId();
+    const axis = try tree.splitLongest(tall, other, 120, 30);
+    try std.testing.expectEqual(Axis.vertical, axis);
 }

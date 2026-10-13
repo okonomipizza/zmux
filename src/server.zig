@@ -158,6 +158,19 @@ const Session = struct {
     panes: std.ArrayList(Pane) = .empty,
     /// Which pane is where. Kept in step with `panes` on every split and close.
     tree: layout.Tree,
+    /// Panes that have been lifted out of the layout and are drawn above it.
+    ///
+    /// Order is z-order, last on top. A float is the same `Pane` as a tiled one: parking changes
+    /// which list owns it and nothing else, so its pty and its screen are untouched and the
+    /// program inside never notices the move.
+    floats: std.ArrayList(layout.PaneId) = .empty,
+    /// The float that is raised, or null when none is.
+    focused_float: ?layout.PaneId = null,
+    /// Set while the user is choosing which tiled pane to dock a float into.
+    ///
+    /// While this is set the layout is frozen: tiled panes carry labels and the floats are not
+    /// drawn, so the labels are readable.
+    docking: bool = false,
     /// Clients attached to this session, as indices into `Server.clients`.
     watchers: std.ArrayList(usize) = .empty,
     /// The area the panes share, which is what the client gave this session. Zero until
@@ -178,6 +191,7 @@ const Session = struct {
         for (self.panes.items) |*pane| pane.deinit(gpa);
         self.panes.deinit(gpa);
         self.tree.deinit();
+        self.floats.deinit(gpa);
         self.watchers.deinit(gpa);
         self.placements.deinit(gpa);
     }
@@ -692,6 +706,23 @@ pub const Server = struct {
                 }
                 try self.sendLayout(session);
             },
+            .float => |float| {
+                const index = self.findSession(float.name.slice()) orelse
+                    return Error.UnknownSession;
+                try self.floatFocusedPane(index);
+            },
+            .dock => |dock| {
+                const index = self.findSession(dock.name.slice()) orelse
+                    return Error.UnknownSession;
+                try self.dockFloat(index, dock.target);
+            },
+            .dock_cancel => |cancel| {
+                const index = self.findSession(cancel.name.slice()) orelse
+                    return Error.UnknownSession;
+                const session = &self.sessions.items[index];
+                session.docking = false;
+                try self.sendLayout(session);
+            },
         }
     }
 
@@ -715,7 +746,111 @@ pub const Server = struct {
         try self.sendEvent(client, .list_end);
     }
 
-    /// Split the focused pane, starting `program` in the new half.
+    /// Lift the focused pane out of the layout and above it.
+    ///
+    /// The pane keeps its pty and its screen; only the list that owns it changes, which is what
+    /// makes the move invisible to the program inside. The tree hands the vacated space to a
+    /// neighbour, so the remaining panes grow rather than leaving a hole.
+    fn floatFocusedPane(self: *Server, index: usize) !void {
+        const session = &self.sessions.items[index];
+        const pane_index = session.focusedPane() orelse return;
+        const id = session.panes.items[pane_index].id;
+
+        // The last tiled pane cannot be parked: a session with no layout has nothing to dock back
+        // into, and the tree would be left empty while a float still needed somewhere to belong.
+        if (session.tree.count() <= 1) return;
+
+        _ = session.tree.detach(id, session.cols, session.rows) catch return;
+        try session.floats.append(self.gpa, id);
+
+        // Centred at a default size, so a float reads as floating rather than as a pane that
+        // happens to be on top.
+        const rect = floatRect(session.cols, session.rows);
+        const pane = &session.panes.items[pane_index];
+        pane.rect = rect;
+
+        // The pane's own terminal is resized to its new rectangle, so the program inside reflows
+        // to the size it is actually drawn at.
+        if (pane.size()) |size| {
+            pane.pty.setWindowSize(size) catch {};
+            pane.terminal.resize(size.cols, size.rows, 0, 0) catch {};
+        }
+
+        session.focused_float = id;
+        session.docking = false;
+
+        // The tiled panes changed shape, so their ptys are resized too.
+        try session.relayout();
+
+        try self.sendLayout(session);
+        for (session.watchers.items) |client| {
+            try self.sendSessionScreens(session, client);
+        }
+    }
+
+    /// Put a floating pane back into the layout, splitting a chosen tiled pane.
+    ///
+    /// With no target this begins choosing one, which freezes the layout and labels the tiled
+    /// panes. The float is split into the chosen pane along that pane's longer side, so the two
+    /// halves come out roughly square rather than as slivers.
+    fn dockFloat(self: *Server, index: usize, target: u64) !void {
+        const session = &self.sessions.items[index];
+        const float_id = session.focused_float orelse return;
+        // The pane must exist even when a target is still being chosen, so that a stale
+        // `focused_float` naming a closed pane does not put the session into a mode it cannot
+        // leave.
+        if (session.findPane(float_id) == null) return;
+
+        if (target == 0) {
+            // Begin choosing. The float stays where it is; only the display changes.
+            session.docking = true;
+            try self.sendLayout(session);
+            return;
+        }
+
+        const target_index = session.findPane(@intCast(target)) orelse {
+            // A target that is not a tiled pane is refused rather than guessed at, and the choice
+            // stays open so the user can pick again.
+            return;
+        };
+        if (isFloating(session, @intCast(target))) return;
+
+        const target_id = session.panes.items[target_index].id;
+
+        // The pane leaves the float list before the tree learns about it, so that a failure to
+        // split cannot leave it owned by both.
+        for (session.floats.items, 0..) |float, position| {
+            if (float == float_id) {
+                _ = session.floats.swapRemove(position);
+                break;
+            }
+        }
+        session.focused_float = null;
+        session.docking = false;
+
+        _ = session.tree.splitLongest(
+            target_id,
+            float_id,
+            session.cols,
+            session.rows,
+        ) catch {
+            // The split failed, so the pane goes back to floating rather than vanishing from both
+            // lists.
+            try session.floats.append(self.gpa, float_id);
+            session.focused_float = float_id;
+            return;
+        };
+
+        // The tiled panes now divide the window differently, which resizes the docked pane along
+        // with the rest.
+        try session.relayout();
+
+        try self.sendLayout(session);
+        for (session.watchers.items) |client| {
+            try self.sendSessionScreens(session, client);
+        }
+    }
+
     ///
     /// The new pane is created before the tree is told about it, so that a failure to
     /// start the program leaves the layout as it was rather than a tree naming a pane
@@ -760,13 +895,25 @@ pub const Server = struct {
     }
 
     /// Tell every watcher where the panes are and which one has focus.
+    /// Tell every watcher where the panes are, which one has focus, and whether a dock target is
+    /// being chosen.
+    ///
+    /// Tiled panes come first and floating ones after, because the order of the list is the
+    /// z-order and a float is drawn above the layout. While a dock target is being chosen the
+    /// floats are left out entirely: the choice is about the layout underneath them, and a float
+    /// covering it would hide the labels the user is reading.
     fn sendLayout(self: *Server, session: *Session) !void {
-        // The layout event borrows the placements list, so it is encoded and queued
-        // before `relayout` runs again and rewrites it.
         var placements: [protocol.Decoder.max_panes]protocol.PanePlacement = undefined;
         var count: usize = 0;
+
+        // Labels are assigned in list order, so that the number the user types is the position the
+        // pane occupies in the layout event. They are only meaningful in dock-select mode.
+        var label: u8 = 0;
+
         for (session.panes.items) |pane| {
             if (count == placements.len) break;
+            if (isFloating(session, pane.id)) continue;
+            label += 1;
             placements[count] = .{
                 .id = pane.id,
                 .rect = .{
@@ -776,8 +923,31 @@ pub const Server = struct {
                     .height = pane.rect.height,
                 },
                 .exited = pane.exited,
+                .floating = false,
+                .label = if (session.docking) label else 0,
             };
             count += 1;
+        }
+
+        if (!session.docking) {
+            for (session.floats.items) |float_id| {
+                if (count == placements.len) break;
+                const index = session.findPane(float_id) orelse continue;
+                const pane = &session.panes.items[index];
+                placements[count] = .{
+                    .id = pane.id,
+                    .rect = .{
+                        .x = pane.rect.x,
+                        .y = pane.rect.y,
+                        .width = pane.rect.width,
+                        .height = pane.rect.height,
+                    },
+                    .exited = pane.exited,
+                    .floating = true,
+                    .label = 0,
+                };
+                count += 1;
+            }
         }
 
         try self.broadcast(session, .{ .layout = .{
@@ -785,6 +955,8 @@ pub const Server = struct {
             .area_rows = session.rows,
             .area_cols = session.cols,
             .focused = session.tree.focused orelse 0,
+            .focused_float = session.focused_float orelse 0,
+            .docking = session.docking,
             .panes = placements[0..count],
         } });
     }
@@ -1205,6 +1377,37 @@ fn exitStatusOf(session: *Session) u8 {
     return last;
 }
 
+/// Whether a pane is currently floating.
+fn isFloating(session: *Session, id: layout.PaneId) bool {
+    for (session.floats.items) |float| {
+        if (float == id) return true;
+    }
+    return false;
+}
+
+/// The default size of a floating pane, derived from the window it appears in.
+///
+/// A float is centred rather than keeping the rectangle it had while tiled: a pane that was a
+/// narrow slice of the layout would look like a stray sliver once it was above everything, and a
+/// float that filled the window would not read as floating at all. Two thirds of the window, with
+/// a floor so that a tiny float is still usable.
+fn floatRect(window_cols: u16, window_rows: u16) layout.Rect {
+    const cols = @max(@as(u32, window_cols) * 2 / 3, 20);
+    const rows = @max(@as(u32, window_rows) * 2 / 3, 6);
+
+    // Clamped to the window, so that a float larger than the window it appears in is not placed
+    // partly off-screen.
+    const width: u16 = @intCast(@min(cols, @max(window_cols, 1)));
+    const height: u16 = @intCast(@min(rows, @max(window_rows, 1)));
+
+    return .{
+        .x = (window_cols - width) / 2,
+        .y = (window_rows - height) / 2,
+        .width = width,
+        .height = height,
+    };
+}
+
 /// The size of a whole session area, for the first pane in it.
 fn fullArea(rows: u16, cols: u16) pty_mod.Size {
     return .{ .rows = rows, .cols = cols };
@@ -1299,4 +1502,42 @@ test "a session name round trips through the protocol" {
     try std.testing.expect(name.eql("work"));
     try std.testing.expect(!name.eql("other"));
     try std.testing.expectError(protocol.Error.BadValue, protocol.Name.init("a/b"));
+}
+
+test "an unset float is centred and does not fill the window" {
+    // A float that filled the window would not read as floating, and one pinned to a corner would
+    // read as a tiled pane. Two thirds, centred.
+    const rect = floatRect(80, 24);
+    try std.testing.expectEqual(@as(u16, 53), rect.width);
+    try std.testing.expectEqual(@as(u16, 16), rect.height);
+    try std.testing.expectEqual(@as(u16, 13), rect.x);
+    try std.testing.expectEqual(@as(u16, 4), rect.y);
+
+    // Centred means the margins on either side are within one cell of each other: an odd
+    // difference cannot be split exactly, so one side gets the extra cell. The comparison is signed
+    // because the left margin can legitimately be the smaller of the two, and subtracting unsigned
+    // would wrap.
+    const right_margin: i32 = @as(i32, 80) - (@as(i32, rect.x) + @as(i32, rect.width));
+    const difference = @as(i32, rect.x) - right_margin;
+    try std.testing.expect(difference <= 1 and difference >= -1);
+}
+
+test "a float smaller than the window stays inside it" {
+    // A window too small for two thirds to be usable gets the floor size, which must then be
+    // clamped rather than placed off-screen.
+    const rect = floatRect(10, 3);
+    try std.testing.expect(rect.width <= 10);
+    try std.testing.expect(rect.height <= 3);
+    try std.testing.expect(rect.x + rect.width <= 10);
+    try std.testing.expect(rect.y + rect.height <= 3);
+}
+
+test "a float never occupies no cells at all" {
+    // A zero-sized rectangle would be skipped by the client and the pane would vanish. The window
+    // may be tiny, but the float still has to be somewhere.
+    const rect = floatRect(1, 1);
+    try std.testing.expect(rect.width >= 1);
+    try std.testing.expect(rect.height >= 1);
+    try std.testing.expectEqual(@as(u16, 0), rect.x);
+    try std.testing.expectEqual(@as(u16, 0), rect.y);
 }
