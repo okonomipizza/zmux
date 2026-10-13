@@ -23,21 +23,26 @@ comes from libghostty-vt, the command line is parsed with
 the sessions.
 
 ```sh
-# Start a session and attach to it. With no program, starts $SHELL.
-zmux run
-zmux run htop
+# Enter a session, creating it if it is not running yet. This is the usual way in:
+# `attach work` runs $SHELL under the name "work".
+zmux attach work
+zmux attach default
 
-# Start one without attaching.
+# Start a session running a particular program instead of a shell.
+zmux run htop
 zmux run -d -n build -- make
 
 # See what is running.
 zmux ls
 # build: 80x24, 1 client(s), pid 4321, running
 
-zmux attach build   # ctrl-a detaches, leaving the program running
 zmux kill build
 zmux kill-all
 ```
+
+`attach <name>` never starts a program: it gives you a shell under that name. Use
+`run` when you want a specific program, and `run -d -n <name>` to start one
+without attaching.
 
 Inside an attached session the prefix key is `ctrl-a`:
 

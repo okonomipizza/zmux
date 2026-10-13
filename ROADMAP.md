@@ -266,6 +266,29 @@ while nothing was watching, `ctrl-a` detaches without ending it, and `kill`,
 pass of the loop, which needs no signal plumbing and cannot miss a child, because
 the pty's readability already wakes the loop when the child dies.
 
+### What `attach`, `run` and the session name mean
+
+These were settled after the phase, because the first version was confusing in a way
+that only showed up in use.
+
+`attach <name>` attaches to a session, **creating it if it does not exist**, running
+`$SHELL`. It never starts a program of its own. That makes naming a session the whole
+of the interface for reaching it: `zmux attach work` puts you in a shell called
+`work`, whether or not it was already running.
+
+`run [program]` starts a session running a particular program and attaches to it. The
+session name is generated unless `-n` is given, and is printed for that reason.
+
+The earlier version had `attach` fail on an unknown session and `run` take a program
+as its first positional, which meant `run work` tried to execute a program called
+`work`, failed to find it, and left a pane whose program had already exited. The
+symptoms were "the shell prompt never appears" and a session name the user did not
+recognise. Nothing about that is a bug in the code; it is a command whose meaning was
+not what a user would assume, and the assumption is the right one.
+
+A missing program still fails silently, which is a separate gap: the child exits and
+the pane keeps a blank screen with nothing saying why.
+
 ### Two bugs this phase found
 
 **Opening the pty slave without `O_NOCTTY` steals the caller's controlling

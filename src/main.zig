@@ -172,7 +172,7 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\
         \\Commands:
         \\  ls              List sessions
-        \\  attach <name>   Attach to a session, opening the TUI
+        \\  attach <name>   Attach to a session, creating it if it does not exist
         \\  detach          Detach the current client from its session
         \\  kill <session>  Terminate a session
         \\  kill-all        Terminate every session
@@ -186,6 +186,9 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\Run options:
         \\  -d, --detached  Start the session without attaching to it
         \\  -n, --name <name>  Name the session instead of generating one
+        \\
+        \\Attaching to a session that does not exist starts one running $SHELL.
+        \\Use run to start a session running a particular program.
         \\
     );
 }

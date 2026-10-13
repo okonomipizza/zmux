@@ -681,8 +681,18 @@ pub const Server = struct {
                 try self.attachClient(client, index, create.rows, create.cols);
             },
             .attach => |attach| {
-                const index = self.findSession(attach.name.slice()) orelse
-                    return Error.UnknownSession;
+                // Attaching to a session that does not exist creates it, running the server's own
+                // shell. That makes `attach <name>` the way to reach a session by name without caring
+                // whether it is already running, which is what a user typing a session name means: they
+                // want to be in it, not to be told it does not exist.
+                const index = self.findSession(attach.name.slice()) orelse created: {
+                    break :created try self.createSession(.{
+                        .name = attach.name.slice(),
+                        .rows = attach.rows,
+                        .cols = attach.cols,
+                        .argv = &.{},
+                    });
+                };
                 try self.attachClient(client, index, attach.rows, attach.cols);
             },
             .detach => |detach| {
