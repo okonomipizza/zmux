@@ -484,7 +484,7 @@ the focused pane; `ctrl-a d` begins docking it back.
 Parking changes which list owns the pane and nothing else. The pty is not touched and the
 child is not signalled, so the program inside has no way to tell that it moved — which is
 the whole point, and is what makes the switch instant rather than a restart. A parked pane
-is centred at two thirds of the window rather than keeping the rectangle it had while
+is centred at three quarters of the window rather than keeping the rectangle it had while
 tiled: a pane that was a narrow slice of the layout reads as a stray sliver once it is
 above everything, and one that filled the window would not read as floating at all.
 

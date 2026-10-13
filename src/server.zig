@@ -1837,15 +1837,26 @@ fn isFloating(session: *Session, id: layout.PaneId) bool {
     return false;
 }
 
-/// The default size of a floating pane, derived from the window it appears in.
+/// The rectangle a floating pane occupies: three quarters of the area, centred.
 ///
-/// A float is centred rather than keeping the rectangle it had while tiled: a pane that was a
-/// narrow slice of the layout would look like a stray sliver once it was above everything, and a
-/// float that filled the window would not read as floating at all. Two thirds of the window, with
-/// a floor so that a tiny float is still usable.
+/// A float is centred rather than keeping the rectangle it had while tiled: a pane that was a narrow
+/// slice of the layout would look like a stray sliver once it was above everything.
+///
+/// Three quarters rather than two thirds because a float is where a program is consulted rather
+/// than glanced at. At the old size an 80-column window gave it 51 usable columns, which is narrow
+/// for `ls` in columns or a `git log`; three quarters gives 58, and still leaves a ring of the
+/// layout visible on every side, which is what makes a float read as floating rather than as having
+/// replaced the screen.
+///
+/// There is no upper bound: the size is a fraction of the window at every size, so a float on a
+/// large window is large. A cap would make the size depend on two things rather than one, and the
+/// one it stopped depending on would be the screen the user is looking at.
+///
+/// The floor is what keeps a float usable on a window too small to divide: below about thirty
+/// columns the floor wins over the fraction, so a float is never a sliver.
 fn floatRect(window_cols: u16, window_rows: u16) layout.Rect {
-    const cols = @max(@as(u32, window_cols) * 2 / 3, 20);
-    const rows = @max(@as(u32, window_rows) * 2 / 3, 6);
+    const cols = @max(@as(u32, window_cols) * 3 / 4, 20);
+    const rows = @max(@as(u32, window_rows) * 3 / 4, 6);
 
     // Clamped to the window, so that a float larger than the window it appears in is not placed
     // partly off-screen.
@@ -2004,12 +2015,27 @@ test "a session name round trips through the protocol" {
 
 test "an unset float is centred and does not fill the window" {
     // A float that filled the window would not read as floating, and one pinned to a corner would
-    // read as a tiled pane. Two thirds, centred.
+    // read as a tiled pane. Three quarters, centred.
+    //
+    // The figures are stated rather than derived from the fraction, because the value of the test is
+    // in the numbers a user sees: an 80-column window gives the float's program 58 usable columns,
+    // which is what the size was changed for. A test that recomputed three quarters would pass at
+    // any fraction and catch nothing.
     const rect = floatRect(80, 24);
-    try std.testing.expectEqual(@as(u16, 53), rect.width);
-    try std.testing.expectEqual(@as(u16, 16), rect.height);
-    try std.testing.expectEqual(@as(u16, 13), rect.x);
-    try std.testing.expectEqual(@as(u16, 4), rect.y);
+    try std.testing.expectEqual(@as(u16, 60), rect.width);
+    try std.testing.expectEqual(@as(u16, 18), rect.height);
+    try std.testing.expectEqual(@as(u16, 10), rect.x);
+    try std.testing.expectEqual(@as(u16, 3), rect.y);
+
+    // And the program's own area, which is what the size is for.
+    try std.testing.expectEqual(@as(u16, 58), rect.interior().width);
+    try std.testing.expectEqual(@as(u16, 16), rect.interior().height);
+
+    // It still leaves the layout visible: a ring of at least one cell on every side, which is what
+    // makes a float read as floating rather than as having replaced the screen.
+    try std.testing.expect(rect.x > 0 and rect.y > 0);
+    try std.testing.expect(rect.x + rect.width < 80);
+    try std.testing.expect(rect.y + rect.height < 24);
 
     // Centred means the margins on either side are within one cell of each other: an odd
     // difference cannot be split exactly, so one side gets the extra cell. The comparison is signed
@@ -2021,7 +2047,7 @@ test "an unset float is centred and does not fill the window" {
 }
 
 test "a float smaller than the window stays inside it" {
-    // A window too small for two thirds to be usable gets the floor size, which must then be
+    // A window too small for the fraction to be usable gets the floor size, which must then be
     // clamped rather than placed off-screen.
     const rect = floatRect(10, 3);
     try std.testing.expect(rect.width <= 10);
