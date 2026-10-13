@@ -40,7 +40,7 @@ pub const Mode = enum {
     query,
 };
 
-/// One remote pane, as the client sees it: its own terminal, its own renderer, and the
+/// One remote pane, as the client sees it: its own terminal and the
 /// rectangle the server says it occupies.
 ///
 /// One terminal per pane rather than one per session, because each program has its own
@@ -50,7 +50,6 @@ const RemotePane = struct {
     id: u64,
     terminal: vt.Terminal,
     render: vt.RenderState,
-    renderer: terminal_mod.Renderer,
     /// Where the server says this pane goes, in window cells.
     rect: protocol.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
     /// Set when the server reports this pane's program has exited.
@@ -63,6 +62,12 @@ const RemotePane = struct {
     /// The number the server wants drawn on this pane while a dock target is being chosen, or
     /// zero when nothing is being numbered.
     label: u8 = 0,
+    /// Set when the whole pane has to be repainted, whatever the library says is dirty.
+    ///
+    /// The library only reports cells that changed, which is not enough on its own: a pane that
+    /// moved, was uncovered by a float, or had a label drawn over it is out of date without any
+    /// cell having changed. Those cases set this rather than trying to describe the damage.
+    stale: bool = true,
     /// Bytes this pane's terminal wants sent to its program, waiting for the socket.
     reply: std.ArrayList(u8) = .empty,
     /// The handle the terminal holds; heap-allocated and owned here.
@@ -78,7 +83,6 @@ const RemotePane = struct {
         gpa.destroy(self.route);
         self.reply.deinit(gpa);
         self.line.deinit(gpa);
-        self.renderer.deinit();
         self.render.deinit();
         self.terminal.deinit();
     }
@@ -113,6 +117,15 @@ pub const Client = struct {
     /// Hidden floats are not in the layout event at all, so without this the client cannot tell
     /// "no floats exist" from "the floats are put away", and the status line would be wrong.
     floats_hidden: bool = false,
+    /// The area the floats covered on the previous frame, per pane.
+    ///
+    /// A tiled pane under a float is not painted at all while the float is up, so when a float
+    /// moves, is hidden or is closed, the cells it was covering are still showing it. Comparing
+    /// this with the current frame's float rectangles is how those panes are found and marked
+    /// stale again. Kept as a rectangle per pane rather than one bounding box, so that a pane
+    /// uncovered along one edge of a float is not repainted because another pane covers a
+    /// different corner.
+    covered: std.ArrayList(protocol.Rect) = .empty,
     /// Set between the prefix key and the key that follows it.
     prefix_armed: bool = false,
     /// Output that arrived for panes this client has not been told about yet.
@@ -191,6 +204,7 @@ pub const Client = struct {
         self.panes.deinit(self.gpa);
         for (self.pending.items) |*entry| entry.data.deinit(self.gpa);
         self.pending.deinit(self.gpa);
+        self.covered.deinit(self.gpa);
         if (self.status) |*status| status.deinit(self.gpa);
         if (self.local) |*local| local.leave();
         self.encoder.deinit();
@@ -405,17 +419,25 @@ pub const Client = struct {
         ) catch buffer[0..0];
     }
 
-    /// Repaint every pane and then the status line.
+    /// Repaint the panes that changed, and then the status line.
     ///
     /// The tiled panes tile the session's area, so nothing overlaps between them and no clearing is
     /// needed; the floats are drawn after them, on top. The status line goes last because it owns the
     /// one row below the area.
+    ///
+    /// A pane's terminal is the authority on what changed, and it reports that per row, so the
+    /// usual frame writes one row for one keystroke rather than every cell on the screen. What the
+    /// library cannot know is which panes stopped being visible, since that is a fact about the
+    /// layout rather than about any one terminal; that is what `covered` is for.
     fn draw(self: *Client, window: terminal_mod.vtSize) void {
         const local = self.local orelse return;
 
         // Replies the panes' terminals produced while parsing go back to the programs
         // they belong to, before anything is painted.
         self.flushPaneReplies();
+
+        // The floats that are up now, which is what the tiled panes are drawn under.
+        self.noteOcclusion();
 
         // Tiled panes first, then the floats over them. The server sends the panes in z-order and
         // the flag on each one says which is which, so the two passes are what put the floats on
@@ -441,6 +463,47 @@ pub const Client = struct {
             var text_buffer: [256]u8 = undefined;
             const text = self.statusText(&text_buffer);
             status.render(self.gpa, local, window.rows - 1, text, window.cols) catch {};
+        }
+    }
+
+    /// Mark the panes whose visibility changed since the last frame.
+    ///
+    /// A tiled pane is not painted while a float covers it, so the cells the float was sitting on
+    /// still hold the float once it has moved away, been hidden or been closed. Neither terminal
+    /// reports those cells as dirty, because neither terminal changed: the layout did. The
+    /// rectangles the floats occupied are therefore remembered from the previous frame, and any
+    /// tiled pane intersecting an old or a new one is marked stale, which makes the next paint
+    /// write every row of it.
+    ///
+    /// Marking a pane that is still covered costs nothing, because the paint loop skips it.
+    ///
+    /// Infallible on purpose: losing the record would leave the cells under a float showing it
+    /// after the float is gone, and the caller has nowhere to report that. The list can hold one
+    /// entry per pane, which is allocated for once and then only ever reused.
+    fn noteOcclusion(self: *Client) void {
+        // Panes that a float stopped covering, or started covering, are stale. The comparison is
+        // against the previous frame's list, which is then replaced by this frame's.
+        for (self.panes.items) |*pane| {
+            if (pane.floating) continue;
+            var affected = false;
+            for (self.covered.items) |old| {
+                if (rectsIntersect(old, pane.rect)) affected = true;
+            }
+            for (self.panes.items) |*other| {
+                if (!other.floating) continue;
+                if (rectsIntersect(other.rect, pane.rect)) affected = true;
+            }
+            if (affected) pane.stale = true;
+        }
+
+        self.covered.clearRetainingCapacity();
+        self.covered.ensureUnusedCapacity(self.gpa, self.panes.items.len) catch return;
+        for (self.panes.items) |*pane| {
+            if (!pane.floating) continue;
+            // A float with no area is not on screen, so it covers nothing and remembering it
+            // would repaint a tiled pane for a float that was never drawn.
+            if (pane.rect.width == 0 or pane.rect.height == 0) continue;
+            self.covered.appendAssumeCapacity(pane.rect);
         }
     }
 
@@ -476,15 +539,39 @@ pub const Client = struct {
         const rect = pane.rect;
         if (rect.width == 0 or rect.height == 0) return;
 
+        // A pane under a float is not painted at all. Whatever it would write is invisible, and
+        // writing it is what made typing in a float repaint the whole session. It is marked stale
+        // instead, so that the frame in which the float moves away repaints it in full.
+        if (self.isCovered(pane)) {
+            pane.stale = true;
+            pane.render.update(pane.terminal) catch return;
+            pane.render.clearDirty();
+            return;
+        }
+
         pane.render.update(pane.terminal) catch return;
 
+        // Whether every row has to be written. The library says so itself when the global state
+        // changed, which is what a resize looks like; `stale` covers the cases it cannot know
+        // about, such as the pane having moved or been uncovered.
+        const repaint_all = pane.stale or pane.render.dirty() == .full;
+        pane.stale = false;
+
+        // Every row is visited either way, because the row flags have to be cleared on the rows
+        // that are not painted as well; leaving them set would make the next frame repaint them.
+        // The whole frame is collected into one buffer and written once, so a frame costs one
+        // write per pane rather than three per row.
+        pane.line.clearRetainingCapacity();
         var row_index: u16 = 0;
         const Painter = struct {
-            local: terminal_mod.Terminal,
             pane: *RemotePane,
             rect: protocol.Rect,
             row_index: *u16,
             gpa: std.mem.Allocator,
+            repaint_all: bool,
+            /// Whether any row was actually written, so that an empty frame does not cost a
+            /// write syscall.
+            wrote: bool = false,
             /// The style the terminal is currently in, which decides when the next cell has to
             /// write a new escape. Reset at the start of every row, because each row is written
             /// after a cursor move and the terminal keeps whatever the last cell of the previous
@@ -496,8 +583,16 @@ pub const Client = struct {
 
             fn visit(painter: *@This(), row: *vt.RowIterator) bool {
                 defer painter.row_index.* += 1;
+                // Rows past the rectangle belong to no part of this pane. They are left dirty,
+                // which is what the previous code did by stopping the walk, and the count only
+                // differs when the terminal and the rectangle disagree.
                 if (painter.row_index.* >= painter.rect.height) return false;
 
+                const needs_paint = painter.repaint_all or row.isDirty();
+                row.clearDirty();
+                if (!needs_paint) return true;
+
+                painter.wrote = true;
                 // Move to this row's first column inside the pane's rectangle, erase the
                 // row, and write the cells. Erasing matters because a row that got shorter
                 // would otherwise keep the tail of the previous frame.
@@ -507,9 +602,7 @@ pub const Client = struct {
                     "\x1b[{d};{d}H\x1b[K",
                     .{ painter.rect.y + painter.row_index.* + 1, painter.rect.x + 1 },
                 ) catch return false;
-                painter.local.writeAll(move) catch return false;
-
-                painter.pane.line.clearRetainingCapacity();
+                painter.pane.line.appendSlice(painter.gpa, move) catch return false;
 
                 // Both are per row: the terminal's style after this row's cursor move is whatever
                 // the previous row's last cell left it in, so the first cell of this row has to
@@ -518,15 +611,11 @@ pub const Client = struct {
                 painter.columns_written = 0;
                 _ = row.forEachCell(painter, collect) catch return false;
 
-                // The buffer holds escape sequences as well as glyphs, so it is not clipped by
-                // length: doing that would cut a sequence in half and corrupt the terminal. The
-                // cells are counted instead, and `collect` stops adding once the rectangle is full.
-                // A pane's terminal is made exactly as wide as the rectangle, so this only bites
-                // when the two disagree, which is the case worth defending against.
-                painter.local.writeAll(painter.pane.line.items) catch return false;
                 // The row ends with a reset, so that a colour cannot bleed into the cursor move
-                // that follows or into the pane next to this one.
-                painter.local.writeAll("\x1b[0m") catch return false;
+                // that follows or into the pane next to this one. It goes into the frame buffer
+                // rather than to the terminal, so that the whole frame is one write.
+                painter.pane.line.appendSlice(painter.gpa, "\x1b[0m") catch return false;
+
                 return true;
             }
 
@@ -560,13 +649,34 @@ pub const Client = struct {
         };
 
         var painter = Painter{
-            .local = local,
             .pane = pane,
             .rect = rect,
             .row_index = &row_index,
             .gpa = self.gpa,
+            .repaint_all = repaint_all,
         };
         pane.render.forEachRow(&painter, Painter.visit) catch {};
+
+        // The frame goes out in one write, and only when a row was actually painted. Writing an
+        // empty frame would cost a syscall per pane per frame for a screen that did not change,
+        // which is most of them while a program is idle.
+        if (painter.wrote) local.writeAll(pane.line.items) catch {};
+
+        // The global flag is cleared only once the frame is out. Clearing it before the write
+        // would lose the frame if the write failed, leaving the pane showing stale cells that
+        // nothing would ask to be repainted again.
+        pane.render.clearDirty();
+    }
+
+    /// Whether a float is currently over this pane, so that painting it would be wasted work.
+    fn isCovered(self: *Client, pane: *RemotePane) bool {
+        for (self.panes.items) |*other| {
+            if (!other.floating) continue;
+            if (other.id == pane.id) continue;
+            if (other.rect.width == 0 or other.rect.height == 0) continue;
+            if (rectsIntersect(other.rect, pane.rect)) return true;
+        }
+        return false;
     }
 
     /// Send every pane's accumulated terminal replies to the program that provoked them.
@@ -888,10 +998,25 @@ pub const Client = struct {
                 // given.
                 break :blk try self.addPane(placement);
             };
+            // A pane that moved or changed size has to be repainted in full, whatever its
+            // terminal reports: its cells did not change, its position did. The library notices a
+            // resize by itself, but not a move, and a move leaves the cells at the old place.
+            if (pane.rect.x != placement.rect.x or pane.rect.y != placement.rect.y or
+                pane.rect.width != placement.rect.width or
+                pane.rect.height != placement.rect.height)
+            {
+                pane.stale = true;
+            }
+
             pane.rect = placement.rect;
             pane.exited = placement.exited;
             pane.floating = placement.floating;
+
+            // A label that appeared or moved is drawn into the pane's own cells, so the cells
+            // underneath have to be repainted before it is drawn again.
+            if (pane.label != placement.label) pane.stale = true;
             pane.label = placement.label;
+
             // The terminal is resized to match, so that the client's idea of the pane's
             // shape agrees with the server's. Skipping this would leave a pane's screen
             // wrapped for a width it no longer has.
@@ -902,7 +1027,6 @@ pub const Client = struct {
                     0,
                     0,
                 ) catch {};
-                pane.renderer.resize(placement.rect.height) catch {};
             }
         }
 
@@ -940,9 +1064,6 @@ pub const Client = struct {
         var render = try terminal.createRenderState();
         errdefer render.deinit();
 
-        var renderer = try terminal_mod.Renderer.init(self.gpa, rows);
-        errdefer renderer.deinit();
-
         const route = try self.gpa.create(PaneRoute);
         errdefer self.gpa.destroy(route);
         route.* = .{ .client = self, .pane = placement.id };
@@ -951,7 +1072,6 @@ pub const Client = struct {
             .id = placement.id,
             .terminal = terminal,
             .render = render,
-            .renderer = renderer,
             .rect = placement.rect,
             .exited = placement.exited,
             .route = route,
@@ -1054,6 +1174,22 @@ fn register(epfd: i32, fd: i32, events: u32) !void {
         return Error.SyscallFailed;
 }
 
+/// Whether two rectangles share at least one cell.
+///
+/// Rectangles with no area share nothing, which matters because a pane that has not been given a
+/// size yet is described as a zero-sized rectangle at the origin rather than being absent. Treating
+/// one as covering the top-left corner would make every frame repaint the panes near it.
+fn rectsIntersect(a: protocol.Rect, b: protocol.Rect) bool {
+    if (a.width == 0 or a.height == 0) return false;
+    if (b.width == 0 or b.height == 0) return false;
+    // Half-open ranges: edges that merely touch do not overlap.
+    if (a.x + a.width <= b.x) return false;
+    if (b.x + b.width <= a.x) return false;
+    if (a.y + a.height <= b.y) return false;
+    if (b.y + b.height <= a.y) return false;
+    return true;
+}
+
 /// Block until the socket has something to read.
 ///
 /// Used by the query path, which has no selector of its own. The timeout is a
@@ -1118,15 +1254,12 @@ test "a label finds the pane the server numbered" {
         errdefer terminal.deinit();
         var render = try terminal.createRenderState();
         errdefer render.deinit();
-        var renderer = try terminal_mod.Renderer.init(gpa, 5);
-        errdefer renderer.deinit();
         const route = try gpa.create(PaneRoute);
         route.* = .{ .client = &client, .pane = entry.id };
         try client.panes.append(gpa, .{
             .id = entry.id,
             .terminal = terminal,
             .render = render,
-            .renderer = renderer,
             .label = entry.label,
             .route = route,
         });
@@ -1138,4 +1271,107 @@ test "a label finds the pane the server numbered" {
     // Nothing is numbered zero or above the number of tiled panes.
     try std.testing.expectEqual(@as(?u64, null), client.labeledPane(0));
     try std.testing.expectEqual(@as(?u64, null), client.labeledPane(9));
+}
+
+test "one keystroke repaints one row, not the screen" {
+    // The defect this guards against: the render state's dirty flags are never
+    // cleared by the library, so a client that does not clear them is told that
+    // every row changed on every frame, forever. That turned each keystroke
+    // into a full repaint of every pane, which is what made typing flicker.
+    var terminal = try vt.Terminal.init(.{ .cols = 80, .rows = 20 });
+    defer terminal.deinit();
+    var render = try terminal.createRenderState();
+    defer render.deinit();
+
+    // Paint a frame the way the client does, and report how many rows it wrote.
+    const Counter = struct {
+        painted: usize = 0,
+        rows: usize = 0,
+
+        fn visit(self: *@This(), row: *vt.RowIterator) bool {
+            self.rows += 1;
+            const needed = row.isDirty();
+            // Clearing is part of painting, and the point of the test: without
+            // it the next frame reports this row dirty again.
+            row.clearDirty();
+            if (needed) self.painted += 1;
+            return true;
+        }
+    };
+    const paint = struct {
+        fn call(state: vt.RenderState) !Counter {
+            var counter = Counter{};
+            try state.forEachRow(&counter, Counter.visit);
+            state.clearDirty();
+            return counter;
+        }
+    }.call;
+
+    terminal.write("user@host:~$ ls -la");
+    try render.update(terminal);
+    var frame = try paint(render);
+    // The first frame is everything, because none of it has been drawn yet.
+    try std.testing.expectEqual(@as(usize, 20), frame.painted);
+
+    // A frame in which nothing happened must repaint nothing. This is the
+    // assertion that fails if the global dirty flag is left set.
+    try render.update(terminal);
+    frame = try paint(render);
+    try std.testing.expectEqual(@as(usize, 0), frame.painted);
+    try std.testing.expectEqual(vt.Dirty.clean, render.dirty());
+
+    // One character lands on one row.
+    terminal.write("x");
+    try render.update(terminal);
+    frame = try paint(render);
+    try std.testing.expectEqual(@as(usize, 1), frame.painted);
+    try std.testing.expectEqual(@as(usize, 20), frame.rows);
+
+    // And the frame after it is clean again, proving the per-row flags were
+    // cleared rather than left set by the row that was just painted.
+    try render.update(terminal);
+    frame = try paint(render);
+    try std.testing.expectEqual(@as(usize, 0), frame.painted);
+}
+
+test "a pane is covered only by an overlapping float" {
+    // A tiled pane under a float is skipped when painting, so the test for
+    // "covered" has to be exact in both directions: too eager and a pane that
+    // is visible is left unpainted, too shy and the skip never happens.
+    const tiled = protocol.Rect{ .x = 0, .y = 0, .width = 40, .height = 20 };
+
+    // Wholly inside, so covered.
+    try std.testing.expect(rectsIntersect(
+        protocol.Rect{ .x = 10, .y = 5, .width = 20, .height = 10 },
+        tiled,
+    ));
+    // Overlapping one corner, so covered.
+    try std.testing.expect(rectsIntersect(
+        protocol.Rect{ .x = 30, .y = 15, .width = 20, .height = 10 },
+        tiled,
+    ));
+    // Disjoint, so not covered.
+    try std.testing.expect(!rectsIntersect(
+        protocol.Rect{ .x = 40, .y = 0, .width = 20, .height = 10 },
+        tiled,
+    ));
+    // Sharing only an edge is not overlapping: half-open ranges.
+    try std.testing.expect(!rectsIntersect(
+        protocol.Rect{ .x = 40, .y = 5, .width = 20, .height = 10 },
+        tiled,
+    ));
+    try std.testing.expect(!rectsIntersect(
+        protocol.Rect{ .x = 0, .y = 20, .width = 40, .height = 10 },
+        tiled,
+    ));
+    // A pane that has not been sized yet covers nothing, rather than sitting
+    // on the origin and covering whatever is there.
+    try std.testing.expect(!rectsIntersect(
+        protocol.Rect{ .x = 0, .y = 0, .width = 0, .height = 0 },
+        tiled,
+    ));
+    try std.testing.expect(!rectsIntersect(
+        tiled,
+        protocol.Rect{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    ));
 }

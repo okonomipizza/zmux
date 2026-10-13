@@ -160,10 +160,17 @@ Draw the screen and a minimal frame around it.
 Judgement: an editor is usable, with correct colors and a visible cursor.
 
 Most of this phase arrived early, in Phase 1: the alternate screen, raw mode with
-restoration, incremental repainting of the rows the library marks dirty, and the
-cursor at its reported position. `SIGWINCH` arrived in Phase 3.1, because it only
-became meaningful once there was a server to tell. The status line is the last
-piece.
+restoration, and the cursor at its reported position. `SIGWINCH` arrived in Phase
+3.1, because it only became meaningful once there was a server to tell. The status
+line is the last piece.
+
+Incremental repainting did *not* arrive here, despite the item above. The client
+wrote every row of every pane on every frame, which is visible as flicker while
+typing, and is what made typing in a floating pane worse than typing in a tiled
+one. The library was reporting the changed rows correctly the whole time; the
+client simply never cleared the dirty flags, and libghostty-vt only ever sets
+them, so every frame was reported as fully dirty and the incremental information
+was discarded. Phase 5.2 fixed this.
 
 ### The status line reserves its row
 
@@ -516,6 +523,43 @@ passes 103 tests, including the SGR encoder and the `TERM` substitution, and the
 caught two bugs on the way: an introducer written as `3;2` instead of `38;2`, which
 draws the 8-colour form with stray parameters, and a replacement value missing its
 `TERM=` prefix, which would have handed the child a bare word where a variable belongs.
+
+## Phase 5.2 — incremental repainting
+
+Repaint only what changed, so that typing does not flicker.
+
+The symptom was reported as flicker while typing, worst in a floating pane. The
+cause was not the renderer being slow: the client painted every row of every
+pane on every frame, and a float added the panes underneath it to the same frame.
+Measured on the real client through a pty, one keystroke cost 4,876 bytes in a
+tiled pane and 5,127 in a float.
+
+libghostty-vt tracks dirty state at two levels, a whole-frame flag and a per-row
+flag, and `render.h` states that the caller is expected to reset both: `update`
+only ever sets them. The client reset neither, so the first frame's flags stayed
+set and every later frame was reported as fully dirty. The library was computing
+the changed rows correctly all along and the information was being thrown away.
+`RowIterator.isDirty` had been wrapped in `vt.zig` and never called.
+
+- `RenderState.clearDirty` and `RowIterator.clearDirty` wrap the two setters
+- `drawPane` paints a row only when it is dirty, and clears the flag either way
+- A frame is collected into one buffer and written once, rather than three writes
+  per row
+- A pane that is covered by a float is skipped, and a pane that stops being
+  covered is marked stale so that the next frame repaints it in full
+- A pane that moved, resized or gained a label is marked stale, because its
+  cells did not change but their position or their overlay did
+
+Verified: one keystroke costs 359 bytes tiled and 359 floated, an idle frame
+costs nothing, and a pane uncovered by hiding a float repaints all of its rows.
+The `drive` tool reports this and fails the run if a keystroke costs more than
+two kilobytes; `measure` reports the row counts directly.
+
+Judgement: the flicker is gone and typing costs the same whether or not a pane is
+floating. What is not done is partial-row painting: a row that changed by one
+cell is still written whole. That is the next step if the cost ever matters
+again, and it needs cell-level damage tracking that the library does not provide
+today.
 
 ## Phase 6 — hardening
 

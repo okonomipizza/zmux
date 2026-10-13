@@ -67,6 +67,26 @@ pub fn build(b: *std.Build) void {
     const drive_step = b.step("drive", "Build the interactive test driver");
     drive_step.dependOn(&b.addInstallArtifact(drive, .{}).step);
 
+    // Reports how many rows a frame repaints, and what a keystroke costs on the
+    // wire. Manual tools, not part of the test run: they are how a claim about
+    // flicker gets checked rather than asserted.
+    const measure = b.addExecutable(.{
+        .name = "measure",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/measure.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    measure.root_module.addImport("vt", b.createModule(.{
+        .root_source_file = b.path("src/vt.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    ghostty_vt.apply(measure.root_module);
+    _ = b.step("measure", "Build the row-level paint measurement tool")
+        .dependOn(&b.addInstallArtifact(measure, .{}).step);
+
     // Zig's cache must not reuse translated headers built against a different
     // libghostty-vt revision, so the include directory is part of the config.
     const docs = b.addInstallFileWithDir(

@@ -148,6 +148,34 @@ state is preserved exactly. Only the owning list changes, and the client
 redraws the affected rectangles. This is what makes the switch instant rather
 than a restart.
 
+A float is drawn over the tiled panes, and a tiled pane underneath one is not
+painted at all while it is covered: whatever it would write is invisible, and
+skipping it is what keeps typing in a float as cheap as typing in a tile. The
+cost of that shortcut is that the cells under a float still hold it once the
+float moves, is hidden or is closed, and no terminal reports them as changed,
+because the layout changed rather than the terminal. The client therefore
+remembers the rectangles the floats occupied on the previous frame and marks any
+tiled pane intersecting an old or a new one stale, which repaints it in full.
+
+## Painting
+
+Each pane owns a libghostty-vt render state, which reports what changed since the
+previous frame at two levels: a whole-frame flag and a per-row flag. The library
+only ever sets these; clearing them is the renderer's job, and `update` reports
+the frame as fully dirty for as long as they are not cleared. The client clears
+the row flag as it paints each row and the frame flag once the frame is out, so a
+keystroke costs one row rather than a screenful.
+
+The row flags describe what changed inside a terminal. They cannot describe a pane
+that moved, was uncovered by a float, or had a number drawn over it, because in
+each of those cases the cells are unchanged and their position or their overlay is
+not. Those cases set a `stale` flag on the pane, which repaints every row of it on
+the next frame.
+
+A frame is collected into one buffer per pane and written with a single write,
+rather than a cursor move, a row and a reset going out separately. A pane with
+nothing to paint writes nothing at all.
+
 ## Pane sizing
 
 A pty has one size, but attached clients may have different window sizes. The

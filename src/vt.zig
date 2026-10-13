@@ -219,6 +219,24 @@ pub const RenderState = struct {
         };
     }
 
+    /// Clear the dirty state after a frame has been painted.
+    ///
+    /// The library only ever sets dirty flags; clearing them is the renderer's
+    /// job, and both layers have to be cleared. `update` reports the frame as
+    /// fully dirty for as long as this is not called.
+    ///
+    /// The row flags are not cleared here because they live on the row
+    /// iterator, which is only valid while the rows are being walked. The
+    /// caller clears each row with `RowIterator.clearDirty` as it paints it.
+    pub fn clearDirty(self: RenderState) void {
+        var value: c.GhosttyRenderStateDirty = c.GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+        _ = c.ghostty_render_state_set(
+            self.handle,
+            c.GHOSTTY_RENDER_STATE_OPTION_DIRTY,
+            &value,
+        );
+    }
+
     pub fn cursorVisible(self: RenderState) bool {
         var value: bool = false;
         _ = c.ghostty_render_state_get(self.handle, c.GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &value);
@@ -298,6 +316,19 @@ pub const RowIterator = struct {
             &value,
         );
         return value;
+    }
+
+    /// Clear this row's dirty flag, once its repaint has been written.
+    ///
+    /// The iterator must be positioned on a row for this to have any effect;
+    /// `forEachRow` guarantees that inside its visitor.
+    pub fn clearDirty(self: RowIterator) void {
+        var value = false;
+        _ = c.ghostty_render_state_row_set(
+            self.handle,
+            c.GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY,
+            &value,
+        );
     }
 
     /// Walk the cells of this row, invoking `visitor` for each one.

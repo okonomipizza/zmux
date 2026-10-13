@@ -1,22 +1,33 @@
-//! A test driver that runs `zmux run <program>` inside a pty and feeds it
-//! keystrokes on a schedule, so an interactive program can be exercised
-//! without a human at the keyboard.
+//! Measures what a keystroke costs, by running zmux on a pty and counting the
+//! bytes it writes back.
 //!
-//! The pty handling is the same code the product uses, so this also serves as
-//! an end-to-end check of `src/pty.zig`.
+//! A client repaints after every keystroke, so the bytes it writes are what a
+//! user perceives as flicker: repainting every cell of every pane is a lot of
+//! traffic for a terminal to absorb while someone is typing. The pane's own
+//! terminal reports which rows actually changed, and this measures whether the
+//! client is using that or rewriting the screen.
+//!
+//! zmux is started exactly as a terminal emulator would start it, against a
+//! runtime directory of its own, so this exercises the real client rather than
+//! a model of it. The pty handling is the same code the product uses.
 //!
 //! Build and run:
-//!   zig run tools/drive.zig -- ./zig-out/bin/zmux run /usr/bin/vi /tmp/out.txt
+//!   zig build drive && ./zig-out/bin/drive -- ./zig-out/bin/zmux attach measure
+//!
+//! The tiled figure is the baseline; the floated figure is the interesting one,
+//! because a float sits over the tiled panes and a client that repaints
+//! everything spends the frame on the panes it covers as well.
 
 const std = @import("std");
 const linux = std.os.linux;
 const pty_mod = @import("pty");
 
-const Step = struct {
-    /// Milliseconds to wait before sending this step.
-    delay_ms: u64,
-    keys: []const u8,
-};
+/// How long to wait for the client to start and the shell to print a prompt.
+const settle_ms = 2500;
+/// How long to collect output after each keystroke.
+const per_key_ms = 400;
+/// How long to collect output while nothing is happening.
+const idle_ms = 1200;
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var gpa_state: std.heap.DebugAllocator(.{}) = .init;
@@ -27,48 +38,40 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer args.deinit();
     _ = args.next();
 
-    // Everything after the command separator is the program to drive.
+    // Everything after the separator is the command, so a release build can be
+    // measured as easily as a debug one.
     var command: std.ArrayList([*:0]const u8) = .empty;
     defer command.deinit(gpa);
-
-    // Each argument needs its own null-terminated buffer.
     var buffers: [64][std.fs.max_path_bytes]u8 = undefined;
     var buffer_count: usize = 0;
-
     var seen_separator = false;
     while (args.next()) |argument| {
-        if (!seen_separator and std.mem.eql(u8, argument, "--")) {
-            seen_separator = true;
+        if (!seen_separator) {
+            if (std.mem.eql(u8, argument, "--")) seen_separator = true;
             continue;
         }
-        if (!seen_separator) continue;
         if (buffer_count >= buffers.len) break;
         const terminated = try std.fmt.bufPrintZ(&buffers[buffer_count], "{s}", .{argument});
-        try command.append(gpa, terminated.ptr);
+        command.append(gpa, terminated.ptr) catch break;
         buffer_count += 1;
     }
-
     if (command.items.len == 0) {
         std.debug.print("usage: drive -- <program> [args...]\n", .{});
         return error.NoProgram;
     }
-
-    // A null-terminated vector for execve.
     var argv: [65]?[*:0]const u8 = undefined;
     for (command.items, 0..) |argument, index| argv[index] = argument;
     argv[command.items.len] = null;
 
-    // The keystroke script. Escape gets its own step with a delay so insert
-    // mode is left before the ex command that follows.
-    const script = [_]Step{
-        .{ .delay_ms = 2000, .keys = "ihello from zmux" },
-        .{ .delay_ms = 800, .keys = "\x1b" },
-        .{ .delay_ms = 800, .keys = ":w /tmp/zmux-vim-test.txt\r" },
-        .{ .delay_ms = 1500, .keys = ":q!\r" },
-        .{ .delay_ms = 800, .keys = "" },
+    // A runtime directory of its own, so a server the user is already running is
+    // not disturbed and the measurement does not join someone else's session.
+    const envp = [_:null]?[*:0]const u8{
+        "PATH=/run/current-system/sw/bin:/bin:/usr/bin",
+        "TERM=xterm-256color",
+        "SHELL=/run/current-system/sw/bin/fish",
+        "XDG_RUNTIME_DIR=/tmp/zmux-drive",
+        "HOME=/tmp/zmux-drive",
     };
-
-    const envp = [_:null]?[*:0]const u8{ "PATH=/bin:/usr/bin", "TERM=xterm-256color" };
 
     var pty = try pty_mod.Pty.spawn(@ptrCast(&argv), &envp, .{ .rows = 24, .cols = 80 });
     defer pty.deinit();
@@ -78,45 +81,93 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var collected: std.ArrayList(u8) = .empty;
     defer collected.deinit(gpa);
 
-    for (script) |step| {
-        sleepMillis(step.delay_ms);
-        if (step.keys.len > 0) {
-            var offset: usize = 0;
-            while (offset < step.keys.len) {
-                const written = pty.write(step.keys[offset..]) catch break;
-                if (written == 0) break;
-                offset += written;
-            }
-        }
-        drain(&pty, &buffer, &collected, gpa);
-    }
-
-    // Let the program exit, then collect whatever is left.
-    sleepMillis(800);
+    // Let the client start and the shell print its prompt.
+    sleepMillis(settle_ms);
     drain(&pty, &buffer, &collected, gpa);
 
-    const status = pty.reap();
-    if (status) |s| {
-        std.debug.print("\n[drive] child exited: code={d} signaled={}\n", .{ s.code, s.signaled });
-    } else {
-        std.debug.print("\n[drive] child still running after the script\n", .{});
+    // An idle period. Output here is repainting that nothing asked for.
+    collected.clearRetainingCapacity();
+    sleepMillis(idle_ms);
+    drain(&pty, &buffer, &collected, gpa);
+    const idle_bytes = collected.items.len;
+
+    const keys = "abcdefghijklmnop";
+
+    // Type into a tiled pane.
+    var tiled: [keys.len]usize = undefined;
+    for (keys, 0..) |key, index| {
+        tiled[index] = keystroke(&pty, &buffer, &collected, gpa, key);
     }
 
-    // Report the screen with escape sequences made visible, so the result can
-    // be checked without a terminal interpreting them.
-    const visible = try visibleEscapes(gpa, collected.items);
-    defer gpa.free(visible);
-    writeAll(1, visible);
+    // The same measurement with the pane floated. Opening the float is not
+    // counted; the bytes it costs belong to the frame that drew it.
+    _ = pty.write("\x01f") catch {};
+    sleepMillis(1000);
+    collected.clearRetainingCapacity();
+    drain(&pty, &buffer, &collected, gpa);
+
+    var floated: [keys.len]usize = undefined;
+    for (keys, 0..) |key, index| {
+        floated[index] = keystroke(&pty, &buffer, &collected, gpa, key);
+    }
+
+    // Leave cleanly, so no server is left behind for the next run.
+    _ = pty.write("\x01q") catch {};
+    sleepMillis(600);
+    drain(&pty, &buffer, &collected, gpa);
+    if (pty.reap()) |status| {
+        if (!status.signaled and status.code != 0) {
+            std.debug.print("[drive] client exited with code {d}\n", .{status.code});
+        }
+    }
+
+    std.debug.print("idle output              : {d} bytes\n", .{idle_bytes});
+    report("tiled", &tiled);
+    report("floated", &floated);
+
+    // A keystroke should cost about one row, and an idle frame nothing. These
+    // are the properties a regression would break, so they are stated as a
+    // verdict rather than left for the reader to eyeball.
+    const tiled_mean = mean(&tiled);
+    if (idle_bytes > 64) {
+        std.debug.print("verdict: FAIL, an idle frame wrote {d} bytes\n", .{idle_bytes});
+    } else if (tiled_mean > 2_000) {
+        std.debug.print(
+            "verdict: FAIL, a keystroke cost {d} bytes, which is a full repaint\n",
+            .{tiled_mean},
+        );
+    } else {
+        std.debug.print("verdict: OK\n", .{});
+    }
 }
 
-/// Write to a raw descriptor, retrying short writes.
-fn writeAll(fd: i32, bytes: []const u8) void {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const written = linux.write(fd, bytes.ptr + offset, bytes.len - offset);
-        if (linux.errno(written) != .SUCCESS or written == 0) return;
-        offset += written;
-    }
+/// Send one key and return how many bytes came back.
+fn keystroke(
+    pty: *pty_mod.Pty,
+    buffer: []u8,
+    collected: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    key: u8,
+) usize {
+    _ = pty.write(&.{key}) catch return 0;
+    collected.clearRetainingCapacity();
+    sleepMillis(per_key_ms);
+    drain(pty, buffer, collected, gpa);
+    return collected.items.len;
+}
+
+fn mean(counts: []const usize) usize {
+    if (counts.len == 0) return 0;
+    var total: usize = 0;
+    for (counts) |count| total += count;
+    return total / counts.len;
+}
+
+fn report(label: []const u8, counts: []const usize) void {
+    std.debug.print("{s:<24} :", .{label});
+    for (counts) |count| std.debug.print(" {d}", .{count});
+    std.debug.print("\n", .{});
+    std.debug.print("{s:<24} : mean {d} bytes per keystroke\n", .{ label, mean(counts) });
 }
 
 fn drain(
@@ -126,37 +177,12 @@ fn drain(
     gpa: std.mem.Allocator,
 ) void {
     while (true) {
-        const read = pty.read(buffer) catch |err| switch (err) {
-            // The slave closed, so the child is gone.
-            pty_mod.Error.Closed => return,
-            else => return,
-        };
+        // A closed slave and an idle master both read as nothing; either way
+        // there is no more output to account for.
+        const read = pty.read(buffer) catch return;
         if (read == 0) return;
         collected.appendSlice(gpa, buffer[0..read]) catch return;
     }
-}
-
-/// Replace control bytes with a readable form so the output can be inspected
-/// in a terminal that is not interpreting them.
-fn visibleEscapes(gpa: std.mem.Allocator, input: []const u8) ![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    for (input) |byte| {
-        switch (byte) {
-            0x1b => try out.appendSlice(gpa, "<ESC>"),
-            '\n' => try out.append(gpa, '\n'),
-            '\r' => try out.appendSlice(gpa, "<CR>"),
-            0x7F => try out.appendSlice(gpa, "<DEL>"),
-            else => {
-                if (byte < 0x20) {
-                    try out.appendSlice(gpa, "<CTRL>");
-                } else {
-                    try out.append(gpa, byte);
-                }
-            },
-        }
-    }
-    return out.toOwnedSlice(gpa);
 }
 
 fn sleepMillis(milliseconds: u64) void {
