@@ -409,7 +409,7 @@ pub const Client = struct {
 
         return std.fmt.bufPrint(
             buffer,
-            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close F float f floats d dock h/j/k/l focus | {s}",
+            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close h/j/k/l focus <> swap o rotate F/f floats d dock | {s}",
             .{
                 name,
                 self.area_cols,
@@ -1005,6 +1005,32 @@ pub const Client = struct {
                 try self.sendRequest(.{ .focus = .{
                     .name = self.watching,
                     .backwards = false,
+                } });
+                return false;
+            },
+            // `<` and `>` move the focused pane past its neighbours. They read as arrows, so the key
+            // says which way the pane travels, and unlike braces they sit on the same physical keys
+            // whatever the keyboard layout.
+            '>' => {
+                try self.sendRequest(.{ .layout_move = .{
+                    .name = self.watching,
+                    .kind = 0,
+                } });
+                return false;
+            },
+            '<' => {
+                try self.sendRequest(.{ .layout_move = .{
+                    .name = self.watching,
+                    .kind = 1,
+                } });
+                return false;
+            },
+            // `o` rotates the whole arrangement, which is a different operation from swapping: with
+            // three panes or more, pairwise swaps cannot shift them all without a plan.
+            'o' => {
+                try self.sendRequest(.{ .layout_move = .{
+                    .name = self.watching,
+                    .kind = 2,
                 } });
                 return false;
             },

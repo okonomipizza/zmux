@@ -371,8 +371,9 @@ into, and focus is the server's idea, read later.
 
 Key bindings are vim-flavoured behind the existing `ctrl-a` prefix: `s` splits side by
 side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
-and `h`/`j`/`k`/`l` move focus. A bare `ctrl-a` twice still detaches, and a prefix
-followed by an unused key detaches rather than being swallowed.
+`h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, and `o`
+rotates the arrangement. A bare `ctrl-a` twice still detaches, and a prefix followed by
+an unused key detaches rather than being swallowed.
 
 Verified: an attached client at 80x24 shows the first pane's text on row 1 and the status
 line reading `1 pane(s)`. Sending `ctrl-a s` produces `2 pane(s)`, and the client's output

@@ -53,7 +53,16 @@ Inside an attached session the prefix key is `ctrl-a`:
 | `ctrl-a f` | hide the floating panes, or show them again |
 | `ctrl-a h` / `k` | move focus to the previous pane |
 | `ctrl-a l` / `j` | move focus to the next pane |
+| `ctrl-a <` / `>` | move the focused pane past its neighbour |
+| `ctrl-a o` | rotate every pane one place along |
 | `ctrl-a ctrl-a` | detach, leaving every pane running |
+
+`ctrl-a <` and `ctrl-a >` swap the focused pane with the pane beside it in the
+layout's order, which is the same order the focus keys walk. `ctrl-a o` shifts
+every pane one place along instead, last to first. Neither changes the shape of
+the layout: the split ratios you built stay as they are, and only which pane sits
+where changes. The programs inside are not disturbed beyond being resized to
+their new rectangles, so a swap costs nothing but a redraw.
 
 Each pane is its own program on its own pty, so a split gives two shells side by
 side. A pane is drawn with a border around it, and the program is given the area

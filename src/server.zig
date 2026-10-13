@@ -874,6 +874,13 @@ pub const Server = struct {
                 }
                 try self.sendLayout(session);
             },
+            .layout_move => |move| {
+                const index = self.findSession(move.name.slice()) orelse
+                    return Error.UnknownSession;
+                // Only the tiled arrangement moves. A float is not in the tree, so it has no
+                // neighbour to swap with and no place in the rotation; it stays where it is.
+                try self.moveInLayout(index, move.kind);
+            },
             .float => |float| {
                 const index = self.findSession(float.name.slice()) orelse
                     return Error.UnknownSession;
@@ -1102,6 +1109,47 @@ pub const Server = struct {
 
         try session.relayout();
         try self.sendLayout(session);
+    }
+
+    /// Move the focused pane within the layout, or shift every pane along.
+    ///
+    /// The tree's shape is untouched: only which pane sits where changes, so the split ratios the
+    /// user built still describe the arrangement. What does change is the geometry, because the
+    /// panes trade rectangles, and each pane's pty has to be told its new size or the program inside
+    /// would keep wrapping for the shape it had.
+    ///
+    /// The programmes themselves are not disturbed beyond that. A pane is its identifier, so the
+    /// pty, the screen and the child process all follow it to the new position.
+    fn moveInLayout(self: *Server, index: usize, kind: u8) !void {
+        const session = &self.sessions.items[index];
+        const focused = session.tree.focused orelse return;
+
+        // A float takes the focus when one is raised, and a float is not in the tree. Moving the
+        // layout is not what the user asked for in that state, so the request is ignored rather than
+        // applied to whatever pane happens to hold the tree's focus.
+        if (session.focused_float != null) return;
+
+        const moved = switch (kind) {
+            0 => session.tree.swapWithNext(focused),
+            1 => session.tree.swapWithPrevious(focused),
+            2 => session.tree.rotate(),
+            // An unknown kind is a client this server does not understand; doing nothing is safer
+            // than guessing at a rearrangement.
+            else => false,
+        };
+        if (!moved) return;
+
+        // The panes traded rectangles, so the geometry is recomputed and every changed pane's pty
+        // is resized. Without this the programs would keep the size they had.
+        try session.relayout();
+        try self.sendLayout(session);
+
+        // What each pane shows has not changed, but where it is drawn has, so the client needs the
+        // screens again. The client paints into the rectangles the layout names, and a pane that has
+        // not been re-sent would be drawn from its previous position.
+        for (session.watchers.items) |client| {
+            try self.sendSessionScreens(session, client);
+        }
     }
 
     /// Close the focused pane, giving its space to its sibling's subtree.

@@ -121,6 +121,19 @@ pub const Request = union(enum) {
         name: Name,
         backwards: bool,
     },
+    /// Move the focused pane within the layout, without disturbing the layout's shape.
+    ///
+    /// One request for both operations rather than two, because the client cannot know which is
+    /// meaningful: a session with two panes has nothing to rotate, and the server holds the
+    /// arrangement. The kind is a wire value, as with `split`'s axis.
+    ///
+    /// - `next` and `previous` swap the focused pane with its neighbour in tree order.
+    /// - `rotate` shifts every pane one place along, last to first.
+    layout_move: struct {
+        name: Name,
+        /// 0 to swap with the next pane, 1 with the previous, 2 to rotate.
+        kind: u8,
+    },
     /// Park the focused pane, lifting it out of the layout and above it.
     ///
     /// The pane keeps its pty and its screen: parking changes which list owns it and nothing
@@ -297,7 +310,7 @@ pub const PanePlacement = struct {
 /// Spelled out rather than taken from the enum ordinal, because these are the
 /// protocol: reordering a union arm must not silently renumber the wire.
 pub const Tag = struct {
-    // Requests, 1..=15.
+    // Requests, 1..=16.
     pub const list: u8 = 1;
     pub const create: u8 = 2;
     pub const attach: u8 = 3;
@@ -313,6 +326,7 @@ pub const Tag = struct {
     pub const dock: u8 = 13;
     pub const dock_cancel: u8 = 14;
     pub const toggle_floats: u8 = 15;
+    pub const layout_move: u8 = 16;
     // Events, 64..=127. The gap leaves room to add either kind later without
     // renumbering.
     pub const session: u8 = 64;
@@ -456,6 +470,11 @@ pub const Encoder = struct {
                 try self.begin(Tag.focus);
                 try self.name(&focus.name);
                 try self.u8le(if (focus.backwards) 1 else 0);
+            },
+            .layout_move => |move| {
+                try self.begin(Tag.layout_move);
+                try self.name(&move.name);
+                try self.u8le(move.kind);
             },
             .float => |float| {
                 try self.begin(Tag.float);
@@ -665,6 +684,10 @@ pub const Decoder = struct {
             Tag.focus => Request{ .focus = .{
                 .name = try self.name(),
                 .backwards = (try self.u8le()) != 0,
+            } },
+            Tag.layout_move => Request{ .layout_move = .{
+                .name = try self.name(),
+                .kind = try self.u8le(),
             } },
             Tag.float => Request{ .float = .{ .name = try self.name() } },
             Tag.dock => Request{ .dock = .{
@@ -1292,4 +1315,29 @@ test "the toggle request round-trips" {
     var decoder = Decoder.init(frame);
     const request = try decoder.request();
     try std.testing.expect(request.toggle_floats.name.eql("work"));
+}
+
+test "a layout move survives a round trip" {
+    // The request carries which of the three moves is wanted. A tag that the decoder does not know
+    // is reported to the client as "unknown request", which is what a mismatch between the two
+    // sides looks like from the outside.
+    const gpa = std.testing.allocator;
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    for ([_]u8{ 0, 1, 2 }) |kind| {
+        const payload = try encoder.writeRequest(.{ .layout_move = .{
+            .name = try Name.init("s"),
+            .kind = kind,
+        } });
+        var decoder = Decoder.init(payload);
+        const request = try decoder.request();
+        switch (request) {
+            .layout_move => |move| {
+                try std.testing.expectEqual(kind, move.kind);
+                try std.testing.expectEqualStrings("s", move.name.slice());
+            },
+            else => return error.WrongRequest,
+        }
+    }
 }

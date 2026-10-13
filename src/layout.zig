@@ -510,6 +510,88 @@ pub const Tree = struct {
         try self.collectNode(root, out);
     }
 
+    /// Swap one pane with the pane next to it in tree order.
+    ///
+    /// Only the identifiers in the two leaves change; the tree's shape is untouched. That is what
+    /// keeps a swap from disturbing the layout: the split ratios and the nesting describe the shape
+    /// the user built, and moving a pane between two positions should not redraw it. The programs
+    /// keep running too, since a pane's identity is its identifier and the pty follows it.
+    ///
+    /// Returns false when there is nothing to swap with, which is a tree holding fewer than two
+    /// panes, or a pane that is not in the tree.
+    pub fn swapWithNext(self: *Tree, id: PaneId) bool {
+        return self.swapNeighbours(id, 1);
+    }
+
+    /// Swap one pane with the pane before it in tree order.
+    pub fn swapWithPrevious(self: *Tree, id: PaneId) bool {
+        return self.swapNeighbours(id, -1);
+    }
+
+    fn swapNeighbours(self: *Tree, id: PaneId, direction: i8) bool {
+        // The order is what the focus keys already use, so "next" here is the pane the user reaches
+        // by pressing the key that moves forward, which is what makes the two agree.
+        var order: std.ArrayList(PaneId) = .empty;
+        defer order.deinit(self.gpa);
+        self.collect(&order) catch return false;
+        if (order.items.len < 2) return false;
+
+        var index: usize = 0;
+        while (index < order.items.len) : (index += 1) {
+            if (order.items[index] == id) break;
+        } else return false;
+
+        // A swap at either end wraps, so the keys keep working however the focus got there. Wrapping
+        // is what the focus keys do too, and a pane that refused to move would read as a broken key.
+        const total = order.items.len;
+        const neighbour = if (direction > 0)
+            (index + 1) % total
+        else
+            (index + total - 1) % total;
+
+        const a = self.findLeaf(id) orelse return false;
+        const b = self.findLeaf(order.items[neighbour]) orelse return false;
+
+        // Both are leaves by construction, so the two values are the pane identifiers.
+        const held = a.leaf;
+        a.leaf = b.leaf;
+        b.leaf = held;
+        return true;
+    }
+
+    /// Move every pane one position along in tree order, last to first.
+    ///
+    /// Rotating rather than swapping because three panes or more cannot be rearranged by pairwise
+    /// swaps without a plan; one key that shifts them all is what makes the arrangement feel like a
+    /// ring. The direction matches tmux's rotate key, so the pane that was last becomes first.
+    ///
+    /// Returns false when there is nothing to rotate.
+    pub fn rotate(self: *Tree) bool {
+        var order: std.ArrayList(PaneId) = .empty;
+        defer order.deinit(self.gpa);
+        self.collect(&order) catch return false;
+        if (order.items.len < 2) return false;
+
+        // Every leaf is located before any is written. Finding a leaf by its identifier and then
+        // overwriting that identifier would make the next lookup search for one that is no longer
+        // there, so the lookups and the writes have to be separate passes.
+        var leaves: std.ArrayList(*Node) = .empty;
+        defer leaves.deinit(self.gpa);
+        for (order.items) |id| {
+            const leaf = self.findLeaf(id) orelse return false;
+            leaves.append(self.gpa, leaf) catch return false;
+        }
+
+        // Each pane takes the identifier of the one before it, and the first takes the last, so the
+        // arrangement shifts one place along a ring. The identifiers are written into the leaves
+        // rather than the leaves being rearranged, which preserves the shape.
+        for (leaves.items, 0..) |leaf, index| {
+            const source = if (index == 0) order.items.len - 1 else index - 1;
+            leaf.leaf = order.items[source];
+        }
+        return true;
+    }
+
     fn collectNode(self: *Tree, node: *Node, out: *std.ArrayList(PaneId)) !void {
         switch (node.*) {
             .leaf => |id| try out.append(self.gpa, id),
@@ -1213,4 +1295,114 @@ test "a pane too small for a frame keeps all of its cells" {
     const smallest = Rect{ .x = 0, .y = 0, .width = 3, .height = 3 };
     try std.testing.expectEqual(@as(u16, 1), smallest.interior().width);
     try std.testing.expectEqual(@as(u16, 1), smallest.interior().height);
+}
+
+test "swapping moves a pane past its neighbour without disturbing the shape" {
+    // The identifiers move between the leaves; the tree's shape does not. That is what keeps a swap
+    // from redrawing the layout: the split ratios still describe the arrangement the user built.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    // Three panes side by side, so there is an order to move along.
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+    const c = tree.allocateId();
+    try tree.split(b, .horizontal, c);
+
+    var order: std.ArrayList(PaneId) = .empty;
+    defer order.deinit(gpa);
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ a, b, c }, order.items);
+
+    // b moves past c.
+    try std.testing.expect(tree.swapWithNext(b));
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ a, c, b }, order.items);
+
+    // And back again with the other key.
+    try std.testing.expect(tree.swapWithPrevious(b));
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ a, b, c }, order.items);
+
+    // The shape is unchanged: three leaves in a tree of three, so two branches.
+    try std.testing.expectEqual(@as(usize, 3), tree.count());
+    try std.testing.expect(tree.contains(a) and tree.contains(b) and tree.contains(c));
+
+    // A swap at the end wraps rather than doing nothing, matching what the focus keys do.
+    try std.testing.expect(tree.swapWithNext(c));
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ c, b, a }, order.items);
+}
+
+test "swapping has nothing to do in a tree of one" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+
+    // One pane has no neighbour, so the key does nothing rather than reporting a failure it cannot
+    // act on.
+    try std.testing.expect(!tree.swapWithNext(only));
+    try std.testing.expect(!tree.swapWithPrevious(only));
+
+    // A pane that is not in the tree cannot be swapped either.
+    try std.testing.expect(!tree.swapWithNext(tree.allocateId()));
+
+    var order: std.ArrayList(PaneId) = .empty;
+    defer order.deinit(gpa);
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{only}, order.items);
+}
+
+test "rotating shifts every pane one place, last to first" {
+    // Rotating is not a sequence of swaps: with three panes or more, pairwise swaps cannot produce
+    // the shift without a plan. One pass over the leaves does it, and the direction matches tmux's
+    // rotate key so a user's habit carries over.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+    const c = tree.allocateId();
+    try tree.split(b, .horizontal, c);
+
+    var order: std.ArrayList(PaneId) = .empty;
+    defer order.deinit(gpa);
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ a, b, c }, order.items);
+
+    // Each pane takes the place of the one before it, and the last takes the first place.
+    try std.testing.expect(tree.rotate());
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ c, a, b }, order.items);
+
+    // A full turn of the ring returns the original arrangement.
+    try std.testing.expect(tree.rotate());
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ b, c, a }, order.items);
+    try std.testing.expect(tree.rotate());
+    try tree.collect(&order);
+    try std.testing.expectEqualSlices(PaneId, &.{ a, b, c }, order.items);
+
+    // Rotating never changes how many panes there are.
+    try std.testing.expectEqual(@as(usize, 3), tree.count());
+}
+
+test "rotating has nothing to do in a tree of one" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+    try std.testing.expect(!tree.rotate());
+    try std.testing.expect(tree.rotate() == false);
 }
