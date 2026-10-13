@@ -23,26 +23,23 @@ comes from libghostty-vt, the command line is parsed with
 the sessions.
 
 ```sh
-# Enter a session, creating it if it is not running yet. This is the usual way in:
-# `attach work` runs $SHELL under the name "work".
+# Enter a session, creating it if it is not running yet. This is the only way in:
+# `attach work` runs your shell under the name "work".
 zmux attach work
 zmux attach default
 
-# Start a session running a particular program instead of a shell.
-zmux run htop
-zmux run -d -n build -- make
-
 # See what is running.
 zmux ls
-# build: 80x24, 1 client(s), pid 4321, running
+# work: 80x24, 0 client(s), pid 4321, running
 
-zmux kill build
+zmux kill work
 zmux kill-all
 ```
 
-`attach <name>` never starts a program: it gives you a shell under that name. Use
-`run` when you want a specific program, and `run -d -n <name>` to start one
-without attaching.
+Attaching always gives you a shell. To run something else, start it from that
+shell: `zmux attach work`, then `htop`. A multiplexer whose session contains a
+shell is more useful than one whose session contains a single command, because the
+shell can start anything and the session survives it.
 
 Inside an attached session the prefix key is `ctrl-a`:
 
@@ -126,7 +123,7 @@ The test driver runs a program on a pty and feeds it keystrokes on a schedule,
 which is how interactive programs are checked without a human at the keyboard:
 
 ```sh
-./zig-out/bin/drive -- ./zig-out/bin/zmux run vi /tmp/out.txt
+./zig-out/bin/drive -- ./zig-out/bin/zmux attach test-session
 ```
 
 ## Build with Nix

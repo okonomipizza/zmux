@@ -19,7 +19,6 @@ const Command = enum {
     kill,
     kill_all,
     dump,
-    run,
 
     /// The name as typed on the command line.
     ///
@@ -59,11 +58,11 @@ const MainArgs = clap.ResultEx(clap.Help, &main_params, main_parsers);
 /// The positional is spelled `<SESSION>` so that `session_parsers` below can
 /// match it: clap looks a value parser up by the parameter's value name.
 ///
-/// This list must not also declare a `--name <SESSION>` option. clap numbers
-/// positionals by declaration order across *all* parameters, so an option whose
-/// value name matches the positional's shifts the positional's slot, and the
-/// argument then parses as an unset option value instead of as the name. `run`,
-/// which genuinely needs both, has its own list below for that reason.
+/// This list must not also declare an option whose value name matches the
+/// positional's. clap numbers positionals by declaration order across *all*
+/// parameters, so such an option shifts the positional's slot and the argument then
+/// parses as an unset option value instead of as the name. That is why `attach` and
+/// `kill` each have their own list rather than sharing one with an option on it.
 const attach_params = clap.parseParamsComptime(
     \\-h, --help  Display this help and exit.
     \\<SESSION>
@@ -78,20 +77,6 @@ const kill_params = clap.parseParamsComptime(
 
 const session_parsers = .{
     .SESSION = clap.parsers.string,
-};
-
-/// `run` takes the command to start, or uses `$SHELL` when given none.
-const run_params = clap.parseParamsComptime(
-    \\-h, --help      Display this help and exit.
-    \\-d, --detached  Start the session without attaching to it.
-    \\-n, --name <NAME>  Name the session instead of using a generated one.
-    \\<PROGRAM>...
-    \\
-);
-
-const run_parsers = .{
-    .NAME = clap.parsers.string,
-    .PROGRAM = clap.parsers.string,
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -125,6 +110,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // arguments belonging to it.
         .terminating_positional = 0,
     }) catch |parse_error| {
+        // An unknown subcommand is reported as such rather than with clap's own message, which names
+        // the parser's error (`NameNotPartOfEnum`) and says nothing about what to type instead. Anything
+        // else clap rejects gets its diagnostics, which are about the arguments rather than the command.
+        if (parse_error == error.NameNotPartOfEnum) {
+            try err.print("zmux: unknown command\n", .{});
+            try printHelp(err);
+            try err.flush();
+            std.process.exit(2);
+        }
         try diag.report(err, parse_error);
         try err.flush();
         std.process.exit(2);
@@ -157,7 +151,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .kill => try runKill(gpa, init.environ, err, &args_iter, &diag),
         .kill_all => try runQuery(gpa, init.environ, out, err, .kill_all),
         .dump => try runDump(gpa, io, out),
-        .run => try runProgram(gpa, init.environ, out, err, &args_iter, &diag),
     }
 
     try out.flush();
@@ -176,19 +169,13 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\  detach          Detach the current client from its session
         \\  kill <session>  Terminate a session
         \\  kill-all        Terminate every session
-        \\  run [program]   Start a session running a program and attach to it
         \\  dump            Parse VT data from stdin and print the resulting screen
         \\
         \\Options:
         \\  -h, --help      Display this help and exit
         \\  -V, --version   Print the version and exit
         \\
-        \\Run options:
-        \\  -d, --detached  Start the session without attaching to it
-        \\  -n, --name <name>  Name the session instead of generating one
-        \\
         \\Attaching to a session that does not exist starts one running $SHELL.
-        \\Use run to start a session running a particular program.
         \\
     );
 }
@@ -498,112 +485,6 @@ fn runKill(
         try err.flush();
         std.process.exit(1);
     }
-}
-
-/// Start a session, optionally attaching to it.
-fn runProgram(
-    gpa: std.mem.Allocator,
-    environ: std.process.Environ,
-    out: *std.Io.Writer,
-    err: *std.Io.Writer,
-    args_iter: *std.process.Args.Iterator,
-    diag: *clap.Diagnostic,
-) !void {
-    var result = clap.parseEx(clap.Help, &run_params, run_parsers, args_iter, .{
-        .diagnostic = diag,
-        .allocator = gpa,
-    }) catch |parse_error| {
-        try diag.report(err, parse_error);
-        try err.flush();
-        std.process.exit(2);
-    };
-    defer result.deinit();
-
-    const detached = result.args.detached != 0;
-
-    // The session name is either given or generated from the clock, which is
-    // enough to be unique among the sessions one user is likely to have.
-    var name_buffer: [protocol.name_max]u8 = undefined;
-    const name = if (result.args.name) |given|
-        given
-    else
-        std.fmt.bufPrint(&name_buffer, "{d}", .{milliTimestamp() & 0xffffff}) catch "session";
-
-    const session_name = protocol.Name.init(name) catch {
-        try err.writeAll("zmux: invalid session name\n");
-        try err.flush();
-        std.process.exit(2);
-    };
-
-    // A generated name is reported, because otherwise there is no way to
-    // attach to the session later.
-    if (result.args.name == null) {
-        try err.print("zmux: session {s}\n", .{name});
-        try err.flush();
-    }
-
-    try ensureServer(gpa, environ, err);
-
-    // The program travels as one NUL-separated blob, matching what `execve`
-    // wants on the other side. `positionals` is a tuple with one field per
-    // positional parameter, so the variadic `<PROGRAM>...` is its single element.
-    var program: std.ArrayList(u8) = .empty;
-    defer program.deinit(gpa);
-    const given_program = result.positionals[0];
-    if (given_program.len > 0) {
-        try protocol.joinProgram(&program, gpa, given_program);
-    }
-
-    // The size comes from this terminal when attaching, and from a default when
-    // there is none, because a detached session still needs a screen to draw
-    // into. The terminal is entered only to measure it and is restored
-    // immediately; the client enters it again for the session itself.
-    var size = terminal_mod.vtSize{ .rows = 24, .cols = 80 };
-    var have_terminal = false;
-    if (!detached) {
-        if (terminal_mod.Terminal.enter() catch null) |local| {
-            var probe = local;
-            have_terminal = true;
-            defer probe.leave();
-            if (probe.size() catch null) |probed| {
-                if (probed.rows != 0 and probed.cols != 0) size = probed;
-            }
-        }
-    }
-
-    const paths = try Paths.resolve(environ);
-    const mode: client_mod.Mode = if (detached) .query else .interactive;
-    const client = client_mod.Client.init(gpa, paths.socket_path, mode, out, err) catch {
-        try err.writeAll("zmux: cannot reach the server\n");
-        try err.flush();
-        std.process.exit(1);
-    };
-    defer client.deinit();
-
-    try client.sendRequest(.{ .create = .{
-        .name = session_name,
-        .rows = size.rows,
-        .cols = size.cols,
-        .program = program.items,
-    } });
-
-    if (detached) {
-        try client.runQuery();
-        return;
-    }
-
-    if (!have_terminal) {
-        try err.writeAll("zmux: run needs a terminal on stdin; use -d to start detached\n");
-        try err.flush();
-        std.process.exit(1);
-    }
-
-    client.runInteractive(size.rows, size.cols) catch |run_error| switch (run_error) {
-        else => {
-            try err.print("zmux: {s}\n", .{@errorName(run_error)});
-            try err.flush();
-        },
-    };
 }
 
 fn runDump(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer) !void {

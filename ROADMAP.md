@@ -91,6 +91,10 @@ typing text, leaving insert mode, `:w` and `:q!` all work, and the file is
 written. `tools/drive.zig` is the harness that feeds those keystrokes on a
 schedule; build it with `zig build drive`.
 
+`run` no longer exists: a later phase replaced it with `attach`, which always gives
+you a shell. The harness now drives `zmux attach`. See "What `attach` and the session
+name mean" below.
+
 Still no server and no socket in this phase: one process owns one pty and
 renders to its own terminal.
 
@@ -266,7 +270,7 @@ while nothing was watching, `ctrl-a` detaches without ending it, and `kill`,
 pass of the loop, which needs no signal plumbing and cannot miss a child, because
 the pty's readability already wakes the loop when the child dies.
 
-### What `attach`, `run` and the session name mean
+### What `attach` and the session name mean
 
 These were settled after the phase, because the first version was confusing in a way
 that only showed up in use.
@@ -276,18 +280,20 @@ that only showed up in use.
 of the interface for reaching it: `zmux attach work` puts you in a shell called
 `work`, whether or not it was already running.
 
-`run [program]` starts a session running a particular program and attaches to it. The
-session name is generated unless `-n` is given, and is printed for that reason.
+There used to be a `run` command as well, which started a session running a
+particular program. It was removed in a later commit, for two reasons. It existed
+only because Phase 1 had no server, so it was the only way to get a program onto a
+pty, and it stayed afterwards by inertia: a session containing a shell can start
+anything, and the session survives what it starts. And it carried the bug that made
+`run work` try to execute a program called `work`, because two commands both took a
+positional, one meaning a session and one meaning a program, with nothing to tell
+them apart. The symptom was "the shell prompt never appears" plus a session name the
+user did not recognise, and neither pointed at the cause.
 
-The earlier version had `attach` fail on an unknown session and `run` take a program
-as its first positional, which meant `run work` tried to execute a program called
-`work`, failed to find it, and left a pane whose program had already exited. The
-symptoms were "the shell prompt never appears" and a session name the user did not
-recognise. Nothing about that is a bug in the code; it is a command whose meaning was
-not what a user would assume, and the assumption is the right one.
-
-A missing program still fails silently, which is a separate gap: the child exits and
-the pane keeps a blank screen with nothing saying why.
+Nothing about that was a defect in the code. It was a command whose meaning was not
+what a user would assume, and the assumption was the right one. It was found by the
+user trying it, which is the only way it was going to be found: every test passed
+throughout.
 
 ### Two bugs this phase found
 
@@ -314,8 +320,8 @@ anything else touches the iterator.
 A second trap in the same area, which cost time while diagnosing rather than in
 the product: clap numbers positionals by declaration order across *all* parameters,
 so an option whose value name matches a positional's shifts the positional's slot.
-`attach` and `kill` now have their own parameter lists, and only `run` declares
-`--name`.
+`attach` and `kill` therefore have their own parameter lists, and neither declares an
+option sharing a value name with its positional.
 
 
 ## Phase 4 — multiple panes (done)
