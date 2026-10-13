@@ -86,9 +86,15 @@ pub const Request = union(enum) {
     },
     /// Terminate every session.
     kill_all,
-    /// Keystrokes destined for the attached session's program.
+    /// Keystrokes destined for one pane of the attached session.
+    ///
+    /// The pane identifier is carried rather than taken from focus, because the two
+    /// can differ: a keystroke already in flight when focus moves must reach the pane
+    /// the user was typing into, not whichever pane is focused by the time the server
+    /// reads it.
     input: struct {
         name: Name,
+        pane: u64,
         data: []const u8,
     },
     /// The client's terminal changed size.
@@ -97,6 +103,36 @@ pub const Request = union(enum) {
         rows: u16,
         cols: u16,
     },
+    /// Divide the focused pane, starting a new program in the new half.
+    split: struct {
+        name: Name,
+        /// 0 for a side-by-side split, 1 for a stacked one. A number rather than
+        /// an enum because this is a wire value.
+        axis: u8,
+        /// The program for the new pane, NUL-separated. Empty means `$SHELL`.
+        program: []const u8,
+    },
+    /// Close the focused pane, ending its program.
+    close: struct {
+        name: Name,
+    },
+    /// Move focus within the session. `backwards` reverses the direction.
+    focus: struct {
+        name: Name,
+        backwards: bool,
+    },
+};
+
+/// Where one pane sits in the session's area, in cells.
+///
+/// Absolute and zero-based, matching `layout.Rect`. The server computes these
+/// because it owns the tree; the client only paints into them, which is what keeps
+/// the two sides from disagreeing about geometry.
+pub const Rect = struct {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
 };
 
 /// One session, as it appears in a listing.
@@ -138,15 +174,45 @@ pub const Event = union(enum) {
         /// The exit status, or 128 + signal when the program was signalled.
         status: u8,
     },
-    /// Output from a session's program, exactly as it left the pty.
+    /// Output from one pane's program, exactly as it left the pty.
+    ///
+    /// Tagged with the pane rather than with the session, because a session may hold
+    /// several programs and each has its own screen. The client keeps one terminal
+    /// per pane and feeds the bytes to the right one.
     output: struct {
         name: Name,
+        pane: u64,
         data: []const u8,
+    },
+    /// The session's panes and their geometry, sent whenever the layout changes.
+    ///
+    /// This is the whole layout rather than a delta, because the client's job is to
+    /// draw the current arrangement and a delta would let it drift from the server's
+    /// tree with no way to notice. The list is empty when the session has no panes
+    /// left.
+    layout: struct {
+        name: Name,
+        /// The rectangle all the panes share, which is the area the client has for
+        /// the session. Panes are positioned inside it.
+        area_rows: u16,
+        area_cols: u16,
+        /// The pane holding focus, or zero when there is none.
+        focused: u64,
+        panes: []const PanePlacement,
     },
     /// A request was rejected, or a listing is empty.
     failure: struct {
         message: []const u8,
     },
+};
+
+/// One pane's identity and position within a session.
+pub const PanePlacement = struct {
+    id: u64,
+    rect: Rect,
+    /// Whether the pane's program is still running. A pane whose child has exited
+    /// keeps its screen until it is closed.
+    exited: bool,
 };
 
 /// Wire tags.
@@ -163,6 +229,9 @@ pub const Tag = struct {
     pub const kill_all: u8 = 6;
     pub const input: u8 = 7;
     pub const resize: u8 = 8;
+    pub const split: u8 = 9;
+    pub const close: u8 = 10;
+    pub const focus: u8 = 11;
     // Events, 64..=127. The gap leaves room to add either kind later without
     // renumbering.
     pub const session: u8 = 64;
@@ -173,6 +242,7 @@ pub const Tag = struct {
     pub const exited: u8 = 69;
     pub const output: u8 = 70;
     pub const failure: u8 = 71;
+    pub const layout: u8 = 72;
 };
 
 /// Appends fields to a buffer.
@@ -213,6 +283,20 @@ pub const Encoder = struct {
     fn i32le(self: *Encoder, value: i32) !void {
         var bytes: [4]u8 = undefined;
         std.mem.writeInt(i32, &bytes, value, .little);
+        try self.buffer.appendSlice(self.gpa, &bytes);
+    }
+
+    fn u32le(self: *Encoder, value: u32) !void {
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, value, .little);
+        try self.buffer.appendSlice(self.gpa, &bytes);
+    }
+
+    /// Pane identifiers are 64-bit because they are counters that must not wrap
+    /// within the life of a session, and a client may hold a stale one.
+    fn u64le(self: *Encoder, value: u64) !void {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, value, .little);
         try self.buffer.appendSlice(self.gpa, &bytes);
     }
 
@@ -268,6 +352,7 @@ pub const Encoder = struct {
             .input => |input| {
                 try self.begin(Tag.input);
                 try self.name(&input.name);
+                try self.u64le(input.pane);
                 try self.blob(input.data);
             },
             .resize => |resize| {
@@ -275,6 +360,21 @@ pub const Encoder = struct {
                 try self.name(&resize.name);
                 try self.u16le(resize.rows);
                 try self.u16le(resize.cols);
+            },
+            .split => |split| {
+                try self.begin(Tag.split);
+                try self.name(&split.name);
+                try self.u8le(split.axis);
+                try self.blob(split.program);
+            },
+            .close => |close| {
+                try self.begin(Tag.close);
+                try self.name(&close.name);
+            },
+            .focus => |focus| {
+                try self.begin(Tag.focus);
+                try self.name(&focus.name);
+                try self.u8le(if (focus.backwards) 1 else 0);
             },
         }
         return self.finish();
@@ -312,9 +412,29 @@ pub const Encoder = struct {
                 try self.u8le(exited.status);
             },
             .output => |output| {
+                // The pane identifier precedes the payload so that a client can
+                // dispatch the bytes before looking at them.
                 try self.begin(Tag.output);
                 try self.name(&output.name);
+                try self.u64le(output.pane);
                 try self.blob(output.data);
+            },
+            .layout => |layout| {
+                try self.begin(Tag.layout);
+                try self.name(&layout.name);
+                try self.u16le(layout.area_rows);
+                try self.u16le(layout.area_cols);
+                try self.u64le(layout.focused);
+                if (layout.panes.len > std.math.maxInt(u16)) return Error.BadLength;
+                try self.u16le(@intCast(layout.panes.len));
+                for (layout.panes) |placement| {
+                    try self.u64le(placement.id);
+                    try self.u16le(placement.rect.x);
+                    try self.u16le(placement.rect.y);
+                    try self.u16le(placement.rect.width);
+                    try self.u16le(placement.rect.height);
+                    try self.u8le(if (placement.exited) 1 else 0);
+                }
             },
             .failure => |failure| {
                 try self.begin(Tag.failure);
@@ -334,6 +454,14 @@ pub const Encoder = struct {
 pub const Decoder = struct {
     bytes: []const u8,
     offset: usize = 0,
+    /// Storage for a decoded `layout` event's placements.
+    ///
+    /// The decoder does not allocate, so the room comes from here. A layout message
+    /// carrying more panes than this is rejected rather than truncated; the bound
+    /// matches the tree's own limit on how many panes it will navigate.
+    placements: [max_panes]PanePlacement = undefined,
+
+    pub const max_panes = 256;
 
     pub fn init(bytes: []const u8) Decoder {
         return .{ .bytes = bytes };
@@ -362,6 +490,18 @@ pub const Decoder = struct {
         return std.mem.readInt(i32, self.bytes[self.offset..][0..4], .little);
     }
 
+    fn u32le(self: *Decoder) Error!u32 {
+        if (self.offset + 4 > self.bytes.len) return Error.BadLength;
+        defer self.offset += 4;
+        return std.mem.readInt(u32, self.bytes[self.offset..][0..4], .little);
+    }
+
+    fn u64le(self: *Decoder) Error!u64 {
+        if (self.offset + 8 > self.bytes.len) return Error.BadLength;
+        defer self.offset += 8;
+        return std.mem.readInt(u64, self.bytes[self.offset..][0..8], .little);
+    }
+
     fn name(self: *Decoder) Error!Name {
         const length = try self.u8le();
         if (length == 0 or length > name_max) return Error.BadValue;
@@ -373,8 +513,10 @@ pub const Decoder = struct {
     }
 
     fn blob(self: *Decoder) Error![]const u8 {
-        const length = std.mem.readInt(u32, self.bytes[self.offset..][0..4], .little);
-        self.offset += 4;
+        // The length is read through `u32le`, which bounds-checks the four bytes
+        // before them. Reading them directly would run off the end of a message
+        // that ended after its tag.
+        const length = try self.u32le();
         if (self.offset + length > self.bytes.len) return Error.BadLength;
         defer self.offset += length;
         return self.bytes[self.offset..][0..length];
@@ -403,12 +545,23 @@ pub const Decoder = struct {
             Tag.kill => Request{ .kill = .{ .name = try self.name() } },
             Tag.input => Request{ .input = .{
                 .name = try self.name(),
+                .pane = try self.u64le(),
                 .data = try self.blob(),
             } },
             Tag.resize => Request{ .resize = .{
                 .name = try self.name(),
                 .rows = try self.u16le(),
                 .cols = try self.u16le(),
+            } },
+            Tag.split => Request{ .split = .{
+                .name = try self.name(),
+                .axis = try self.u8le(),
+                .program = try self.blob(),
+            } },
+            Tag.close => Request{ .close = .{ .name = try self.name() } },
+            Tag.focus => Request{ .focus = .{
+                .name = try self.name(),
+                .backwards = (try self.u8le()) != 0,
             } },
             else => Error.UnknownTag,
         };
@@ -441,7 +594,42 @@ pub const Decoder = struct {
             } },
             Tag.output => Event{ .output = .{
                 .name = try self.name(),
+                .pane = try self.u64le(),
                 .data = try self.blob(),
+            } },
+            Tag.layout => Event{ .layout = blk: {
+                const session_name = try self.name();
+                const area_rows = try self.u16le();
+                const area_cols = try self.u16le();
+                const focused = try self.u64le();
+                const count = try self.u16le();
+
+                // The placements are decoded field by field into the caller's
+                // buffer. Reinterpreting the message bytes as `[]PanePlacement`
+                // would be faster and wrong: the wire format is packed, the struct
+                // has alignment and padding, and a peer could hand over bytes that
+                // happen to parse as a different length than they occupy.
+                if (count > self.placements.len) return Error.BadLength;
+                var index: usize = 0;
+                while (index < count) : (index += 1) {
+                    self.placements[index] = .{
+                        .id = try self.u64le(),
+                        .rect = .{
+                            .x = try self.u16le(),
+                            .y = try self.u16le(),
+                            .width = try self.u16le(),
+                            .height = try self.u16le(),
+                        },
+                        .exited = (try self.u8le()) != 0,
+                    };
+                }
+                break :blk .{
+                    .name = session_name,
+                    .area_rows = area_rows,
+                    .area_cols = area_cols,
+                    .focused = focused,
+                    .panes = self.placements[0..index],
+                };
             } },
             Tag.failure => Event{ .failure = .{ .message = try self.blob() } },
             else => Error.UnknownTag,
@@ -474,6 +662,137 @@ pub fn joinProgram(out: *std.ArrayList(u8), gpa: std.mem.Allocator, argv: []cons
         // so it cannot be represented and is not silently dropped.
         if (std.mem.indexOfScalar(u8, argument, 0) != null) return Error.BadValue;
         try out.appendSlice(gpa, argument);
+    }
+}
+
+test "a layout event round-trips with every pane's rectangle intact" {
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const placements = [_]PanePlacement{
+        .{ .id = 1, .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 }, .exited = false },
+        .{ .id = 2, .rect = .{ .x = 40, .y = 0, .width = 40, .height = 12 }, .exited = true },
+        .{ .id = 3, .rect = .{ .x = 40, .y = 12, .width = 40, .height = 12 }, .exited = false },
+    };
+
+    const frame = try encoder.writeEvent(.{ .layout = .{
+        .name = try Name.init("work"),
+        .area_rows = 24,
+        .area_cols = 80,
+        .focused = 3,
+        .panes = &placements,
+    } });
+
+    var decoder = Decoder.init(frame);
+    const event = try decoder.event();
+    try std.testing.expect(event.layout.name.eql("work"));
+    try std.testing.expectEqual(@as(u16, 24), event.layout.area_rows);
+    try std.testing.expectEqual(@as(u16, 80), event.layout.area_cols);
+    try std.testing.expectEqual(@as(u64, 3), event.layout.focused);
+    try std.testing.expectEqual(@as(usize, 3), event.layout.panes.len);
+
+    // Each placement is checked field by field: a packed wire format re-read as a
+    // padded struct is exactly the kind of mismatch that would silently shift every
+    // rectangle by a few cells.
+    for (placements, event.layout.panes) |expected, got| {
+        try std.testing.expectEqual(expected.id, got.id);
+        try std.testing.expectEqual(expected.rect.x, got.rect.x);
+        try std.testing.expectEqual(expected.rect.y, got.rect.y);
+        try std.testing.expectEqual(expected.rect.width, got.rect.width);
+        try std.testing.expectEqual(expected.rect.height, got.rect.height);
+        try std.testing.expectEqual(expected.exited, got.exited);
+    }
+}
+
+test "a layout event with no panes round-trips" {
+    // A session whose last pane was closed still reports its area, so that the
+    // client knows how much room it has and can draw background.
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const frame = try encoder.writeEvent(.{ .layout = .{
+        .name = try Name.init("empty"),
+        .area_rows = 24,
+        .area_cols = 80,
+        .focused = 0,
+        .panes = &.{},
+    } });
+
+    var decoder = Decoder.init(frame);
+    const event = try decoder.event();
+    try std.testing.expectEqual(@as(usize, 0), event.layout.panes.len);
+    try std.testing.expectEqual(@as(u64, 0), event.layout.focused);
+}
+
+test "a truncated layout event is rejected rather than read past its end" {
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const placements = [_]PanePlacement{
+        .{ .id = 1, .rect = .{ .x = 0, .y = 0, .width = 40, .height = 24 }, .exited = false },
+    };
+
+    // Claim two placements but supply one, so the second read runs off the end.
+    const frame = try encoder.writeEvent(.{ .layout = .{
+        .name = try Name.init("work"),
+        .area_rows = 24,
+        .area_cols = 80,
+        .focused = 1,
+        .panes = &placements,
+    } });
+
+    var bytes = try gpa.dupe(u8, frame);
+    defer gpa.free(bytes);
+    // The count is the last two bytes of the fixed part, just after the name and
+    // the three scalars.
+    const count_offset = 1 + 1 + 4 + 2 + 2 + 8;
+    std.mem.writeInt(u16, bytes[count_offset..][0..2], 2, .little);
+
+    var decoder = Decoder.init(bytes);
+    try std.testing.expectError(Error.BadLength, decoder.event());
+}
+
+test "split, close and focus requests round-trip" {
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const name = try Name.init("work");
+
+    {
+        const frame = try encoder.writeRequest(.{ .split = .{
+            .name = name,
+            .axis = 1,
+            .program = "vim\x00notes.txt",
+        } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expectEqual(@as(u8, 1), request.split.axis);
+        try std.testing.expectEqualStrings("vim\x00notes.txt", request.split.program);
+    }
+
+    {
+        const frame = try encoder.writeRequest(.{ .focus = .{
+            .name = name,
+            .backwards = true,
+        } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expect(request.focus.backwards);
+    }
+
+    {
+        const frame = try encoder.writeRequest(.{ .close = .{ .name = name } });
+        var decoder = Decoder.init(frame);
+        const request = try decoder.request();
+        try std.testing.expect(request.close.name.eql("work"));
     }
 }
 
@@ -528,10 +847,12 @@ test "a request survives a round trip" {
     {
         const frame = try encoder.writeRequest(.{ .input = .{
             .name = name,
+            .pane = 7,
             .data = "ls -la\n",
         } });
         var decoder = Decoder.init(frame);
         const request = try decoder.request();
+        try std.testing.expectEqual(@as(u64, 7), request.input.pane);
         try std.testing.expectEqualStrings("ls -la\n", request.input.data);
     }
 
@@ -580,6 +901,7 @@ test "output carrying arbitrary bytes survives a round trip" {
 
     const frame = try encoder.writeEvent(.{ .output = .{
         .name = try Name.init("tty"),
+        .pane = 3,
         .data = raw,
     } });
 
