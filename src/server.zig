@@ -545,6 +545,17 @@ pub const Server = struct {
 
             self.reapChildren();
             self.sweepClients();
+
+            // Every client is flushed once per pass, after all the events have been handled. Replies
+            // are queued from several places -- a client request, a pane's output, a pane ending -- and
+            // only the request path used to flush, so output from a pane sat in the queue until that
+            // client next sent something. That made a session feel one keystroke behind, and lost the
+            // last message outright when the user stopped typing.
+            for (self.clients.items, 0..) |client, index| {
+                if (client.gone) continue;
+                if (client.outgoing.items.len == 0) continue;
+                self.flushClient(index) catch {};
+            }
         }
     }
 
@@ -1128,37 +1139,47 @@ pub const Server = struct {
     }
 
     /// Read one pane's pty and forward whatever arrived to every watcher.
+    ///
+    /// The pty is drained rather than read once. A program that answers a keystroke with an echo and
+    /// then a response produces two separate writes, and reading one per wakeup leaves the second
+    /// sitting in the kernel until the next event arrives -- which, with nothing else happening, is
+    /// the next keystroke. That is what made typing feel one character behind.
     fn servicePane(self: *Server, session_index: usize, pane_index: usize) !void {
         const session = &self.sessions.items[session_index];
         if (pane_index >= session.panes.items.len) return;
         const pane = &session.panes.items[pane_index];
 
-        const read = pane.pty.read(pane.read_buffer) catch |err| switch (err) {
-            pty_mod.Error.Closed => {
-                // The slave closed, so the child is gone even if the exit status has not
-                // been collected yet. A pane whose child has exited keeps its screen, so
-                // this is not the same as closing it.
-                try self.paneEnded(session_index, pane_index, pane.status);
-                return;
-            },
-            else => return err,
-        };
-        if (read == 0) return;
+        // Bounded so that a program producing output faster than the client can consume it cannot
+        // hold the loop here forever; the next wakeup picks up where this stops.
+        var rounds: usize = 0;
+        while (rounds < 32) : (rounds += 1) {
+            const read = pane.pty.read(pane.read_buffer) catch |err| switch (err) {
+                pty_mod.Error.Closed => {
+                    // The slave closed, so the child is gone even if the exit status has not been
+                    // collected yet. A pane whose child has exited keeps its screen, so this is not
+                    // the same as closing it.
+                    try self.paneEnded(session_index, pane_index, pane.status);
+                    return;
+                },
+                else => return err,
+            };
+            if (read == 0) return;
 
-        pane.terminal.write(pane.read_buffer[0..read]);
+            pane.terminal.write(pane.read_buffer[0..read]);
 
-        // Replies the parser produced go back to the program before any output is
-        // forwarded, because a program waiting on one is not producing more.
-        pane.flushReply();
+            // Replies the parser produced go back to the program before any output is forwarded,
+            // because a program waiting on one is not producing more.
+            pane.flushReply();
 
-        // The bytes are forwarded unchanged, tagged with the pane. The client has its
-        // own terminal per pane and parses them itself, which is what lets the two sides
-        // disagree about the screen without the server having to reconcile them.
-        try self.broadcast(session, .{ .output = .{
-            .name = session.name,
-            .pane = pane.id,
-            .data = pane.read_buffer[0..read],
-        } });
+            // The bytes are forwarded unchanged, tagged with the pane. The client has its own terminal
+            // per pane and parses them itself, which is what lets the two sides disagree about the
+            // screen without the server having to reconcile them.
+            try self.broadcast(session, .{ .output = .{
+                .name = session.name,
+                .pane = pane.id,
+                .data = pane.read_buffer[0..read],
+            } });
+        }
     }
 
     fn reapChildren(self: *Server) void {

@@ -317,12 +317,28 @@ pub const Client = struct {
                     }
                 } else if (fd == 0) {
                     if (try self.handleLocalInput()) return;
-                } else {
-                    const read = self.connection.read(&buffer) catch return;
-                    if (read == 0) continue;
-                    try self.frame.feed(self.gpa, buffer[0..read], self, Client.onMessage);
-                    if (self.finished) break;
+                    // The screen is repainted after input as well as after output. A program that
+                    // echoes what it receives, or that answers a keystroke by drawing, sends its
+                    // answer back as a separate message; without a paint here the display shows the
+                    // state as of the previous keystroke, which reads as the terminal being one
+                    // character behind the typing. Painting is cheap when nothing changed, because
+                    // each pane only redraws the rows the library marks dirty.
                     self.draw(window);
+                } else {
+                    // The socket is drained before painting, so one repaint reflects everything that
+                    // has arrived rather than only the first segment. A program that echoes a
+                    // keystroke and then answers it produces two messages, and painting between them
+                    // shows a half-updated screen.
+                    var rounds: usize = 0;
+                    var drew = false;
+                    while (rounds < 32) : (rounds += 1) {
+                        const read = self.connection.read(&buffer) catch return;
+                        try self.frame.feed(self.gpa, buffer[0..read], self, Client.onMessage);
+                        if (self.finished) break;
+                        drew = true;
+                    }
+                    if (self.finished) break;
+                    if (drew) self.draw(window);
                 }
             }
         }
