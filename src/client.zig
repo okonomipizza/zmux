@@ -16,6 +16,7 @@ const vt = @import("vt.zig");
 const socket = @import("socket.zig");
 const protocol = @import("protocol.zig");
 const terminal_mod = @import("terminal.zig");
+const signal_mod = @import("signal.zig");
 
 pub const Error = error{
     /// A raw syscall failed.
@@ -183,7 +184,7 @@ pub const Client = struct {
         // The client's terminal is the authority on size, and it is read after
         // entering raw mode because that is when the size query is meaningful.
         const probed = local.size() catch terminal_mod.vtSize{ .rows = rows, .cols = cols };
-        const size = terminal_mod.vtSize{
+        const current_size = terminal_mod.vtSize{
             .rows = if (probed.rows == 0) rows else probed.rows,
             .cols = if (probed.cols == 0) cols else probed.cols,
         };
@@ -199,9 +200,18 @@ pub const Client = struct {
         self.write_context = .{ .owner = @ptrCast(self) };
         self.terminal.?.setWritePty(&self.write_context, onWritePty);
 
-        const epfd = try createPoll(self.connection.fd, 0);
+        // The window may be resized while attached, and the kernel signals this
+        // process rather than the program on the far side of the pty, so the new
+        // size is read here and sent on as a request. `SIGWINCH`'s default action
+        // is to be ignored, so a client that failed to claim it would simply
+        // never notice a resize.
+        var signals = try signal_mod.Source.init(&.{linux.SIG.WINCH});
+        defer signals.deinit();
+
+        const epfd = try createPoll(self.connection.fd, 0, signals.fd);
         defer _ = linux.close(epfd);
 
+        var size = current_size;
         var buffer: [16 * 1024]u8 = undefined;
         while (!self.finished) {
             var events: [8]linux.epoll_event = undefined;
@@ -210,7 +220,40 @@ pub const Client = struct {
             if (linux.errno(count) != .SUCCESS) return Error.SyscallFailed;
 
             for (events[0..count]) |event| {
-                if (event.data.fd == 0) {
+                const fd = event.data.fd;
+                if (fd == signals.fd) {
+                    if (try signals.drain() == 0) continue;
+                    // The signal itself carries no size, so the terminal is asked
+                    // for the new one. A failed query leaves the size alone rather
+                    // than resizing to zero.
+                    if (self.local) |local_terminal| {
+                        if (local_terminal.size() catch null) |resized| {
+                            if (resized.rows == 0 or resized.cols == 0) continue;
+                            if (resized.rows == size.rows and resized.cols == size.cols) continue;
+
+                            size = resized;
+                            try self.sendRequest(.{ .resize = .{
+                                .name = self.watching,
+                                .rows = resized.rows,
+                                .cols = resized.cols,
+                            } });
+
+                            // The local screen is now the wrong shape, so it is
+                            // rebuilt at the new size. The renderer's dirty table is
+                            // resized with it, and everything is marked for repaint
+                            // because every row has moved.
+                            self.terminal.?.resize(
+                                resized.cols,
+                                resized.rows,
+                                0,
+                                0,
+                            ) catch {};
+                            self.renderer.?.resize(resized.rows) catch {};
+                            try self.local.?.writeAll("\x1b[2J");
+                            self.draw();
+                        }
+                    }
+                } else if (fd == 0) {
                     if (try self.handleLocalInput(size)) return;
                 } else {
                     const read = self.connection.read(&buffer) catch return;
@@ -381,7 +424,7 @@ pub const Client = struct {
     }
 };
 
-fn createPoll(socket_fd: i32, terminal_fd: i32) !i32 {
+fn createPoll(socket_fd: i32, terminal_fd: i32, signal_fd: i32) !i32 {
     const epfd_raw = linux.epoll_create1(linux.EPOLL.CLOEXEC);
     if (linux.errno(epfd_raw) != .SUCCESS) return Error.SyscallFailed;
     const epfd: i32 = @intCast(epfd_raw);
@@ -389,6 +432,7 @@ fn createPoll(socket_fd: i32, terminal_fd: i32) !i32 {
 
     try register(epfd, socket_fd, linux.EPOLL.IN);
     try register(epfd, terminal_fd, linux.EPOLL.IN);
+    try register(epfd, signal_fd, linux.EPOLL.IN);
     return epfd;
 }
 

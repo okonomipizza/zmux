@@ -151,15 +151,44 @@ Draw the screen and a minimal frame around it.
 - Enter the alternate screen, enable raw mode, restore on exit
 - Render from the render state, redrawing only rows the library marks dirty
 - Draw a status line, and the cursor at its reported viewport position
-- Handle `SIGWINCH` and propagate the new size
+- Handle `SIGWINCH` and propagate the new size (done in Phase 3.1)
 
 Judgement: an editor is usable, with correct colors and a visible cursor.
 
 Much of what this phase listed arrived early, in Phase 1: the alternate screen,
 raw mode with restoration, incremental repainting of the rows the library marks
-dirty, and the cursor at its reported position. What remains is the frame around
-the screen — a status line — and reacting to `SIGWINCH` while attached rather
-than only measuring the terminal at attach time.
+dirty, and the cursor at its reported position. `SIGWINCH` arrived in Phase 3.1,
+below, because it only became meaningful once there was a server to tell. What
+remains is the frame around the screen: a status line.
+
+## Phase 3.1 — resizing (done)
+
+Make a resized window reach the program in the session.
+
+The kernel signals whoever holds the terminal, which is the client, while the
+program is on the far side of a pty the server owns. So the client reads the new
+size and forwards it: client gets `SIGWINCH`, queries the terminal, sends a
+`resize` request, the server applies `TIOCSWINSZ` and resizes its terminal, and
+the kernel then signals the program, which re-reads the size itself.
+
+`SIGWINCH` is delivered through `signalfd` rather than a handler, so it arrives as
+one more readable descriptor in the epoll loop that already exists. A handler
+would have to hand the news to that loop through an atomic flag, and the loop
+would then have to poll the flag — either blocking for up to some timeout or
+busy-looping. The loop has no timeout, because one would wake it forever for
+nothing.
+
+Verified: a shell that traps `WINCH` and prints `stty size` logs `start 24 80`
+when its pty is created and `winch 40 100` after the attached client's terminal is
+resized to 40x100, and `zmux ls` then reports the session as 100x40.
+
+Two notes on the implementation. The signal set must be *blocked* before the
+signalfd is created; a blocked signal is not delivered to its default action and
+is not dropped, it stays pending until the descriptor is read. And there are two
+different `sigset_t` definitions in the standard library — the kernel's array of
+`c_ulong` and the one `std.posix` resolves to when linking libc — which are not
+interchangeable; this module uses the `std.posix` one throughout so its wrappers
+and the raw syscall agree.
 
 ## Phase 3 — server, sessions and IPC (done)
 
@@ -279,15 +308,11 @@ describe a snapshot API, but the pinned build does not export those symbols, so
 serialising terminal state is not available today. Sessions are therefore lost
 when the server exits, and a client reports that the connection went away.
 
-**SIGWINCH while attached.** A client measures its terminal once, when it
-attaches. Resizing the terminal mid-session is not yet noticed, so the session
-keeps its old size until the client reattaches. Handling it means watching for
-the signal and sending a `resize` request.
-
 **Several clients of different sizes.** Attaching resizes the session to the
 newest client's terminal, so two clients of different sizes fight over it. The
 compromise is the one tmux makes; a better answer is to size to the smallest and
-letterbox the rest.
+letterbox the rest. Resizing an *attached* client now propagates correctly, but
+the choice of which client wins is still last-one-in.
 
 **Copy mode.** Scrollback browsing, selection and search are natural for a
 multiplexer but are a phase of their own. `ghostty_terminal_scroll_viewport`

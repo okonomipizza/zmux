@@ -671,6 +671,7 @@ test {
     _ = server_mod;
     _ = client_mod;
     _ = socket;
+    _ = @import("signal.zig");
 }
 
 test "a copied name outlives the iterator's buffer" {

@@ -44,6 +44,9 @@ nothing: the program keeps running while nothing is watching, and reattaching
 redraws the screen as it stands. A server is started on first use and keeps
 running until `kill-all`.
 
+Resizing the window while attached reaches the program inside the session, so a
+full-screen editor re-lays out without being detached and reattached.
+
 `dump` parses escape sequences on stdin and prints the resulting screen, which
 is useful for inspecting what zmux makes of a byte stream:
 
@@ -116,6 +119,7 @@ src/protocol.zig    the client/server message set and its encoding
 src/runtime.zig     where the socket lives, and starting a server on demand
 src/server.zig      the session registry and its epoll loop
 src/client.zig      attach, detach, and rendering what the server sends
+src/signal.zig      signals delivered as a descriptor, for SIGWINCH
 tools/drive.zig     test driver that plays keystrokes into a program
 flake.nix           dev shell, package, and formatter
 ARCHITECTURE.md     process model, data structures, and design decisions
