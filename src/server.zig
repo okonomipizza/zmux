@@ -25,6 +25,7 @@ const pty_mod = @import("pty.zig");
 const socket = @import("socket.zig");
 const layout = @import("layout.zig");
 const protocol = @import("protocol.zig");
+const terminal_mod = @import("terminal.zig");
 
 pub const Error = error{
     /// A raw syscall failed.
@@ -1615,13 +1616,14 @@ const ScreenPainter = struct {
         var line: std.ArrayList(u8) = .empty;
         defer line.deinit(self.gpa);
 
+        // The style starts from whatever the terminal is in after this row's cursor move, which is
+        // whatever the previous row's last cell left it in, so it begins unset for every row.
         var collector = CellCollector{ .line = &line, .gpa = self.gpa };
         _ = row.forEachCell(&collector, CellCollector.collect) catch {};
 
-        // Trailing blanks are skipped so the stream stays short, and a row of
-        // only blanks emits nothing at all.
-        const text = std.mem.trimEnd(u8, line.items, " ");
-        if (text.len == 0) return;
+        // A row of nothing but blanks would draw nothing, so it is skipped rather than costing a
+        // cursor move and a reset.
+        if (isBlankRow(line.items)) return;
 
         var move_buffer: [32]u8 = undefined;
         const move = try std.fmt.bufPrint(
@@ -1630,16 +1632,82 @@ const ScreenPainter = struct {
             .{self.row_index + 1},
         );
         try self.buffer.appendSlice(self.gpa, move);
-        try self.buffer.appendSlice(self.gpa, text);
+        try self.buffer.appendSlice(self.gpa, line.items);
+        // The row ends with a reset, so a colour cannot bleed into the next row or into the pane
+        // drawn after this one.
+        try self.buffer.appendSlice(self.gpa, "\x1b[0m");
     }
 };
 
+/// Whether a rendered row holds nothing but blanks.
+///
+/// Used to skip a row entirely, which is the only trimming worth doing: it saves a cursor move and
+/// a reset for a row that would draw nothing. Trailing blanks *within* a row are left alone, because
+/// the line carries SGR sequences and removing spaces from around them risks cutting a sequence or
+/// shortening a row without moving the cursor back. The bytes saved are not worth that risk; the
+/// screen's own painting, which is what a client uses between resends, does clip by cell count.
+fn isBlankRow(line: []const u8) bool {
+    var index: usize = 0;
+    while (index < line.len) {
+        const byte = line[index];
+        if (byte == ' ') {
+            index += 1;
+            continue;
+        }
+        // An escape sequence is not content.
+        if (byte == 0x1b) {
+            index += 1;
+            if (index < line.len and line[index] == '[') {
+                index += 1;
+                while (index < line.len and (line[index] < 0x40 or line[index] > 0x7e)) index += 1;
+                if (index < line.len) index += 1;
+                continue;
+            }
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 /// Copies the text of each cell into a line buffer.
+/// Copy one row's cells into a byte stream, styles included.
+///
+/// The styles matter as much as the glyphs. A screen is re-sent by re-emitting the sequences that
+/// would produce it, so a row copied without its colours arrives as plain text: a shell's prompt,
+/// `ls --color` output and an editor's syntax highlighting all lose their colour the moment a
+/// screen is re-sent. This is the path behind floating a pane, docking one, toggling the floats and
+/// resizing, which is why the colour appeared to vanish on those actions.
+///
+/// The style is written only when it changes from the previous cell, so a run of text in one colour
+/// costs one escape rather than one per character.
 const CellCollector = struct {
     line: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
+    /// The style the last cell was written with. Reset per row by the caller, since each row starts
+    /// after a cursor move and the terminal keeps whatever the previous row left it in.
+    current_style: vt.Style = .{},
 
     fn collect(self: *CellCollector, cell: *vt.CellIterator) void {
+        const style = cell.resolvedStyle();
+        if (!style.eql(self.current_style)) {
+            if (style.isDefault()) {
+                // Back to no styling. `SgrWriter` writes nothing for a default style, because a
+                // cell that asks for nothing should inherit the terminal rather than be forced to
+                // something. That is right for a screen being painted from scratch, where the row
+                // starts unstyled, and wrong halfway through a row: the previous cell's colour
+                // would run on to the end of the line. An explicit reset is what ends it.
+                self.line.appendSlice(self.gpa, "\x1b[0m") catch return;
+            } else {
+                terminal_mod.SgrWriter.write(self.line, self.gpa, style) catch {
+                    // A dropped escape would colour the rest of the line wrongly, so the row is left
+                    // as it is rather than written with the wrong colours.
+                    return;
+                };
+            }
+            self.current_style = style;
+        }
+
         var codepoints: [8]u32 = undefined;
         var utf8: [32]u8 = undefined;
         const bytes = cell.graphemesUtf8(&codepoints, &utf8);
@@ -2202,4 +2270,67 @@ test "the last pane's exit status is recorded before its session is discarded" {
     const recorded = exitStatusOf(&session);
     _ = session.panes.pop();
     try std.testing.expectEqual(@as(u8, 42), recorded);
+}
+
+test "a re-sent screen keeps the colours its cells have" {
+    // A screen is re-sent by re-emitting the sequences that would produce it, and the collector used
+    // to copy only glyphs. Every style was lost: a shell's prompt, `ls --color` output and an
+    // editor's highlighting all went plain the moment a screen was re-sent, which is what floating
+    // a pane, docking one, toggling the floats and resizing all do.
+    const gpa = std.testing.allocator;
+
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 2 });
+    defer terminal.deinit();
+    // Red text, so the terminal holds a styled cell to reproduce.
+    terminal.write("\x1b[31mRED\x1b[0m plain");
+    var render = try terminal.createRenderState();
+    defer render.deinit();
+
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    var collector = CellCollector{ .line = &line, .gpa = gpa };
+    const Walker = struct {
+        collector: *CellCollector,
+        fn visit(self: *@This(), row: *vt.RowIterator) bool {
+            _ = row.forEachCell(self.collector, CellCollector.collect) catch {};
+            return false;
+        }
+    };
+    var walker = Walker{ .collector = &collector };
+    try render.forEachRow(&walker, Walker.visit);
+
+    // The first cell's colour is written before its glyph, which is the whole point: without it the
+    // row would be the plain text "RED plain" and the terminal would draw it unstyled.
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "RED") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "plain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "\x1b[") != null);
+    // A colour introducer, not a bare reset: the glyphs have to arrive styled.
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "38;2;") != null or
+        std.mem.indexOf(u8, line.items, ";31") != null);
+
+    // And the introducer has to come *before* the glyph it styles. A colour written after the text,
+    // or not at all, leaves the row plain on the terminal that receives the resend.
+    const colour_at = std.mem.indexOf(u8, line.items, "\x1b[").?;
+    const red_at = std.mem.indexOf(u8, line.items, "RED").?;
+    try std.testing.expect(colour_at < red_at);
+
+    // The unstyled word after the reset is written with a reset rather than being left to inherit
+    // the red, so the styles are what the screen says rather than what the previous cell left.
+    const plain_at = std.mem.indexOf(u8, line.items, "plain").?;
+    const after_red = line.items[red_at..plain_at];
+    try std.testing.expect(std.mem.indexOf(u8, after_red, "\x1b[0m") != null);
+}
+
+test "a row of only blanks is skipped, and a row with content is not" {
+    // Skipping an empty row saves a cursor move and a reset, and it is the only trimming that is
+    // safe: the line carries escape sequences, so removing spaces from around them risks cutting a
+    // sequence in half.
+    try std.testing.expect(isBlankRow(""));
+    try std.testing.expect(isBlankRow("   "));
+    // A row whose only non-space bytes are an escape is still blank.
+    try std.testing.expect(isBlankRow("\x1b[0;38;2;1;2;3m   \x1b[0m"));
+
+    try std.testing.expect(!isBlankRow("x"));
+    try std.testing.expect(!isBlankRow(" x"));
+    try std.testing.expect(!isBlankRow("\x1b[0mtext"));
 }

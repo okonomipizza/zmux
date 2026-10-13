@@ -487,14 +487,38 @@ pub const CellIterator = struct {
         return value;
     }
 
+    /// Whether this cell carries any styling of its own.
+    ///
+    /// This is the flag that says whether a style is worth writing at all. The colour accessors
+    /// *resolve* a colour for every cell, including one that never asked for any: a plain cell
+    /// reports the terminal's default foreground rather than nothing. Reading that as a style made
+    /// every cell look styled, so a re-sent screen wrote an explicit colour for text that had none,
+    /// and the rest of the row inherited it.
+    pub fn hasStyling(self: CellIterator) bool {
+        var value: bool = false;
+        _ = c.ghostty_render_state_row_cells_get(
+            self.handle,
+            c.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING,
+            &value,
+        );
+        return value;
+    }
+
     /// Everything needed to draw this cell, gathered in one call.
     ///
     /// The colours come from the resolved accessors rather than from the style's own fields,
     /// because those may hold palette indices while these are RGB. A renderer would otherwise have
     /// to carry a palette and keep it matching the terminal's, which is a way to get the colours
     /// subtly wrong rather than to get them right.
+    ///
+    /// A cell with no styling reports no colours, whatever the resolved accessors say. A cell that
+    /// has styling keeps them, and one that asked only for a colour the terminal did not change is
+    /// indistinguishable from a plain cell by design: what matters for drawing is whether anything
+    /// has to be written, not whether the program mentioned it.
     pub fn resolvedStyle(self: CellIterator) Style {
         const raw = self.style();
+        if (!self.hasStyling()) return .{};
+
         const fg = self.foregroundColor();
         const bg = self.backgroundColor();
 
