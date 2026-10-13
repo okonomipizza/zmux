@@ -220,6 +220,63 @@ pub const Renderer = struct {
     }
 };
 
+/// Draws a one-row status line along the bottom of the terminal.
+///
+/// The row is *reserved*, not overlaid: the session's terminal is one row shorter
+/// than the window, so no program ever draws underneath this and nothing is
+/// covered up. tmux and screen make the same choice, and for the same reason — a
+/// full-screen editor uses every row it is given, so an overlay would hide real
+/// output.
+///
+/// The line is drawn in inverse video so that it reads as chrome rather than as
+/// part of the program's output.
+pub const StatusLine = struct {
+    /// A scratch buffer for composing the row, reused between frames.
+    buffer: std.ArrayList(u8) = .empty,
+
+    pub fn init() StatusLine {
+        return .{};
+    }
+
+    pub fn deinit(self: *StatusLine, gpa: std.mem.Allocator) void {
+        self.buffer.deinit(gpa);
+    }
+
+    /// Paint the status row.
+    ///
+    /// `row` is zero-based and is the last row of the window. The text is
+    /// truncated rather than wrapped, because a wrapped status line would push
+    /// the terminal's own scroll region around.
+    pub fn render(
+        self: *StatusLine,
+        gpa: std.mem.Allocator,
+        terminal: Terminal,
+        row: u16,
+        text: []const u8,
+        cols: u16,
+    ) !void {
+        var buffer = &self.buffer;
+        buffer.clearRetainingCapacity();
+
+        // Move to the row, erase it, then draw inverse video. The list's own
+        // `print` is used rather than a writer: `ArrayList.writer` does not exist
+        // in Zig 0.16, and the list takes the allocator per call instead.
+        try buffer.print(gpa, "\x1b[{d};1H\x1b[K\x1b[7m", .{row + 1});
+
+        // Truncating here rather than letting the terminal wrap keeps the layout
+        // predictable. The column count is authoritative.
+        const visible = if (text.len > cols) text[0..cols] else text;
+        try buffer.appendSlice(gpa, visible);
+
+        // Pad to the full width so the inverse background covers the row.
+        var written: usize = visible.len;
+        while (written < cols) : (written += 1) try buffer.append(gpa, ' ');
+
+        try buffer.appendSlice(gpa, "\x1b[0m");
+        try terminal.writeAll(buffer.items);
+    }
+};
+
 test "size reports the terminal dimensions" {
     // Only meaningful when attached to a terminal, which is not the case for
     // an automated test run.

@@ -50,8 +50,14 @@ pub const Client = struct {
     /// The local terminal, when there is one.
     local: ?terminal_mod.Terminal = null,
     renderer: ?terminal_mod.Renderer = null,
+    /// The one-row status line along the bottom of the window. Its row belongs to
+    /// zmux, so the session's terminal is one row shorter than the window.
+    status: ?terminal_mod.StatusLine = null,
     /// The session being watched.
     watching: protocol.Name = .{},
+    /// Set when the server reports that the session's program has ended, so the
+    /// status line can say so rather than claiming it is still live.
+    exited: bool = false,
     /// Replies the terminal generated while parsing, waiting for the socket.
     reply: std.ArrayList(u8) = .empty,
     /// The handle the terminal holds while it parses. Points at this client, so
@@ -112,6 +118,7 @@ pub const Client = struct {
         if (self.render) |*render| render.deinit();
         if (self.terminal) |*terminal| terminal.deinit();
         if (self.renderer) |*renderer| renderer.deinit();
+        if (self.status) |*status| status.deinit(self.gpa);
         if (self.local) |*local| local.leave();
         self.encoder.deinit();
         self.connection.deinit();
@@ -167,31 +174,43 @@ pub const Client = struct {
 
     /// Watch the socket and the local terminal until the session ends or the
     /// user detaches.
+    ///
+    /// `rows` and `cols` describe the whole window. One of those rows is the status
+    /// line, which belongs to zmux, so the session is given `sessionSize(rows)` and
+    /// no program ever draws behind the status line.
     pub fn runInteractive(self: *Client, rows: u16, cols: u16) !void {
         var local = try terminal_mod.Terminal.enter();
         errdefer local.leave();
         self.local = local;
 
-        var terminal = try vt.Terminal.init(.{ .cols = cols, .rows = rows });
+        // The client's terminal is the authority on size, and it is read after
+        // entering raw mode because that is when the size query is meaningful.
+        const probed = local.size() catch terminal_mod.vtSize{ .rows = rows, .cols = cols };
+        const window_size = terminal_mod.vtSize{
+            .rows = if (probed.rows == 0) rows else probed.rows,
+            .cols = if (probed.cols == 0) cols else probed.cols,
+        };
+        const initial_session = sessionSize(window_size);
+
+        var terminal = try vt.Terminal.init(.{
+            .cols = initial_session.cols,
+            .rows = initial_session.rows,
+        });
         errdefer terminal.deinit();
 
         var render = try terminal.createRenderState();
         errdefer render.deinit();
 
-        var renderer = try terminal_mod.Renderer.init(self.gpa, rows);
+        var renderer = try terminal_mod.Renderer.init(self.gpa, initial_session.rows);
         errdefer renderer.deinit();
 
-        // The client's terminal is the authority on size, and it is read after
-        // entering raw mode because that is when the size query is meaningful.
-        const probed = local.size() catch terminal_mod.vtSize{ .rows = rows, .cols = cols };
-        const current_size = terminal_mod.vtSize{
-            .rows = if (probed.rows == 0) rows else probed.rows,
-            .cols = if (probed.cols == 0) cols else probed.cols,
-        };
+        var status = terminal_mod.StatusLine.init();
+        errdefer status.deinit(self.gpa);
 
         self.terminal = terminal;
         self.render = render;
         self.renderer = renderer;
+        self.status = status;
 
         // The terminal's replies (cursor position reports and so on) belong to
         // the program in the session, so they travel back over the socket. The
@@ -211,7 +230,10 @@ pub const Client = struct {
         const epfd = try createPoll(self.connection.fd, 0, signals.fd);
         defer _ = linux.close(epfd);
 
-        var size = current_size;
+        var window = window_size;
+        // `session` is mutable so that a resize can change it; the initial value
+        // was computed above to size the terminal.
+        var session = sessionSize(window);
         var buffer: [16 * 1024]u8 = undefined;
         while (!self.finished) {
             var events: [8]linux.epoll_event = undefined;
@@ -229,13 +251,19 @@ pub const Client = struct {
                     if (self.local) |local_terminal| {
                         if (local_terminal.size() catch null) |resized| {
                             if (resized.rows == 0 or resized.cols == 0) continue;
-                            if (resized.rows == size.rows and resized.cols == size.cols) continue;
+                            // A window too short to hold both the status line and a
+                            // row of the program is not worth rearranging for; the
+                            // program keeps the size it had rather than being given
+                            // a zero-row terminal.
+                            if (resized.rows < 2) continue;
+                            if (resized.rows == window.rows and resized.cols == window.cols) continue;
 
-                            size = resized;
+                            window = resized;
+                            session = sessionSize(window);
                             try self.sendRequest(.{ .resize = .{
                                 .name = self.watching,
-                                .rows = resized.rows,
-                                .cols = resized.cols,
+                                .rows = session.rows,
+                                .cols = session.cols,
                             } });
 
                             // The local screen is now the wrong shape, so it is
@@ -243,24 +271,24 @@ pub const Client = struct {
                             // resized with it, and everything is marked for repaint
                             // because every row has moved.
                             self.terminal.?.resize(
-                                resized.cols,
-                                resized.rows,
+                                session.cols,
+                                session.rows,
                                 0,
                                 0,
                             ) catch {};
-                            self.renderer.?.resize(resized.rows) catch {};
+                            self.renderer.?.resize(session.rows) catch {};
                             try self.local.?.writeAll("\x1b[2J");
-                            self.draw();
+                            self.draw(window, session);
                         }
                     }
                 } else if (fd == 0) {
-                    if (try self.handleLocalInput(size)) return;
+                    if (try self.handleLocalInput(session)) return;
                 } else {
                     const read = self.connection.read(&buffer) catch return;
                     if (read == 0) continue;
                     try self.frame.feed(self.gpa, buffer[0..read], self, Client.onMessage);
                     if (self.finished) break;
-                    self.draw();
+                    self.draw(window, session);
                 }
             }
         }
@@ -270,8 +298,39 @@ pub const Client = struct {
         if (self.finished) return;
     }
 
-    /// Repaint the screen from the last state the server sent.
-    fn draw(self: *Client) void {
+    /// The size the session's terminal gets: the window minus the status row.
+    ///
+    /// Clamped so that a window of one row still leaves the program a row to draw
+    /// in. A terminal with no rows is rejected by libghostty-vt, and a session with
+    /// no screen is worse than a status line that has to share.
+    fn sessionSize(window: terminal_mod.vtSize) terminal_mod.vtSize {
+        return .{
+            .rows = if (window.rows > 1) window.rows - 1 else 1,
+            .cols = window.cols,
+        };
+    }
+
+    /// Compose the text of the status line.
+    ///
+    /// Kept to plain fields with no colour, so that it stays legible on whatever
+    /// palette the user has, and truncated by the caller if the window is narrow.
+    fn statusText(self: *Client, buffer: []u8, session: terminal_mod.vtSize) []const u8 {
+        const name = if (self.watching.len > 0) self.watching.slice() else "-";
+        const state = if (self.exited) "exited" else "running";
+        return std.fmt.bufPrint(buffer, " zmux | {s} | {d}x{d} | {s} | ctrl-a detach", .{
+            name,
+            session.cols,
+            session.rows,
+            state,
+        }) catch buffer[0..0];
+    }
+
+    /// Repaint the screen and the status line from the last state the server sent.
+    ///
+    /// `window` and `session` are carried rather than read back from `self`,
+    /// because the status row is the window's last row while the screen is the
+    /// session's, and the two differ by exactly that row.
+    fn draw(self: *Client, window: terminal_mod.vtSize, session: terminal_mod.vtSize) void {
         const terminal = &(self.terminal orelse return);
         const render = &(self.render orelse return);
         const renderer = &(self.renderer orelse return);
@@ -292,6 +351,20 @@ pub const Client = struct {
 
         render.update(terminal.*) catch return;
         renderer.render(local, render.*) catch {};
+
+        // The status line goes last, so that nothing the screen painter does can
+        // overwrite it. It owns the final row of the window.
+        if (self.status) |*status| {
+            var text_buffer: [256]u8 = undefined;
+            const text = self.statusText(&text_buffer, session);
+            status.render(
+                self.gpa,
+                local,
+                window.rows - 1,
+                text,
+                window.cols,
+            ) catch {};
+        }
     }
 
     /// Handle a keystroke from the local terminal.
@@ -377,6 +450,9 @@ pub const Client = struct {
             .created => {},
             .exited => |exited| {
                 self.exit_status = exited.status;
+                // Recorded before finishing, so that the status line shows the
+                // session as ended rather than still live.
+                self.exited = true;
                 if (self.local != null) {
                     try self.err.print("\nzmux: session {s} exited with status {d}\n", .{
                         exited.name.slice(),
@@ -450,6 +526,24 @@ fn waitReadable(fd: i32) !void {
     var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
     const ready = std.posix.poll(&fds, 5000) catch return Error.SyscallFailed;
     if (ready == 0) return Error.ServerFailed;
+}
+
+test "the session loses exactly one row to the status line" {
+    // The contract the status line rests on: the program's terminal is the window
+    // minus one row, so nothing the program draws is ever covered up.
+    const window = terminal_mod.vtSize{ .rows = 24, .cols = 80 };
+    const session = Client.sessionSize(window);
+    try std.testing.expectEqual(@as(u16, 23), session.rows);
+    // The width is untouched.
+    try std.testing.expectEqual(@as(u16, 80), session.cols);
+}
+
+test "a one-row window still leaves the program a row" {
+    // libghostty-vt rejects a zero-row terminal, so a window too short to split
+    // must not produce one. The status line gives up its row rather than the
+    // program having nowhere to draw.
+    const session = Client.sessionSize(.{ .rows = 1, .cols = 40 });
+    try std.testing.expectEqual(@as(u16, 1), session.rows);
 }
 
 test "the client detaches on the prefix key" {

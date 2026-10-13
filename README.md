@@ -17,7 +17,7 @@ and the TUI. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and
 
 ## Status
 
-Phases 0, 0.5, 1 and 3 of the roadmap are complete. Escape sequence handling
+Phases 0, 0.5, 1, 2 and 3 of the roadmap are complete. Escape sequence handling
 comes from libghostty-vt, the command line is parsed with
 [zig-clap](https://github.com/Hejsil/zig-clap), and there is a server that owns
 the sessions.
@@ -47,6 +47,11 @@ running until `kill-all`.
 Resizing the window while attached reaches the program inside the session, so a
 full-screen editor re-lays out without being detached and reattached.
 
+The bottom row is a status line showing the session name, its size and whether
+the program is still running. That row belongs to zmux rather than to the
+program, so the session is given the window minus one row and nothing the program
+draws is ever covered up.
+
 `dump` parses escape sequences on stdin and prints the resulting screen, which
 is useful for inspecting what zmux makes of a byte stream:
 
@@ -54,9 +59,9 @@ is useful for inspecting what zmux makes of a byte stream:
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-Not yet built: panes and splits, floating panes, and the status line. `zmux
-detach` outside an attached client reports that, because the prefix key is how a
-client detaches. See [ROADMAP.md](ROADMAP.md).
+Not yet built: panes and splits, floating panes, copy mode, and configuration.
+`zmux detach` outside an attached client reports that, because the prefix key is
+how a client detaches. See [ROADMAP.md](ROADMAP.md).
 
 ## Development
 
@@ -112,7 +117,8 @@ build.zig.zon       Zig package dependencies (zig-clap)
 src/main.zig        entry point and command line parsing
 src/vt.zig          the only module that knows libghostty-vt's C ABI
 src/pty.zig         pty allocation, child spawning, raw fd I/O
-src/terminal.zig    the local terminal: raw mode, and the screen renderer
+src/terminal.zig    the local terminal: raw mode, the screen renderer, and the
+                    status line
 src/session.zig     the single-pane event loop from phase 1
 src/socket.zig      unix sockets and length-prefixed message framing
 src/protocol.zig    the client/server message set and its encoding

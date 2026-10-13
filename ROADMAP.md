@@ -144,7 +144,7 @@ union, so `try` on it fails to compile. And when the slave side closes, reading
 the master returns `error.InputOutput` (EIO) rather than 0, so the read loop
 must treat it as end of file or it spins forever.
 
-## Phase 2 — TUI
+## Phase 2 — TUI (done)
 
 Draw the screen and a minimal frame around it.
 
@@ -155,11 +155,36 @@ Draw the screen and a minimal frame around it.
 
 Judgement: an editor is usable, with correct colors and a visible cursor.
 
-Much of what this phase listed arrived early, in Phase 1: the alternate screen,
-raw mode with restoration, incremental repainting of the rows the library marks
-dirty, and the cursor at its reported position. `SIGWINCH` arrived in Phase 3.1,
-below, because it only became meaningful once there was a server to tell. What
-remains is the frame around the screen: a status line.
+Most of this phase arrived early, in Phase 1: the alternate screen, raw mode with
+restoration, incremental repainting of the rows the library marks dirty, and the
+cursor at its reported position. `SIGWINCH` arrived in Phase 3.1, because it only
+became meaningful once there was a server to tell. The status line is the last
+piece.
+
+### The status line reserves its row
+
+The bottom row belongs to zmux, so the session's terminal is one row shorter than
+the window and the status line has nowhere to overlap the program's output. The
+alternative — drawing over the last row — would hide a row of a full-screen
+editor, which uses every row it is given. tmux and screen reserve a row for the
+same reason.
+
+That one-row difference is the whole reason the client tracks two sizes rather
+than one. `sessionSize` is the single place it is applied, and it clamps so that a
+window of one row still leaves the program a row: libghostty-vt rejects a
+zero-row terminal, and the status line giving up its row is better than the
+program having nowhere to draw.
+
+The line is drawn in inverse video with no colour of its own, so it stays legible
+on whatever palette the user has, and it is padded to the full width so the bar
+covers the row. It is truncated rather than wrapped, because a wrapped status line
+would scroll the screen underneath it.
+
+Verified: attaching at 24x80 shows `STATUS-TEST` on row 1 and
+` zmux | st | 80x23 | running | ctrl-a detach` on row 24, with row 23 blank. A
+program that prints `stty size` reports `winch 39 100` after an attached client is
+resized to 40x100, so the session is given the window minus the status row. A
+detached session has no client and therefore no status line, and keeps all 24 rows.
 
 ## Phase 3.1 — resizing (done)
 
