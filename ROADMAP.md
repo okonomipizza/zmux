@@ -372,9 +372,37 @@ into, and focus is the server's idea, read later.
 Key bindings are vim-flavoured behind the existing `ctrl-a` prefix: `s` splits side by
 side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
 `h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, `o`
-rotates the arrangement, and `w` lists the sessions and switches to one. A bare
-`ctrl-a` twice still detaches, and a prefix followed by an unused key detaches rather
-than being swallowed.
+rotates the arrangement, `w` lists the sessions and switches to one, and `x` reads
+the focused pane's history. A bare `ctrl-a` twice still detaches, and a prefix
+followed by an unused key detaches rather than being swallowed.
+
+### Reading a pane's history
+
+`ctrl-a x` opens the focused pane's scrollback. The movement keys follow `less` and
+vim, which is where the habit comes from: `j`/`k` a line, `J`/`K` ten, `ctrl-d` and
+`ctrl-u` half a screen, `g` and `G` the ends, `q` or Escape to leave. The capitals
+moving by ten is the one addition, for crossing a long history without holding a key.
+
+Scrollback is the library's, not a copy: the pane's own terminal holds the history, and
+the mode moves its viewport. That is what makes it free — nothing crosses the wire, the
+program is not disturbed, and the rows read are the rows the program wrote, with their
+colours and their wide characters intact.
+
+The mode exists rather than a pair of keys because it changes what every key means. `j`
+is a scroll rather than a `j`, and `q` leaves rather than closing the pane beneath the
+reader. Every keystroke is consumed, so nothing typed at a view of the past reaches a
+program that would act on it.
+
+A viewport that followed new output would be unreadable, so scrolling stops the pane
+from following; output still arrives and still goes into the history. Typing puts the
+viewport back at the bottom first, because the program's answer would otherwise arrive
+below the view and the user would be typing without seeing it.
+
+The mode refuses to open on a pane with no history. One that has printed less than a
+screenful, or that is on the alternate screen where there is no scrollback at all, would
+give a frozen screen and a mode that swallowed every key, which reads as the program
+hanging. That is checked by asking the terminal how many rows it holds rather than by
+tracking any of it here.
 
 ### Switching sessions without detaching
 

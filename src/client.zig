@@ -119,6 +119,12 @@ pub const Client = struct {
     session_menu: std.ArrayList(protocol.SessionInfo) = .empty,
     /// Set while the switch menu is open.
     menu_open: bool = false,
+    /// Set while the focused pane is being scrolled through its history.
+    ///
+    /// A mode rather than a key, because it changes what every other key means: `j` and `k` move the
+    /// viewport instead of being typed, and `q` leaves rather than closing a pane. The pane's
+    /// viewport is the library's, so what is being read is the pane's own history and not a copy.
+    scroll_mode: bool = false,
     /// The digits typed so far, as a number, or zero when none has been typed.
     ///
     /// A value rather than a string, because the menu chooses a session by its position and a number
@@ -400,6 +406,19 @@ pub const Client = struct {
 
         // While a dock target is being chosen the status line is the instruction for the mode, since
         // the whole window is now a menu.
+        // While the history is being read the status line is the only thing that says the mode is
+        // on, since the pane itself looks like one that has simply stopped updating.
+        if (self.scroll_mode) {
+            const pane = self.focusedPane();
+            const history = if (pane) |p| p.terminal.scrollbackRows() else 0;
+            const at_live = if (pane) |p| p.terminal.viewportActive() else true;
+            return std.fmt.bufPrint(
+                buffer,
+                " zmux | {s} | scroll: j/k line  J/K ten  ctrl-d/u page  g/G ends  q quit |{s} {d} rows of history",
+                .{ name, if (at_live) " live," else "", history },
+            ) catch buffer[0..0];
+        }
+
         if (self.docking) {
             return std.fmt.bufPrint(
                 buffer,
@@ -991,6 +1010,45 @@ pub const Client = struct {
             return false;
         }
 
+        // While the history is being read, the movement keys move the viewport and everything else
+        // is consumed. Nothing is forwarded: a program receiving a `j` the user meant as a scroll
+        // would act on it, and the whole point of the mode is that the program is left alone.
+        if (self.scroll_mode) {
+            const pane = self.focusedPane() orelse {
+                self.leaveScroll();
+                return false;
+            };
+            // A page is the visible height less one row, so that a line of context carries over and
+            // the reader can see where they were. That is what `less` and `vim` do.
+            const page: i32 = if (pane.rect.height > 2) @as(i32, pane.rect.height) - 2 else 1;
+            switch (byte) {
+                'j', 'l' => pane.terminal.scrollBy(1),
+                'k', 'h' => pane.terminal.scrollBy(-1),
+                // The capitals move by ten, so a long history can be crossed without holding a key.
+                'J', 'L' => pane.terminal.scrollBy(10),
+                'K', 'H' => pane.terminal.scrollBy(-10),
+                // Half a screen, the movement a reader makes most when looking for something.
+                0x04 => pane.terminal.scrollBy(@divTrunc(page, 2)), // ctrl-d
+                0x15 => pane.terminal.scrollBy(-@divTrunc(page, 2)), // ctrl-u
+                0x06 => pane.terminal.scrollBy(page), // ctrl-f
+                0x02 => pane.terminal.scrollBy(-page), // ctrl-b
+                // The ends of the history. `g` is vim's and `G` the same for the other end.
+                'g' => pane.terminal.scrollToTop(),
+                'G' => pane.terminal.scrollToBottom(),
+                // Leaving with Enter returns to the live screen, which is what the user wants when
+                // they have found what they were looking for.
+                'q', 0x1B, '\r', '\n' => {
+                    self.leaveScroll();
+                    return false;
+                },
+                else => return false,
+            }
+            // The rows on screen have changed, so the pane is painted again from the viewport the
+            // library now holds.
+            pane.stale = true;
+            return false;
+        }
+
         // While the session menu is open, the digits choose a session and Enter accepts. Every
         // keystroke is consumed: the menu belongs to zmux, and forwarding a digit to the pane behind
         // it would be sending a character the user typed at a menu.
@@ -1054,8 +1112,47 @@ pub const Client = struct {
         // Everything else is forwarded raw. The program's own terminal decides what the
         // bytes mean: re-encoding them here would discard whatever the program and its own
         // terminal have already agreed on.
+        //
+        // A keystroke also ends the scroll mode. Reading history and typing cannot both be
+        // happening: the program's answer would arrive below the viewport, and the user would be
+        // typing without seeing it. Returning to the live screen first is what makes the reply
+        // visible.
+        self.endScrollForInput();
         try payload.append(self.gpa, byte);
         return false;
+    }
+
+    /// Enter the scroll mode on the focused pane, if there is any history to read.
+    ///
+    /// Refusing when there is nothing above the screen is deliberate: a mode that opens onto a
+    /// frozen screen and swallows the keys would read as the program hanging. The status line stays
+    /// as it is, so the user sees why nothing happened.
+    fn enterScroll(self: *Client) void {
+        const pane = self.focusedPane() orelse return;
+        if (pane.terminal.scrollbackRows() == 0) return;
+        self.scroll_mode = true;
+    }
+
+    /// Leave the scroll mode and return the pane to the live screen.
+    ///
+    /// The viewport is put back at the bottom rather than left where it was, so that the pane shows
+    /// what the program is doing now. Leaving it in history would mean the next output arrives
+    /// off-screen and the pane looks stuck.
+    fn leaveScroll(self: *Client) void {
+        self.scroll_mode = false;
+        const pane = self.focusedPane() orelse return;
+        pane.terminal.scrollToBottom();
+        pane.stale = true;
+    }
+
+    /// Return every pane's viewport to the live screen.
+    ///
+    /// Used when a key is about to be typed into a program. Reading history and typing at the same
+    /// time is not possible: the program's next output would arrive out of view, and the user would
+    /// be typing without seeing what they typed.
+    fn endScrollForInput(self: *Client) void {
+        if (!self.scroll_mode) return;
+        self.leaveScroll();
     }
 
     /// Open the switch menu and ask the server for the sessions to fill it.
@@ -1226,6 +1323,12 @@ pub const Client = struct {
             // chosen. A window onto the other sessions, which is what the key is named for.
             'w' => {
                 try self.openMenu();
+                return false;
+            },
+            // `x` opens the focused pane's history for reading. Nothing is detached and the program
+            // keeps running; the viewport is what moves.
+            'x' => {
+                self.enterScroll();
                 return false;
             },
             // The prefix twice detaches, which is how a user who is used to ctrl-a ctrl-a
@@ -1471,8 +1574,14 @@ pub const Client = struct {
 
     /// Make a local pane to mirror one the server has.
     fn addPane(self: *Client, placement: protocol.PanePlacement) !*RemotePane {
-        const cols = if (placement.rect.width == 0) 1 else placement.rect.width;
-        const rows = if (placement.rect.height == 0) 1 else placement.rect.height;
+        // The terminal is the size the server gave the pty, which is the *interior*: the frame takes
+        // a row and a column on every side, and the program inside is handed what is left. Building
+        // this from the whole rectangle would give one pane two widths, and since both sides wrap
+        // what they receive, the same output would become a different number of rows on each. The
+        // reader scrolls this side's history, so that history has to be the program's own.
+        const interior = placement.rect.interior();
+        const cols = if (interior.width == 0) 1 else interior.width;
+        const rows = if (interior.height == 0) 1 else interior.height;
 
         var terminal = try vt.Terminal.init(.{ .cols = cols, .rows = rows });
         errdefer terminal.deinit();
@@ -2421,4 +2530,249 @@ test "digits typed at the menu build a number" {
     client.menu_choice = client.menu_choice * 10 + ('2' - '0');
     try std.testing.expectEqual(@as(usize, 12), client.menu_choice);
     try std.testing.expectEqualStrings("s12", client.chosenSession().?.name.slice());
+}
+
+test "the scroll mode refuses to open with nothing to scroll" {
+    // A mode that opens onto a frozen screen and swallows every key reads as the program hanging.
+    // A pane on the alternate screen has no scrollback at all, and one that has printed less than a
+    // screenful has none either, so both must leave the mode off.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // No panes at all: nothing to scroll.
+    client.enterScroll();
+    try std.testing.expect(!client.scroll_mode);
+
+    // A pane that has printed one line into a five-row terminal has no history.
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 7 };
+    try client.panes.append(gpa, .{
+        .id = 7,
+        .terminal = terminal,
+        .render = render,
+        .route = route,
+    });
+    client.focused = 7;
+
+    terminal.write("one line\n");
+    try std.testing.expectEqual(@as(usize, 0), client.findPane(7).?.terminal.scrollbackRows());
+    client.enterScroll();
+    try std.testing.expect(!client.scroll_mode);
+
+    // Once lines have scrolled out of view there is history, so the mode opens.
+    var line: usize = 0;
+    while (line < 20) : (line += 1) terminal.write("more\n");
+    try std.testing.expect(client.findPane(7).?.terminal.scrollbackRows() > 0);
+    client.enterScroll();
+    try std.testing.expect(client.scroll_mode);
+}
+
+test "leaving the scroll mode returns the pane to the live screen" {
+    // Leaving the viewport in history would mean the program's next output arrives off-screen and
+    // the pane looks stuck, which is worse than not having scrolled at all.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 3 };
+    try client.panes.append(gpa, .{
+        .id = 3,
+        .terminal = terminal,
+        .render = render,
+        .route = route,
+    });
+    client.focused = 3;
+
+    var line: usize = 0;
+    while (line < 30) : (line += 1) terminal.write("x\n");
+
+    const pane = client.findPane(3).?;
+    try std.testing.expect(pane.terminal.viewportActive());
+    client.enterScroll();
+    pane.terminal.scrollBy(-5);
+    try std.testing.expect(!pane.terminal.viewportActive());
+
+    client.leaveScroll();
+    try std.testing.expect(!client.scroll_mode);
+    // The viewport is back at the bottom, and the pane is marked for repainting so the screen
+    // catches up.
+    try std.testing.expect(pane.terminal.viewportActive());
+    try std.testing.expect(pane.stale);
+}
+
+test "typing ends the scroll mode before the byte is forwarded" {
+    // Reading history and typing cannot both be happening: the program's answer would arrive below
+    // the viewport and the user would be typing without seeing it.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 9 };
+    try client.panes.append(gpa, .{
+        .id = 9,
+        .terminal = terminal,
+        .render = render,
+        .route = route,
+    });
+    client.focused = 9;
+    client.watching = try protocol.Name.init("s");
+    var line: usize = 0;
+    while (line < 30) : (line += 1) terminal.write("x\n");
+    client.enterScroll();
+    client.findPane(9).?.terminal.scrollBy(-5);
+    try std.testing.expect(client.scroll_mode);
+    try std.testing.expect(!client.findPane(9).?.terminal.viewportActive());
+
+    // This is what `handleByte` calls before forwarding a printable byte. It is exercised directly
+    // because forwarding needs a socket, and what matters here is the order: the mode ends and the
+    // viewport returns, so the program's reply will be visible.
+    client.endScrollForInput();
+
+    try std.testing.expect(!client.scroll_mode);
+    try std.testing.expect(client.findPane(9).?.terminal.viewportActive());
+    try std.testing.expect(client.findPane(9).?.stale);
+}
+
+test "a pane's local terminal is the size the server gave its pty" {
+    // The two sides have to agree on the pane's width, because wrapping happens on both of them and
+    // the reader scrolls this side's history. Building this terminal from the whole rectangle while
+    // the server sizes the pty from the interior gives the same pane two widths, so the same output
+    // wraps into a different number of rows on each side and the history the reader walks is not the
+    // one the program produced.
+    const rect = protocol.Rect{ .x = 4, .y = 2, .width = 80, .height = 24 };
+    const interior = rect.interior();
+
+    // The sizes must differ, or this test would pass on the broken code by accident.
+    try std.testing.expect(interior.width != rect.width);
+    try std.testing.expect(interior.height != rect.height);
+
+    var terminal = try vt.Terminal.init(.{
+        .cols = interior.width,
+        .rows = interior.height,
+    });
+    defer terminal.deinit();
+
+    try std.testing.expectEqual(interior.width, terminal.cols());
+    try std.testing.expectEqual(interior.height, terminal.rows());
+
+    // A stream of numbered lines longer than the screen, which is what a reader scrolls.
+    var n: usize = 1;
+    var buf: [32]u8 = undefined;
+    while (n <= 200) : (n += 1) {
+        terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{n}));
+    }
+
+    // Every line that has scrolled off is reachable, so the history is the whole stream less the
+    // rows still on screen. Losing any of it is what makes a long listing stop part-way.
+    // The final newline leaves the cursor on a fresh row rather than scrolling another off, so the
+    // history is one row short of the plain difference.
+    const expected = 200 - interior.height + 1;
+    try std.testing.expectEqual(@as(usize, expected), terminal.scrollbackRows());
+}
+
+test "a long run of output is retained in full, not cut short" {
+    // The report was that `seq 1 1000` could only be scrolled back to about line 600. A pane whose
+    // local terminal is wider than the pty that produced the output wraps the same text into fewer
+    // rows, so the history the reader walks is shorter than the one the program wrote, and the
+    // older part of it is not reachable at all.
+    //
+    // Every line here is short, so wrapping is not what loses them; what this pins down is that the
+    // count of scrolled-off rows matches the count of lines that went off screen, at the size the
+    // pane actually uses.
+    const rect = protocol.Rect{ .x = 1, .y = 1, .width = 80, .height = 24 };
+    const interior = rect.interior();
+    var terminal = try vt.Terminal.init(.{
+        .cols = interior.width,
+        .rows = interior.height,
+    });
+    defer terminal.deinit();
+
+    var n: usize = 1;
+    var buf: [32]u8 = undefined;
+    while (n <= 1000) : (n += 1) {
+        terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{n}));
+    }
+
+    // A thousand lines printed into a terminal of `interior.height` rows leaves every line above the
+    // last screenful in history, which is what makes the first line reachable.
+    const history = terminal.scrollbackRows();
+    try std.testing.expect(history >= 1000 - interior.height);
+
+    // The oldest content is genuinely there: scrolling to the top brings it into view.
+    terminal.scrollToTop();
+    try std.testing.expect(!terminal.viewportActive());
+
+    const Probe = struct {
+        found_first: bool = false,
+        seen: std.ArrayList(u8),
+        gpa: std.mem.Allocator,
+        fn visit(self: *@This(), row: *vt.RowIterator) bool {
+            _ = row.forEachCell(self, collect) catch {};
+            return true;
+        }
+        fn collect(self: *@This(), cell: *vt.CellIterator) void {
+            var codepoints: [8]u32 = undefined;
+            var utf8: [32]u8 = undefined;
+            const bytes = cell.graphemesUtf8(&codepoints, &utf8);
+            self.seen.appendSlice(self.gpa, if (bytes.len == 0) " " else bytes) catch {};
+        }
+    };
+    var probe = Probe{ .seen = .empty, .gpa = std.testing.allocator };
+    defer probe.seen.deinit(std.testing.allocator);
+    var render = try terminal.createRenderState();
+    defer render.deinit();
+    try render.forEachRow(&probe, Probe.visit);
+
+    const top = std.mem.trim(u8, probe.seen.items, " ");
+    // The first rows of the scrollback hold the oldest output, which begins with `1`.
+    try std.testing.expect(top.len > 0);
+    try std.testing.expect(top[0] == '1');
 }

@@ -40,6 +40,15 @@ pub const Terminal = struct {
         rows: u16,
         /// Maximum lines retained in scrollback history.
         max_scrollback: usize = 10_000,
+        /// Maximum bytes of scrollback history, or null for the library's default.
+        ///
+        /// The line limit alone is not enough, and this is the reason a long run of output stopped
+        /// being reachable part-way. The library keeps *both* limits and prunes at whichever is
+        /// reached first, and its default byte limit is small enough to be hit long before ten
+        /// thousand lines: printing `seq 1 1000` into an 80-column pane retained only about 870 rows
+        /// and silently discarded the rest. Raising it is what lets the line limit be the one that
+        /// governs, which is the limit a reader expects.
+        max_scrollback_bytes: ?usize = 32 * 1024 * 1024,
     };
 
     pub fn init(options: Options) Error!Terminal {
@@ -63,6 +72,19 @@ pub const Terminal = struct {
             c.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES,
             &max_lines,
         );
+
+        // The byte limit as well, because the library prunes at whichever limit is reached first and
+        // its own default byte limit is reached long before ten thousand lines. Setting this is not
+        // a tuning knob: without it the line limit is not the one that applies, so a long run of
+        // output is cut off at a few hundred rows with nothing to say so.
+        if (options.max_scrollback_bytes) |limit| {
+            var max_bytes = limit;
+            _ = c.ghostty_terminal_set(
+                terminal.handle,
+                c.GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES,
+                &max_bytes,
+            );
+        }
 
         return terminal;
     }
@@ -141,6 +163,66 @@ pub const Terminal = struct {
         var value: u16 = 0;
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_ROWS, &value);
         return value;
+    }
+
+    /// How many rows of history are above the active area.
+    ///
+    /// Zero on the alternate screen, which has no scrollback, so this is also what says whether
+    /// scrolling is possible at all.
+    pub fn scrollbackRows(self: Terminal) usize {
+        var value: usize = 0;
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS, &value);
+        return value;
+    }
+
+    /// Whether the viewport is following the active area rather than sitting in history.
+    ///
+    /// The library says outright that there is no change notification for this, so it is polled
+    /// rather than watched.
+    pub fn viewportActive(self: Terminal) bool {
+        var value: bool = false;
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_VIEWPORT_ACTIVE, &value);
+        return value;
+    }
+
+    /// Move the viewport by a number of rows, negative meaning up into history.
+    ///
+    /// The library clamps at both ends, so a scroll past the top or the bottom is not an error and
+    /// needs no bounds check here. Scrolling does not disturb the program: it changes which rows are
+    /// drawn, not the terminal's contents, and output arriving meanwhile still goes to the screen.
+    pub fn scrollBy(self: Terminal, count: i32) void {
+        const request = c.GhosttyTerminalScrollViewport{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_DELTA,
+            .value = .{ .delta = count },
+        };
+        c.ghostty_terminal_scroll_viewport(self.handle, request);
+    }
+
+    /// Move the viewport to an absolute row of the scrollable area, zero being the oldest.
+    pub fn scrollToRow(self: Terminal, row: usize) void {
+        const request = c.GhosttyTerminalScrollViewport{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_ROW,
+            .value = .{ .row = row },
+        };
+        c.ghostty_terminal_scroll_viewport(self.handle, request);
+    }
+
+    /// Return the viewport to the bottom, where new output is.
+    pub fn scrollToBottom(self: Terminal) void {
+        const request = c.GhosttyTerminalScrollViewport{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_BOTTOM,
+            .value = .{ .row = 0 },
+        };
+        c.ghostty_terminal_scroll_viewport(self.handle, request);
+    }
+
+    /// Move the viewport to the oldest row held.
+    pub fn scrollToTop(self: Terminal) void {
+        const request = c.GhosttyTerminalScrollViewport{
+            .tag = c.GHOSTTY_SCROLL_VIEWPORT_TOP,
+            .value = .{ .row = 0 },
+        };
+        c.ghostty_terminal_scroll_viewport(self.handle, request);
     }
 
     pub fn cursorVisible(self: Terminal) bool {
@@ -928,4 +1010,59 @@ test "write_pty keeps working when the owner is heap-allocated" {
     for (0..64) |_| term.write("\x1b[6n");
 
     try std.testing.expectEqual(@as(usize, 64), owner.replies);
+}
+
+test "a long run of output is retained up to the line limit" {
+    // The defect this guards against: the library keeps both a line limit and a byte limit and prunes
+    // at whichever is reached first, and its default byte limit is far smaller than what ten thousand
+    // lines need. Printing `seq 1 1000` into an 80-column pane therefore kept only about 870 rows and
+    // silently discarded the rest, so scrolling back stopped part-way with no indication why.
+    //
+    // Every line here is short and unstyled, which is the cheapest case for the byte limit; a run
+    // with colour would be pruned sooner still.
+    var terminal = try Terminal.init(.{ .cols = 78, .rows = 21 });
+    defer terminal.deinit();
+
+    var n: usize = 1;
+    var buf: [32]u8 = undefined;
+    while (n <= 1000) : (n += 1) {
+        terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{n}));
+    }
+
+    // A thousand lines into twenty-one rows leaves every line above the last screenful in history.
+    const held = terminal.scrollbackRows();
+    try std.testing.expect(held >= 1000 - 21);
+
+    // And the limit is still a limit: printing far past it keeps the configured number of lines
+    // rather than growing without bound.
+    var count: usize = 1001;
+    while (count <= 12_000) : (count += 1) {
+        terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{count}));
+    }
+    const capped = terminal.scrollbackRows();
+    try std.testing.expect(capped <= 10_000);
+    try std.testing.expect(capped > 9_000);
+}
+
+test "the byte limit can be lowered, and is what stops a run when it is" {
+    // The counterpart of the test above: with a small byte limit the history is pruned early, which
+    // is the behaviour that was being seen by default. This states the mechanism rather than trusting
+    // that the option took effect.
+    var terminal = try Terminal.init(.{
+        .cols = 78,
+        .rows = 21,
+        .max_scrollback_bytes = 512 * 1024,
+    });
+    defer terminal.deinit();
+
+    var n: usize = 1;
+    var buf: [32]u8 = undefined;
+    while (n <= 5000) : (n += 1) {
+        terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{n}));
+    }
+
+    const held = terminal.scrollbackRows();
+    // Far fewer than the five thousand printed, and fewer than the ten thousand the line limit
+    // allows: the byte limit is what decided.
+    try std.testing.expect(held < 5000);
 }

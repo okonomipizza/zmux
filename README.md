@@ -56,7 +56,20 @@ Inside an attached session the prefix key is `ctrl-a`:
 | `ctrl-a <` / `>` | move the focused pane past its neighbour |
 | `ctrl-a o` | rotate every pane one place along |
 | `ctrl-a w` | list the sessions and switch to one |
+| `ctrl-a x` | read the focused pane's history |
 | `ctrl-a ctrl-a` | detach, leaving every pane running |
+
+`ctrl-a x` opens the focused pane's scrollback for reading. `j` and `k` move a
+line at a time, `J` and `K` ten, `ctrl-d` and `ctrl-u` half a screen, `g` and
+`G` go to the ends, and `q` or Escape leaves. Nothing is detached and the
+program keeps running: only the viewport moves, so the pane's own history is
+what you are reading rather than a copy of it.
+
+While the history is open the pane stops following new output, because a
+viewport that moved under the reader would be unreadable. Typing anything puts
+it back at the bottom first, so the program's answer is visible rather than
+arriving below the view. A pane with no history to show is left alone: a mode
+that opened onto a frozen screen would read as the program hanging.
 
 `ctrl-a w` lists the sessions in the same window, numbered from one. Type a
 number and press Enter to move to that session, or Escape to stay where you
