@@ -115,6 +115,11 @@ nothing: the program keeps running while nothing is watching, and reattaching
 redraws the screen as it stands. A server is started on first use and keeps
 running until `kill-all`.
 
+A key the prefix does not use does nothing at all. It used to detach, which meant
+a mistyped key ended the client and lost the session with it; tmux ignores the
+key, and the prefix is spent either way, so the next keystroke is an ordinary one
+whether or not the key after it was understood.
+
 Resizing the window while attached reaches the program inside the session, so a
 full-screen editor re-lays out without being detached and reattached.
 

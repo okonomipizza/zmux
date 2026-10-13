@@ -373,8 +373,17 @@ Key bindings are vim-flavoured behind the existing `ctrl-b` prefix: `s` splits s
 side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
 `h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, `o`
 rotates the arrangement, `w` lists the sessions and switches to one, and `x` reads
-the focused pane's history. A bare `ctrl-b` twice still detaches, and a prefix
-followed by an unused key detaches rather than being swallowed.
+the focused pane's history. A bare `ctrl-b` twice still detaches, and a key the prefix
+does not use does nothing at all.
+
+That last part was not always so. An unused key after the prefix used to detach, on the
+reasoning that a typo should not leave the client in a state where the next byte is eaten.
+Nothing is eaten: the prefix is consumed by the handler whether or not the key after it is
+one it knows, so the next byte is an ordinary keystroke either way. What detaching actually
+did was end the client on a mistyped key. It was noticed when `ctrl-b g` closed the window:
+`g` is bound inside the scroll mode only, so at the top level it was a stray key and the
+client went away. tmux ignores an unbound key, which left the session running and no client
+attached when probed the same way.
 
 The prefix was `ctrl-a` until the key was moved to `ctrl-b`, which is what tmux uses. It is
 written as one named constant rather than as a byte in three places, because a prefix that

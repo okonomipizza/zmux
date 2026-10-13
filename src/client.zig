@@ -1362,12 +1362,15 @@ pub const Client = struct {
                 return true;
             },
             else => {
-                // An unused key after the prefix detaches, so that the prefix followed by a typo does
-                // not leave the client sitting in a state where the next byte is eaten.
-                if (self.watching.len > 0) {
-                    try self.sendRequest(.{ .detach = .{ .name = self.watching } });
-                }
-                return true;
+                // An unused key after the prefix does nothing at all.
+                //
+                // It used to detach, on the reasoning that a prefix followed by a typo should not
+                // leave the client in a state where the next byte is eaten. It does not: the prefix
+                // is consumed by `handleByte` whether or not the key that follows is one it knows,
+                // so the next byte is an ordinary keystroke either way. What detaching actually did
+                // was end the client on a mistyped key, losing the session the user was working in
+                // to a slip of the finger. tmux ignores the key, and now so does this.
+                return false;
             },
         }
     }
@@ -2826,4 +2829,46 @@ test "a long run of output is retained in full, not cut short" {
     // The first rows of the scrollback hold the oldest output, which begins with `1`.
     try std.testing.expect(top.len > 0);
     try std.testing.expect(top[0] == '1');
+}
+
+test "an unbound key after the prefix does nothing" {
+    // It used to detach. The reasoning was that a prefix followed by a typo should not leave the
+    // client in a state where the next byte is eaten, but the prefix is consumed either way, so the
+    // next byte is an ordinary keystroke whatever follows it. What detaching actually did was end
+    // the client on a mistyped key and lose the session with it. tmux ignores the key.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        client.session_menu.deinit(gpa);
+        client.encoder.deinit();
+    }
+    // A session name, so that the old code would have had something to detach from: without one it
+    // returned early and the test would pass either way.
+    client.watching = try protocol.Name.init("s");
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+
+    // A key the prefix does not use. `g` is bound inside the scroll mode only, so at the top level it
+    // is exactly the stray key the report was about.
+    _ = try client.handleByte(prefix_key, &payload);
+    try std.testing.expect(client.prefix_armed);
+
+    const finished = try client.handleByte('g', &payload);
+    try std.testing.expect(!finished);
+    try std.testing.expect(!client.finished);
+    // The prefix is spent, so the next key is an ordinary one rather than being eaten.
+    try std.testing.expect(!client.prefix_armed);
+
+    // And a key typed afterwards still reaches the program.
+    payload.clearRetainingCapacity();
+    _ = try client.handleByte('a', &payload);
+    try std.testing.expectEqualStrings("a", payload.items);
 }
