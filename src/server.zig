@@ -834,6 +834,28 @@ pub const Server = struct {
                     return Error.UnknownSession;
                 try self.killSession(index);
             },
+            .switch_session => |move| {
+                // Letting go of the old session first is what makes this safe. A client that
+                // attached before detaching would be in two watcher lists at once, and the server
+                // would send it output for panes it no longer has.
+                const previous = self.clients.items[client].watching.slice();
+                if (previous.len > 0) {
+                    if (self.findSession(previous)) |index| _ = self.removeWatcher(index, client);
+                    self.clients.items[client].watching = .{};
+                }
+
+                // A name that does not exist creates the session, which is what `attach` does: a
+                // user choosing a name means they want to be in it.
+                const index = self.findSession(move.name.slice()) orelse created: {
+                    break :created try self.createSession(.{
+                        .name = move.name.slice(),
+                        .rows = move.rows,
+                        .cols = move.cols,
+                        .argv = &.{},
+                    });
+                };
+                try self.attachClient(client, index, move.rows, move.cols);
+            },
             .input => |input| {
                 const index = self.findSession(input.name.slice()) orelse return;
                 const session = &self.sessions.items[index];

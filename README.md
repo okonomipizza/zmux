@@ -55,7 +55,15 @@ Inside an attached session the prefix key is `ctrl-a`:
 | `ctrl-a l` / `j` | move focus to the next pane |
 | `ctrl-a <` / `>` | move the focused pane past its neighbour |
 | `ctrl-a o` | rotate every pane one place along |
+| `ctrl-a w` | list the sessions and switch to one |
 | `ctrl-a ctrl-a` | detach, leaving every pane running |
+
+`ctrl-a w` lists the sessions in the same window, numbered from one. Type a
+number and press Enter to move to that session, or Escape to stay where you
+are. Nothing is detached and no pane is closed: the session being left keeps
+running, and its panes are still there when you come back. The list is asked for
+each time the menu opens, so a session started in another terminal is there and
+one whose last pane exited is not.
 
 `ctrl-a <` and `ctrl-a >` swap the focused pane with the pane beside it in the
 layout's order, which is the same order the focus keys walk. `ctrl-a o` shifts

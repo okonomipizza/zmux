@@ -134,6 +134,23 @@ pub const Request = union(enum) {
         /// 0 to swap with the next pane, 1 with the previous, 2 to rotate.
         kind: u8,
     },
+    /// Move this client to another session without detaching.
+    ///
+    /// One request rather than a detach followed by an attach, because the two are not independent:
+    /// a client that attached before letting go of the old session would be watching both, and the
+    /// server would send it output it has no panes for. The server does both halves in one step.
+    ///
+    /// A name that does not exist creates the session, which is what `attach` does and what a user
+    /// choosing a name expects.
+    ///
+    /// The size travels with the request because the session being moved to has to be sized to this
+    /// client, and the server does not remember a client's size between requests; `attach` carries
+    /// its own for the same reason.
+    switch_session: struct {
+        name: Name,
+        rows: u16,
+        cols: u16,
+    },
     /// Park the focused pane, lifting it out of the layout and above it.
     ///
     /// The pane keeps its pty and its screen: parking changes which list owns it and nothing
@@ -310,7 +327,7 @@ pub const PanePlacement = struct {
 /// Spelled out rather than taken from the enum ordinal, because these are the
 /// protocol: reordering a union arm must not silently renumber the wire.
 pub const Tag = struct {
-    // Requests, 1..=16.
+    // Requests, 1..=17.
     pub const list: u8 = 1;
     pub const create: u8 = 2;
     pub const attach: u8 = 3;
@@ -327,6 +344,7 @@ pub const Tag = struct {
     pub const dock_cancel: u8 = 14;
     pub const toggle_floats: u8 = 15;
     pub const layout_move: u8 = 16;
+    pub const switch_session: u8 = 17;
     // Events, 64..=127. The gap leaves room to add either kind later without
     // renumbering.
     pub const session: u8 = 64;
@@ -475,6 +493,12 @@ pub const Encoder = struct {
                 try self.begin(Tag.layout_move);
                 try self.name(&move.name);
                 try self.u8le(move.kind);
+            },
+            .switch_session => |move| {
+                try self.begin(Tag.switch_session);
+                try self.name(&move.name);
+                try self.u16le(move.rows);
+                try self.u16le(move.cols);
             },
             .float => |float| {
                 try self.begin(Tag.float);
@@ -688,6 +712,11 @@ pub const Decoder = struct {
             Tag.layout_move => Request{ .layout_move = .{
                 .name = try self.name(),
                 .kind = try self.u8le(),
+            } },
+            Tag.switch_session => Request{ .switch_session = .{
+                .name = try self.name(),
+                .rows = try self.u16le(),
+                .cols = try self.u16le(),
             } },
             Tag.float => Request{ .float = .{ .name = try self.name() } },
             Tag.dock => Request{ .dock = .{

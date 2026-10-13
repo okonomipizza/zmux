@@ -371,9 +371,32 @@ into, and focus is the server's idea, read later.
 
 Key bindings are vim-flavoured behind the existing `ctrl-a` prefix: `s` splits side by
 side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
-`h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, and `o`
-rotates the arrangement. A bare `ctrl-a` twice still detaches, and a prefix followed by
-an unused key detaches rather than being swallowed.
+`h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, `o`
+rotates the arrangement, and `w` lists the sessions and switches to one. A bare
+`ctrl-a` twice still detaches, and a prefix followed by an unused key detaches rather
+than being swallowed.
+
+### Switching sessions without detaching
+
+`ctrl-a w` opens a menu over the whole window listing the sessions numbered from one.
+A number and Enter moves to that session; Escape stays where you are. The session being
+left is not closed and its panes keep running, so this is a move rather than a restart.
+
+The menu is drawn over the window rather than inside the status line, because the
+sessions it lists are not the one on screen and drawing it beside them would invite
+reading the listing as part of the current layout. It reuses the `list` request and the
+`session` events that `zmux ls` already had, so nothing new crosses the wire to fetch
+it; the events fill the menu instead of being printed.
+
+Switching is one request rather than a detach followed by an attach, and that is not a
+convenience. A client that attached before letting go of the old session would be in two
+watcher lists at once, and the server would send it output for panes it no longer has.
+The server removes the old watcher and attaches to the new session in one step, and the
+client drops its panes, because they belong to the session being left.
+
+The size travels with the request. The server does not remember a client's size between
+requests, and the session being moved to has to be sized to this client, which is why
+`attach` carries its own too.
 
 Verified: an attached client at 80x24 shows the first pane's text on row 1 and the status
 line reading `1 pane(s)`. Sending `ctrl-a s` produces `2 pane(s)`, and the client's output

@@ -112,6 +112,21 @@ pub const Client = struct {
     focused_float: u64 = 0,
     /// Set while the server is labelling the tiled panes for a dock target.
     docking: bool = false,
+    /// The sessions the server last listed, while the switch menu is open.
+    ///
+    /// Gathered from the `session` events that answer a `list` request, and held here rather than
+    /// drawn as they arrive so that the menu is one screenful the user reads at once.
+    session_menu: std.ArrayList(protocol.SessionInfo) = .empty,
+    /// Set while the switch menu is open.
+    menu_open: bool = false,
+    /// The digits typed so far, as a number, or zero when none has been typed.
+    ///
+    /// A value rather than a string, because the menu chooses a session by its position and a number
+    /// is what that is. Zero means nothing has been typed, which is also why the sessions are
+    /// numbered from one.
+    menu_choice: usize = 0,
+    /// Whether the listing the menu is waiting for has arrived.
+    menu_ready: bool = false,
     /// Set while the floating panes are hidden, so the status line can say so.
     ///
     /// Hidden floats are not in the layout event at all, so without this the client cannot tell
@@ -205,6 +220,7 @@ pub const Client = struct {
         for (self.pending.items) |*entry| entry.data.deinit(self.gpa);
         self.pending.deinit(self.gpa);
         self.covered.deinit(self.gpa);
+        self.session_menu.deinit(self.gpa);
         if (self.status) |*status| status.deinit(self.gpa);
         if (self.local) |*local| local.leave();
         self.encoder.deinit();
@@ -432,6 +448,13 @@ pub const Client = struct {
     fn draw(self: *Client, window: terminal_mod.vtSize) void {
         const local = self.local orelse return;
 
+        // The menu takes the whole window rather than sitting beside the panes: it is a choice the
+        // user is making, and the sessions it lists are not the one already on screen.
+        if (self.menu_open) {
+            self.drawMenu(local, window);
+            return;
+        }
+
         // Replies the panes' terminals produced while parsing go back to the programs
         // they belong to, before anything is painted.
         self.flushPaneReplies();
@@ -573,6 +596,58 @@ pub const Client = struct {
             if (pane.rect.width == 0 or pane.rect.height == 0) continue;
             self.covered.appendAssumeCapacity(pane.rect);
         }
+    }
+
+    /// Draw the session menu over the whole window.
+    ///
+    /// The sessions are numbered from one down the left, and the number typed so far is shown back
+    /// to the user so that a multi-digit choice is visible before it is accepted. One `\x1b[K` per
+    /// row is what clears each line, so a shorter listing does not leave the previous frame behind.
+    fn drawMenu(self: *Client, local: terminal_mod.Terminal, window: terminal_mod.vtSize) void {
+        var buffer: [512]u8 = undefined;
+
+        local.writeAll("\x1b[2J") catch return;
+
+        const heading = std.fmt.bufPrint(
+            &buffer,
+            "\x1b[1;1H\x1b[7m zmux | switch to which session?  type a number and press enter, esc to cancel \x1b[0m\x1b[K",
+            .{},
+        ) catch return;
+        local.writeAll(heading) catch return;
+
+        // The menu can only draw as many rows as the window has, and the heading and the prompt line
+        // take one each. A listing longer than that is truncated rather than scrolled, because the
+        // session the user wants is more likely to be near the top than at the bottom.
+        const rows_available = if (window.rows > 2) window.rows - 2 else 0;
+        var row: u16 = 0;
+        for (self.session_menu.items) |info| {
+            if (row >= rows_available) break;
+            const line = std.fmt.bufPrint(
+                &buffer,
+                "\x1b[{d};1H  {d:>2}  {s}\x1b[K",
+                .{ row + 2, row + 1, info.name.slice() },
+            ) catch return;
+            local.writeAll(line) catch return;
+            row += 1;
+        }
+
+        // A listing that has not arrived yet, or one with nothing in it, says so rather than leaving
+        // the screen blank: an empty window reads as a failure.
+        if (self.session_menu.items.len == 0) {
+            const empty = if (self.menu_ready)
+                "\x1b[3;1H  (no sessions)\x1b[K"
+            else
+                "\x1b[3;1H  (asking the server)\x1b[K";
+            local.writeAll(empty) catch return;
+        }
+
+        // Where the choice is written, so a number that has been typed is visible before Enter.
+        const prompt_row = if (window.rows > 1) window.rows else 1;
+        const choice = if (self.menu_choice == 0)
+            std.fmt.bufPrint(&buffer, "\x1b[{d};1H\x1b[7m choice: \x1b[0m\x1b[K", .{prompt_row}) catch return
+        else
+            std.fmt.bufPrint(&buffer, "\x1b[{d};1H\x1b[7m choice: {d} \x1b[0m\x1b[K", .{ prompt_row, self.menu_choice }) catch return;
+        local.writeAll(choice) catch {};
     }
 
     /// Draw a pane's number in the middle of its top row, while a dock target is being chosen.
@@ -916,6 +991,58 @@ pub const Client = struct {
             return false;
         }
 
+        // While the session menu is open, the digits choose a session and Enter accepts. Every
+        // keystroke is consumed: the menu belongs to zmux, and forwarding a digit to the pane behind
+        // it would be sending a character the user typed at a menu.
+        if (self.menu_open) {
+            switch (byte) {
+                // A number is built up digit by digit, so a session beyond the ninth is still
+                // reachable. Only the sessions actually listed count, so a typed number that is too
+                // large simply selects nothing.
+                '0'...'9' => {
+                    self.menu_choice = self.menu_choice * 10 + (byte - '0');
+                    // A leading zero is not part of a number, so it is treated as starting one.
+                    if (self.menu_choice == 0 and byte == '0') self.menu_choice = 0;
+                    return false;
+                },
+                '\r', '\n' => {
+                    const chosen = self.chosenSession();
+                    self.closeMenu();
+                    if (chosen) |info| {
+                        // The size travels with the request, because the session being moved to has
+                        // to be sized to this client and the server does not remember one between
+                        // requests.
+                        const window = self.local.?.size() catch terminal_mod.vtSize{
+                            .rows = 24,
+                            .cols = 80,
+                        };
+                        try self.sendRequest(.{ .switch_session = .{
+                            .name = info.name,
+                            .rows = if (window.rows > 1) window.rows - 1 else 1,
+                            .cols = window.cols,
+                        } });
+                        // Everything on screen belongs to the session being left, and this client is
+                        // about to be told a whole new layout. Clearing now means the old session's
+                        // panes are not briefly drawn underneath the new one's.
+                        self.forgetPanes();
+                        try self.local.?.writeAll("\x1b[2J");
+                    }
+                    return false;
+                },
+                // Backspace withdraws a digit, which is what a number field does.
+                0x7F, 0x08 => {
+                    self.menu_choice /= 10;
+                    return false;
+                },
+                // Escape leaves without switching.
+                0x1B => {
+                    self.closeMenu();
+                    return false;
+                },
+                else => return false,
+            }
+        }
+
         if (byte == 0x01) {
             // The prefix takes effect on the next byte; a prefix that is never followed
             // by anything means the user pressed ctrl-a and stopped, which detaches so
@@ -929,6 +1056,67 @@ pub const Client = struct {
         // terminal have already agreed on.
         try payload.append(self.gpa, byte);
         return false;
+    }
+
+    /// Open the switch menu and ask the server for the sessions to fill it.
+    ///
+    /// The list is requested rather than remembered, because sessions come and go without this
+    /// client being told: another terminal can start one, and one whose last pane exited is gone.
+    /// Asking each time the menu opens is what makes it current.
+    fn openMenu(self: *Client) !void {
+        self.session_menu.clearRetainingCapacity();
+        self.menu_choice = 0;
+        self.menu_ready = false;
+        self.menu_open = true;
+        try self.sendRequest(.list);
+    }
+
+    /// Close the menu without switching.
+    ///
+    /// The panes are marked stale and the screen cleared, because the menu covered the whole window
+    /// and the panes are painted by writing into their rectangles rather than by restoring a saved
+    /// screen. Without this the window would come back empty.
+    fn closeMenu(self: *Client) void {
+        self.menu_open = false;
+        self.menu_choice = 0;
+        self.session_menu.clearRetainingCapacity();
+        self.forgetMenuScreen();
+    }
+
+    /// Blank the window and arrange for every pane to be painted again.
+    fn forgetMenuScreen(self: *Client) void {
+        for (self.panes.items) |*pane| pane.stale = true;
+        const local = self.local orelse return;
+        local.writeAll("\x1b[2J") catch {};
+    }
+
+    /// The session the typed number names, or null when it names none.
+    ///
+    /// The numbers are positions in the listed order, counted from one, so zero names nothing. A
+    /// number larger than the list names nothing either, which is what a mistyped digit gets.
+    fn chosenSession(self: *Client) ?protocol.SessionInfo {
+        if (self.menu_choice == 0) return null;
+        const index = self.menu_choice - 1;
+        if (index >= self.session_menu.items.len) return null;
+        return self.session_menu.items[index];
+    }
+
+    /// Drop every pane this client holds, and their terminals with them.
+    ///
+    /// Used when moving to another session. The panes belong to the session being left, and the
+    /// servers sends a whole new layout for the one being entered; keeping the old panes would draw
+    /// a mixture of the two, and their terminals would go on parsing whatever arrived.
+    fn forgetPanes(self: *Client) void {
+        for (self.panes.items) |*pane| pane.deinit(self.gpa);
+        self.panes.clearRetainingCapacity();
+        for (self.pending.items) |*entry| entry.data.deinit(self.gpa);
+        self.pending.clearRetainingCapacity();
+        self.covered.clearRetainingCapacity();
+        self.focused = 0;
+        self.focused_float = 0;
+        self.docking = false;
+        self.floats_hidden = false;
+        self.exited = false;
     }
 
     /// The pane carrying a given label, while a dock target is being chosen.
@@ -1034,6 +1222,12 @@ pub const Client = struct {
                 } });
                 return false;
             },
+            // `w` opens the session menu, which lists the sessions by number and switches to the one
+            // chosen. A window onto the other sessions, which is what the key is named for.
+            'w' => {
+                try self.openMenu();
+                return false;
+            },
             // The prefix twice detaches, which is how a user who is used to ctrl-a ctrl-a
             // gets out.
             0x01 => {
@@ -1108,9 +1302,21 @@ pub const Client = struct {
                 try self.applyLayout(layout);
             },
             .session => |info| {
+                // While the menu is open the listing fills the menu rather than being printed, since
+                // the user is looking at the menu and not at the terminal they started zmux from.
+                if (self.menu_open) {
+                    try self.session_menu.append(self.gpa, info);
+                    return;
+                }
                 try self.printSession(info);
             },
             .list_end => {
+                // While the menu is open the listing is its contents, so the end of the listing is
+                // the moment it can be drawn rather than the end of the query.
+                if (self.menu_open) {
+                    self.menu_ready = true;
+                    return;
+                }
                 self.finished = true;
             },
             .attached => |attached| {
@@ -2121,4 +2327,98 @@ test "a pane is skipped only when a float covers all of it" {
     // A float one column narrower leaves that column to draw, so the pane is not skippable.
     client.findPane(3).?.rect = .{ .x = 0, .y = 0, .width = 39, .height = 20 };
     try std.testing.expect(!client.isCovered(client.findPane(1).?));
+}
+
+test "the menu numbers sessions from one, and refuses a number out of range" {
+    // The user types a position, not an identifier, so the mapping is the whole contract. Counting
+    // from one is what makes zero unusable as a choice, which is what leaves "nothing typed" and
+    // "the first session" distinguishable.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        client.session_menu.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    try client.session_menu.append(gpa, .{
+        .name = try protocol.Name.init("alpha"),
+        .rows = 24,
+        .cols = 80,
+        .clients = 0,
+        .pid = 0,
+        .running = true,
+    });
+    try client.session_menu.append(gpa, .{
+        .name = try protocol.Name.init("beta"),
+        .rows = 24,
+        .cols = 80,
+        .clients = 0,
+        .pid = 0,
+        .running = true,
+    });
+
+    // Nothing typed yet.
+    client.menu_choice = 0;
+    try std.testing.expectEqual(@as(?protocol.SessionInfo, null), client.chosenSession());
+
+    // One is the first session, not the second.
+    client.menu_choice = 1;
+    try std.testing.expectEqualStrings("alpha", client.chosenSession().?.name.slice());
+
+    client.menu_choice = 2;
+    try std.testing.expectEqualStrings("beta", client.chosenSession().?.name.slice());
+
+    // Past the end there is nothing, so a mistyped digit selects nothing rather than the last
+    // session.
+    client.menu_choice = 3;
+    try std.testing.expectEqual(@as(?protocol.SessionInfo, null), client.chosenSession());
+    client.menu_choice = 99;
+    try std.testing.expectEqual(@as(?protocol.SessionInfo, null), client.chosenSession());
+}
+
+test "digits typed at the menu build a number" {
+    // A list longer than nine needs more than one digit, so the digits accumulate rather than each
+    // replacing the last. This mirrors what `handleByte` does with a digit key.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        client.session_menu.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // Twelve sessions, so a two-digit choice is meaningful.
+    var index: usize = 0;
+    var names: [12]protocol.Name = undefined;
+    while (index < 12) : (index += 1) {
+        names[index] = try protocol.Name.init(try std.fmt.bufPrint(&names[index].bytes, "s{d}", .{index + 1}));
+        try client.session_menu.append(gpa, .{
+            .name = names[index],
+            .rows = 24,
+            .cols = 80,
+            .clients = 0,
+            .pid = 0,
+            .running = true,
+        });
+    }
+
+    // Typing "1" then "2" is twelve, not two.
+    client.menu_choice = 0;
+    client.menu_choice = client.menu_choice * 10 + ('1' - '0');
+    client.menu_choice = client.menu_choice * 10 + ('2' - '0');
+    try std.testing.expectEqual(@as(usize, 12), client.menu_choice);
+    try std.testing.expectEqualStrings("s12", client.chosenSession().?.name.slice());
 }
