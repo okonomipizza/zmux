@@ -1066,3 +1066,88 @@ test "the byte limit can be lowered, and is what stops a run when it is" {
     // allows: the byte limit is what decided.
     try std.testing.expect(held < 5000);
 }
+
+test "every scroll movement goes the way it says" {
+    // The direction of a scroll is not visible in the code: `scrollBy(1)` and `scrollBy(-1)` differ
+    // by a sign, and the library documents that up is negative. This checks the sign against the
+    // viewport's own absolute row, which is the only thing that says which way the reader moved.
+    //
+    // It exists because the prefix was moved to ctrl-b, which had been page-up in the scroll mode.
+    // Renaming a key is exactly the kind of change that leaves a movement pointing the wrong way
+    // with nothing to catch it.
+    var terminal = try Terminal.init(.{ .cols = 78, .rows = 20 });
+    defer terminal.deinit();
+
+    var n: usize = 1;
+    var buf: [32]u8 = undefined;
+    while (n <= 300) : (n += 1) {
+        terminal.write(try std.fmt.bufPrint(&buf, "L{d}\r\n", .{n}));
+    }
+
+    // The viewport row, from the scrollbar, in the same row space the scroll API uses.
+    const row = struct {
+        fn of(t: Terminal) usize {
+            var bar: c.GhosttyTerminalScrollbar = .{ .total = 0, .offset = 0, .len = 0 };
+            const result = c.ghostty_terminal_get(
+                t.handle,
+                c.GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                &bar,
+            );
+            if (result != c.GHOSTTY_SUCCESS) return 0;
+            return @intCast(bar.offset);
+        }
+    }.of;
+
+    // Each movement is tried from a row well away from both ends, so a wrong sign has room to show.
+    const Movement = struct { name: []const u8, delta: i32, goes_up: bool };
+    const movements = [_]Movement{
+        .{ .name = "a line down", .delta = 1, .goes_up = false },
+        .{ .name = "a line up", .delta = -1, .goes_up = true },
+        .{ .name = "ten down", .delta = 10, .goes_up = false },
+        .{ .name = "ten up", .delta = -10, .goes_up = true },
+        .{ .name = "half a screen down", .delta = 9, .goes_up = false },
+        .{ .name = "half a screen up", .delta = -9, .goes_up = true },
+        .{ .name = "a screen down", .delta = 18, .goes_up = false },
+        .{ .name = "a screen up", .delta = -18, .goes_up = true },
+    };
+
+    for (movements) |movement| {
+        // An absolute row rather than a relative one, so every movement starts from the same place:
+        // scrolling by a delta would drift, and a later movement would run out of room at an end and
+        // be reported as going the wrong way.
+        terminal.scrollToRow(140);
+        const before = row(terminal);
+        terminal.scrollBy(movement.delta);
+        const after = row(terminal);
+        if (movement.goes_up) {
+            if (after >= before) {
+                std.debug.print("scrollBy({d}) for {s} did not move up: row {d} to {d}\n", .{
+                    movement.delta, movement.name, before, after,
+                });
+                return error.ScrollWentTheWrongWay;
+            }
+        } else {
+            if (after <= before) {
+                std.debug.print("scrollBy({d}) for {s} did not move down: row {d} to {d}\n", .{
+                    movement.delta, movement.name, before, after,
+                });
+                return error.ScrollWentTheWrongWay;
+            }
+        }
+    }
+
+    // The ends are the ends: the top is row zero, and the bottom is past every row of history.
+    terminal.scrollToTop();
+    try std.testing.expectEqual(@as(usize, 0), row(terminal));
+    terminal.scrollToBottom();
+    try std.testing.expect(row(terminal) > 250);
+    try std.testing.expect(terminal.viewportActive());
+
+    // Scrolling past either end is clamped rather than wrapping or reporting an error, so a reader
+    // holding a key at the top does not end up at the bottom.
+    terminal.scrollBy(-5000);
+    try std.testing.expectEqual(@as(usize, 0), row(terminal));
+    terminal.scrollBy(5000);
+    try std.testing.expectEqual(@as(usize, 0), row(terminal) - (row(terminal) - 0));
+    try std.testing.expect(terminal.viewportActive());
+}

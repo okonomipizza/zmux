@@ -31,6 +31,13 @@ pub const Error = error{
     Detached,
 };
 
+/// The key that introduces a zmux command rather than being sent to the program.
+///
+/// `ctrl-b`, which is what tmux uses, so a habit formed there carries over. Named rather than written
+/// as a literal because it appears in three places, and a prefix that agreed with itself in only two
+/// of them would leave the third key either dead or sent to the program by mistake.
+const prefix_key: u8 = 0x02;
+
 /// What a client is doing.
 pub const Mode = enum {
     /// Attached to a session and drawing it.
@@ -414,7 +421,7 @@ pub const Client = struct {
             const at_live = if (pane) |p| p.terminal.viewportActive() else true;
             return std.fmt.bufPrint(
                 buffer,
-                " zmux | {s} | scroll: j/k line  J/K ten  ctrl-d/u page  g/G ends  q quit |{s} {d} rows of history",
+                " zmux | {s} | scroll: j/k line  J/K ten  ctrl-d/u half  ctrl-f/v page  g/G ends  q quit |{s} {d} rows of history",
                 .{ name, if (at_live) " live," else "", history },
             ) catch buffer[0..0];
         }
@@ -432,7 +439,7 @@ pub const Client = struct {
         if (self.floats_hidden) {
             return std.fmt.bufPrint(
                 buffer,
-                " zmux | {s} | {d}x{d} | floats hidden, ctrl-a f shows them | {s}",
+                " zmux | {s} | {d}x{d} | floats hidden, ctrl-b f shows them | {s}",
                 .{
                     name,
                     self.area_cols,
@@ -444,7 +451,7 @@ pub const Client = struct {
 
         return std.fmt.bufPrint(
             buffer,
-            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close h/j/k/l focus <> swap o rotate F/f floats d dock | {s}",
+            " zmux | {s} | {d}x{d} | ctrl-b: s/v split q close h/j/k/l focus <> swap o rotate F/f floats d dock | {s}",
             .{
                 name,
                 self.area_cols,
@@ -1013,6 +1020,16 @@ pub const Client = struct {
         // While the history is being read, the movement keys move the viewport and everything else
         // is consumed. Nothing is forwarded: a program receiving a `j` the user meant as a scroll
         // would act on it, and the whole point of the mode is that the program is left alone.
+        //
+        // The prefix is the exception, and it is checked first. A reader inside the mode still needs
+        // to reach the rest of zmux, and the keys that would take them out again are behind the
+        // prefix; consuming it would leave the mode as the only thing a mistyped command could reach.
+        if (self.scroll_mode and byte == prefix_key) {
+            self.leaveScroll();
+            self.prefix_armed = true;
+            return false;
+        }
+
         if (self.scroll_mode) {
             const pane = self.focusedPane() orelse {
                 self.leaveScroll();
@@ -1031,7 +1048,12 @@ pub const Client = struct {
                 0x04 => pane.terminal.scrollBy(@divTrunc(page, 2)), // ctrl-d
                 0x15 => pane.terminal.scrollBy(-@divTrunc(page, 2)), // ctrl-u
                 0x06 => pane.terminal.scrollBy(page), // ctrl-f
-                0x02 => pane.terminal.scrollBy(-page), // ctrl-b
+                // Page-up is `ctrl-v`, the counterpart of `ctrl-f` on keyboards where the pair is
+                // adjacent, and the key `less` uses for the same movement. `ctrl-b` would be the
+                // obvious partner but it is the prefix, and a reader who pressed it expecting the
+                // prefix would find themselves in a mode they could not leave by the key they meant
+                // to press. The prefix is checked before this switch, so it wins.
+                0x16 => pane.terminal.scrollBy(-page), // ctrl-v
                 // The ends of the history. `g` is vim's and `G` the same for the other end.
                 'g' => pane.terminal.scrollToTop(),
                 'G' => pane.terminal.scrollToBottom(),
@@ -1101,10 +1123,10 @@ pub const Client = struct {
             }
         }
 
-        if (byte == 0x01) {
+        if (byte == prefix_key) {
             // The prefix takes effect on the next byte; a prefix that is never followed
-            // by anything means the user pressed ctrl-a and stopped, which detaches so
-            // that a bare ctrl-a keeps working.
+            // by anything means the user pressed it and stopped, which detaches so
+            // that a bare prefix keeps working.
             self.prefix_armed = true;
             return false;
         }
@@ -1331,18 +1353,17 @@ pub const Client = struct {
                 self.enterScroll();
                 return false;
             },
-            // The prefix twice detaches, which is how a user who is used to ctrl-a ctrl-a
-            // gets out.
-            0x01 => {
+            // The prefix twice detaches, which is how a user who is used to pressing it twice gets
+            // out.
+            prefix_key => {
                 if (self.watching.len > 0) {
                     try self.sendRequest(.{ .detach = .{ .name = self.watching } });
                 }
                 return true;
             },
             else => {
-                // An unused key after the prefix detaches, so that ctrl-a followed by a
-                // typo does not leave the client sitting in a state where the next byte is
-                // eaten.
+                // An unused key after the prefix detaches, so that the prefix followed by a typo does
+                // not leave the client sitting in a state where the next byte is eaten.
                 if (self.watching.len > 0) {
                     try self.sendRequest(.{ .detach = .{ .name = self.watching } });
                 }
@@ -1901,11 +1922,41 @@ test "a one-row window still leaves the program a row" {
     try std.testing.expectEqual(@as(u16, 1), session.rows);
 }
 
-test "the client detaches on the prefix key" {
-    // `handleByte` is where the prefix is recognised, and it is pure enough to
-    // test without a socket: a client with no terminal still routes Ctrl-a to a
-    // detach request.
-    _ = Client;
+test "the prefix key arms the prefix, and the old one no longer does" {
+    // The prefix is recognised in `handleByte`, which is pure enough to test without a socket. What
+    // matters is that the key named by `prefix_key` is the one that arms it, and that the key it was
+    // moved from does not: a rename that left the old byte reachable would leave two prefixes, and
+    // the second would silently swallow the byte it consumed.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        client.session_menu.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    try std.testing.expectEqual(@as(u8, 0x02), prefix_key);
+
+    var payload: std.ArrayList(u8) = .empty;
+    defer payload.deinit(gpa);
+
+    // The prefix arms and is not forwarded to the program.
+    _ = try client.handleByte(prefix_key, &payload);
+    try std.testing.expect(client.prefix_armed);
+    try std.testing.expectEqual(@as(usize, 0), payload.items.len);
+
+    // The key the prefix used to be is an ordinary byte now, and reaches the program.
+    client.prefix_armed = false;
+    payload.clearRetainingCapacity();
+    _ = try client.handleByte(0x01, &payload);
+    try std.testing.expect(!client.prefix_armed);
+    try std.testing.expectEqualStrings("\x01", payload.items);
 }
 
 test "a label finds the pane the server numbered" {

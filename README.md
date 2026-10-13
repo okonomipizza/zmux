@@ -41,29 +41,29 @@ shell: `zmux attach work`, then `htop`. A multiplexer whose session contains a
 shell is more useful than one whose session contains a single command, because the
 shell can start anything and the session survives it.
 
-Inside an attached session the prefix key is `ctrl-a`:
+Inside an attached session the prefix key is `ctrl-b`:
 
 | key | action |
 | --- | --- |
-| `ctrl-a s` | split the focused pane side by side |
-| `ctrl-a v` | split it into stacked halves |
-| `ctrl-a q` | close the focused pane |
-| `ctrl-a F` | float the focused pane above the layout |
-| `ctrl-a d` | dock a floating pane back into the layout |
-| `ctrl-a f` | hide the floating panes, or show them again |
-| `ctrl-a h` / `k` | move focus to the previous pane |
-| `ctrl-a l` / `j` | move focus to the next pane |
-| `ctrl-a <` / `>` | move the focused pane past its neighbour |
-| `ctrl-a o` | rotate every pane one place along |
-| `ctrl-a w` | list the sessions and switch to one |
-| `ctrl-a x` | read the focused pane's history |
-| `ctrl-a ctrl-a` | detach, leaving every pane running |
+| `ctrl-b s` | split the focused pane side by side |
+| `ctrl-b v` | split it into stacked halves |
+| `ctrl-b q` | close the focused pane |
+| `ctrl-b F` | float the focused pane above the layout |
+| `ctrl-b d` | dock a floating pane back into the layout |
+| `ctrl-b f` | hide the floating panes, or show them again |
+| `ctrl-b h` / `k` | move focus to the previous pane |
+| `ctrl-b l` / `j` | move focus to the next pane |
+| `ctrl-b <` / `>` | move the focused pane past its neighbour |
+| `ctrl-b o` | rotate every pane one place along |
+| `ctrl-b w` | list the sessions and switch to one |
+| `ctrl-b x` | read the focused pane's history |
+| `ctrl-b ctrl-b` | detach, leaving every pane running |
 
-`ctrl-a x` opens the focused pane's scrollback for reading. `j` and `k` move a
-line at a time, `J` and `K` ten, `ctrl-d` and `ctrl-u` half a screen, `g` and
-`G` go to the ends, and `q` or Escape leaves. Nothing is detached and the
-program keeps running: only the viewport moves, so the pane's own history is
-what you are reading rather than a copy of it.
+`ctrl-b x` opens the focused pane's scrollback for reading. `j` and `k` move a
+line at a time, `J` and `K` ten, `ctrl-d` and `ctrl-u` half a screen, `ctrl-f`
+and `ctrl-v` a whole one, `g` and `G` go to the ends, and `q` or Escape leaves.
+Nothing is detached and the program keeps running: only the viewport moves, so
+what you are reading is the pane's own history rather than a copy of it.
 
 While the history is open the pane stops following new output, because a
 viewport that moved under the reader would be unreadable. Typing anything puts
@@ -71,15 +71,15 @@ it back at the bottom first, so the program's answer is visible rather than
 arriving below the view. A pane with no history to show is left alone: a mode
 that opened onto a frozen screen would read as the program hanging.
 
-`ctrl-a w` lists the sessions in the same window, numbered from one. Type a
+`ctrl-b w` lists the sessions in the same window, numbered from one. Type a
 number and press Enter to move to that session, or Escape to stay where you
 are. Nothing is detached and no pane is closed: the session being left keeps
 running, and its panes are still there when you come back. The list is asked for
 each time the menu opens, so a session started in another terminal is there and
 one whose last pane exited is not.
 
-`ctrl-a <` and `ctrl-a >` swap the focused pane with the pane beside it in the
-layout's order, which is the same order the focus keys walk. `ctrl-a o` shifts
+`ctrl-b <` and `ctrl-b >` swap the focused pane with the pane beside it in the
+layout's order, which is the same order the focus keys walk. `ctrl-b o` shifts
 every pane one place along instead, last to first. Neither changes the shape of
 the layout: the split ratios you built stay as they are, and only which pane sits
 where changes. The programs inside are not disturbed beyond being resized to
@@ -98,7 +98,7 @@ space it leaves is given to a neighbouring pane that grows into it. Docking asks
 which pane to split: the layout freezes, each tiled pane shows a number, and the
 number you press is divided along its longer side. Escape cancels.
 
-`ctrl-a f` puts the floating panes away and brings them back. A hidden float keeps
+`ctrl-b f` puts the floating panes away and brings them back. A hidden float keeps
 running and keeps its screen; it is simply not drawn, and it cannot take focus, so
 nothing is ever typed into a pane you cannot see. Showing them again returns focus
 to the pane you were working in before the float appeared.

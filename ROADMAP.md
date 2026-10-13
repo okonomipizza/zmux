@@ -369,19 +369,34 @@ Input carries the pane it is meant for rather than relying on which pane is focu
 keystroke already in flight when focus moves must reach the pane the user was typing
 into, and focus is the server's idea, read later.
 
-Key bindings are vim-flavoured behind the existing `ctrl-a` prefix: `s` splits side by
+Key bindings are vim-flavoured behind the existing `ctrl-b` prefix: `s` splits side by
 side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
 `h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, `o`
 rotates the arrangement, `w` lists the sessions and switches to one, and `x` reads
-the focused pane's history. A bare `ctrl-a` twice still detaches, and a prefix
+the focused pane's history. A bare `ctrl-b` twice still detaches, and a prefix
 followed by an unused key detaches rather than being swallowed.
+
+The prefix was `ctrl-a` until the key was moved to `ctrl-b`, which is what tmux uses. It is
+written as one named constant rather than as a byte in three places, because a prefix that
+agreed with itself in only two of them would leave the third key either dead or sent to the
+program by mistake. The records earlier in this file still say `ctrl-a`: they describe what
+a phase verified when it was written, and rewriting them would claim a test ran against a
+key that did not exist yet.
 
 ### Reading a pane's history
 
-`ctrl-a x` opens the focused pane's scrollback. The movement keys follow `less` and
+`ctrl-b x` opens the focused pane's scrollback. The movement keys follow `less` and
 vim, which is where the habit comes from: `j`/`k` a line, `J`/`K` ten, `ctrl-d` and
-`ctrl-u` half a screen, `g` and `G` the ends, `q` or Escape to leave. The capitals
-moving by ten is the one addition, for crossing a long history without holding a key.
+`ctrl-u` half a screen, `ctrl-f` and `ctrl-v` a whole one, `g` and `G` the ends, `q`
+or Escape to leave. The capitals moving by ten is the one addition, for crossing a long
+history without holding a key.
+
+Page-up is `ctrl-v` rather than `ctrl-b` because `ctrl-b` became the prefix. `less` uses
+both for that movement, so the pairing survives the change, and the prefix is checked
+before the movement keys so a reader pressing it gets out of the mode rather than
+scrolling. The symmetry is tested: every movement is checked against the viewport's own
+absolute row, since a sign is not visible in the code and a renamed key is exactly what
+leaves one pointing the wrong way.
 
 Scrollback is the library's, not a copy: the pane's own terminal holds the history, and
 the mode moves its viewport. That is what makes it free — nothing crosses the wire, the
@@ -406,7 +421,7 @@ tracking any of it here.
 
 ### Switching sessions without detaching
 
-`ctrl-a w` opens a menu over the whole window listing the sessions numbered from one.
+`ctrl-b w` opens a menu over the whole window listing the sessions numbered from one.
 A number and Enter moves to that session; Escape stays where you are. The session being
 left is not closed and its panes keep running, so this is a move rather than a restart.
 
