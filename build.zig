@@ -8,6 +8,12 @@ pub fn build(b: *std.Build) void {
     // Ghostty's VT library. zmux owns the pty, the server and the TUI.
     const ghostty_vt = GhosttyVt.resolve(b, target);
 
+    // Command line parsing, pinned in build.zig.zon.
+    const clap = b.dependency("clap", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const exe = b.addExecutable(.{
         .name = "zmux",
         .root_module = b.createModule(.{
@@ -17,6 +23,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     ghostty_vt.apply(exe.root_module);
+    exe.root_module.addImport("clap", clap.module("clap"));
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -34,6 +41,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     ghostty_vt.apply(unit_tests.root_module);
+    unit_tests.root_module.addImport("clap", clap.module("clap"));
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");

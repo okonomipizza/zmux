@@ -17,15 +17,25 @@ and the TUI. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and
 
 ## Status
 
-Phase 0 of the roadmap is complete: libghostty-vt is integrated, and VT data
-can be parsed and rendered as text.
+Phases 0 and 0.5 of the roadmap are complete: libghostty-vt is integrated, VT
+data can be parsed and rendered as text, and the command line is parsed with
+[zig-clap](https://github.com/Hejsil/zig-clap).
 
 ```sh
 # Parse escape sequences on stdin and print the resulting screen.
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-There is no pty, server or TUI yet; those are phases 1 to 3.
+The session commands are accepted but have no server behind them yet, so they
+report that and exit non-zero. The pty, server and TUI are phases 1 to 3.
+
+```sh
+zmux ls
+zmux attach <session>
+zmux detach
+zmux kill <session>
+zmux kill-all
+```
 
 ## Development
 
@@ -59,14 +69,21 @@ nix build .#zmux
 ./result/bin/zmux
 ```
 
+The build sandbox has no network, so Zig cannot fetch `build.zig.zon`
+dependencies there. The flake pre-fetches them in a separate fixed-output
+derivation and passes the result to `zig build --system`. That derivation is
+keyed by a hash, so after changing a dependency run the build once, take the
+hash from the mismatch message, and paste it into `zmuxDeps.outputHash`.
+
 ## Layout
 
 ```
-build.zig        Zig build definition, including libghostty-vt discovery
-src/main.zig     entry point and the `dump` command
-src/vt.zig       the only module that knows libghostty-vt's C ABI
-flake.nix        dev shell, package, and formatter
-ARCHITECTURE.md  process model, data structures, and design decisions
-ROADMAP.md       phase plan and open questions
+build.zig           Zig build definition, including libghostty-vt discovery
+build.zig.zon       Zig package dependencies (zig-clap)
+src/main.zig        entry point and command line parsing
+src/vt.zig          the only module that knows libghostty-vt's C ABI
+flake.nix           dev shell, package, and formatter
+ARCHITECTURE.md     process model, data structures, and design decisions
+ROADMAP.md          phase plan and open questions
 ```
 

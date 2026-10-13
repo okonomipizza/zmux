@@ -44,12 +44,38 @@ and the binary appears to work, so this only shows up elsewhere. The `postFixup`
 step rewrites both. When changing this derivation, check `readelf -lW` and
 `readelf -dW` rather than only running the binary.
 
+## Phase 0.5 — command line
+
+The interface the server will hang off, settled before there is a server.
+
+Every command from the design is parsed: `ls`, `attach <session>`, `detach`,
+`kill <session>`, `kill-all`, plus `dump`. Parsing uses
+[zig-clap](https://github.com/Hejsil/zig-clap), pinned in `build.zig.zon`.
+
+The commands with no implementation behind them report that and exit non-zero
+rather than failing silently, so the interface can be exercised now and the
+server slotted in without changing how it is called.
+
+Two things worth recording.
+
+**clap's version matters more than usual.** The 0.10.0 that nixpkgs carries
+compiles against an older Zig and fails against 0.16 with four unrelated
+errors. 0.12.0 declares `minimum_zig_version = "0.16.0-dev"` and works. Check
+that field when the toolchain moves.
+
+**Nix cannot fetch Zig dependencies.** The build sandbox has no network, so
+`zig build` fails with `NameServerFailure` trying to reach the package URL. The
+flake pre-fetches into a fixed-output derivation and the build consumes it with
+`--system`. Note that `--fetch` leaves each dependency as a tarball while
+`--system` wants it unpacked, because it reads the dependency's own `build.zig`
+to learn which modules it exports; the derivation unpacks after fetching.
+
 ## Phase 1 — pty and a live shell
 
 Get a real program running and responding.
 
 1. Open `/dev/ptmx`, obtain the slave with `TIOCGPTN`, unlock with `TIOCSPTLCK`
-2. Spawn `$SHELL` on the slave with `posix_spawn`, with the slave on fds 0/1/2
+2. Spawn `$SHELL` on the slave with `fork` and `setsid`, with the slave on fds 0/1/2
 3. Register the master in epoll and feed reads into `vt_write`
 4. Register the `write_pty` callback and forward replies to the master
 5. Encode keystrokes with libghostty-vt's key encoder and write them to the master
@@ -61,6 +87,42 @@ pty, the parser, the reply path and the input encoder at once.
 
 Still no server and no socket in this phase: one process owns one pty and
 renders to its own stdout.
+
+### What Zig 0.16 changed underneath this phase
+
+These were each confirmed by compiling against the pinned toolchain, because
+the failure mode for most of them is a compile error naming a replacement that
+does not exist.
+
+**`std.posix` has lost nearly all of its POSIX wrappers.** `open`, `close`,
+`write`, `dup2`, `fork`, `execve`, `setsid`, `waitpid`, `fcntl`, `openpty` and
+`posix_spawn` are all gone; the compiler reports only
+`no member named 'X'`. Surviving and used here: `openatZ`, `read`, `sigprocmask`,
+`signalfd`, `tcgetattr`. Everything else goes through the raw syscalls in
+`std.os.linux`, which return `usize` and report errors as negative errno. The
+two-step idiom is `linux.errno(rc)` first, then narrow the fd with `@intCast` —
+casting before checking does not compile. `linux.E.init` does not exist either;
+the decoder is `linux.errno`.
+
+**The ioctl names drop the `TIOC` prefix.** They live in `std.os.linux.T`, so
+`TIOCGPTN` is `T.IOCGPTN` (`0x80045430`) and `TIOCSCTTY` is `T.IOCSCTTY`
+(`0x540e`). Searching the std source for `TIOC` finds nothing.
+
+**`std.c.posix_spawn` cannot be used on Linux.** It is a declaration that
+aliases the Darwin implementation, whose body asserts the target is Darwin, so
+touching it is a compile error with or without `-lc`. It is reachable through
+`@cImport("spawn.h")`, but glibc does not define `POSIX_SPAWN_SETSID` and offers
+no file action for `TIOCSCTTY`, so it cannot give the child a controlling
+terminal. Phase 1 uses the `fork` path for that reason, which the earlier plan
+had ruled out.
+
+**`std.posix.winsize` uses `row`/`col`/`xpixel`/`ypixel`.** There is no
+`ws_row`; that spelling is a compile error.
+
+**Two smaller traps.** `std.posix.sigprocmask` returns `void`, not an error
+union, so `try` on it fails to compile. And when the slave side closes, reading
+the master returns `error.InputOutput` (EIO) rather than 0, so the read loop
+must treat it as end of file or it spins forever.
 
 ## Phase 2 — TUI
 

@@ -1,0 +1,18 @@
+.{
+    .name = .zmux,
+    .version = "0.1.0",
+    .dependencies = .{
+        // Command line parsing. Pinned to the release whose
+        // minimum_zig_version matches the toolchain in flake.nix: the 0.10.0
+        // that nixpkgs carries does not compile against Zig 0.16.
+        .clap = .{
+            .url = "https://github.com/Hejsil/zig-clap/archive/refs/tags/0.12.0.tar.gz",
+            .hash = "clap-0.12.0-oBajB7foAQDqlSwaSG5g0yq7xGbQARUsBk5T64gAOqP5",
+        },
+    },
+    // An empty filter means "everything". The Nix build hands Zig a source
+    // tree that already holds only what it needs, and a narrower filter here
+    // would silently drop files that build.zig reads.
+    .paths = .{""},
+    .fingerprint = 0x695fb32a134f5621,
+}

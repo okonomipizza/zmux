@@ -39,6 +39,45 @@
       # Headers live in the `dev` output and the shared object in `out`, so the
       # build is pointed at the two separately.
       ghosttyVt = pkgs.libghostty-vt;
+
+      zig = pkgs.zigpkgs.${zigVersion};
+
+      # Zig fetches its package dependencies over the network, which the build
+      # sandbox does not have. This derivation runs the fetch once, with
+      # network access, and exports the resulting cache; `zig build --system`
+      # then resolves dependencies from it instead of dialling out.
+      #
+      # `--fetch` leaves each dependency as a tarball, but `--system` wants it
+      # unpacked: it reads the dependency's own build.zig to find the modules
+      # it exports. Unpacking here is what makes the consuming build work; a
+      # cache left as tarballs fails with "package not found at <dir>".
+      zmuxDeps = pkgs.stdenv.mkDerivation {
+        name = "zmux-zig-deps";
+        src = self;
+        nativeBuildInputs = [zig];
+        outputHashAlgo = "sha256";
+        outputHashMode = "recursive";
+        outputHash = "sha256-23ka0ZsyNiEbYk81K9DqAHY5B5YA7bOVA6vjqYmyMs0=";
+        dontConfigure = true;
+        dontInstall = true;
+        buildPhase = ''
+          runHook preBuild
+          export ZIG_GLOBAL_CACHE_DIR=$(mktemp -d)
+          # Zig 0.16 expects this directory to exist before fetching.
+          mkdir -p "$ZIG_GLOBAL_CACHE_DIR/tmp"
+          zig build --fetch
+
+          cache="$ZIG_GLOBAL_CACHE_DIR/p"
+          for archive in "$cache"/*.tar.gz; do
+            [ -e "$archive" ] || continue
+            tar xzf "$archive" -C "$cache"
+            rm "$archive"
+          done
+
+          mv "$cache" $out
+          runHook postBuild
+        '';
+      };
     in {
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.zmux;
 
@@ -47,7 +86,7 @@
         version = "0.1.0";
         src = self;
 
-        nativeBuildInputs = [pkgs.zigpkgs.${zigVersion}];
+        nativeBuildInputs = [zig];
 
         # The VT layer is a C library, so the Zig build needs the headers to
         # translate and the shared object to link against.
@@ -57,7 +96,7 @@
 
         buildPhase = ''
           runHook preBuild
-          export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-local-cache"
+          export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
           export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
           export GHOSTTY_VT_INCLUDE_DIR="${lib.getDev ghosttyVt}/include"
           export GHOSTTY_VT_LIBRARY_DIR="${ghosttyVt}/lib"
@@ -69,6 +108,7 @@
           # minimum far older than the stdenv's, which leaves symbols such as
           # pthread_create and shm_open unresolved.
           zig build \
+            --system ${zmuxDeps} \
             --prefix $out \
             -Dtarget=${pkgs.stdenv.hostPlatform.system}-${pkgs.stdenv.hostPlatform.parsed.abi.name}.${pkgs.glibc.version} \
             -Doptimize=ReleaseSafe
