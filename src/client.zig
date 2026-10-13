@@ -654,15 +654,16 @@ pub const Client = struct {
                 // Each failure below abandons the frame rather than continuing with a partial
                 // rectangle, and says so through `failed`.
                 //
-                // Move to this row's first column inside the pane's rectangle, erase the
-                // row, and write the cells. Erasing matters because a row that got shorter
+                // Move to this row's first column inside the pane's rectangle and blank exactly the
+                // interior, then write the cells. Blanking matters because a row that got shorter
                 // would otherwise keep the tail of the previous frame.
-                var buffer: [32]u8 = undefined;
-                const move = std.fmt.bufPrint(
-                    &buffer,
-                    "\x1b[{d};{d}H\x1b[K",
-                    .{ painter.rect.y + painter.row_index.* + 1, painter.rect.x + 1 },
-                ) catch {
+                //
+                // The blanking is `ECH` with an explicit count rather than `EL` (`\x1b[K`), which
+                // erases to the end of the whole screen line. Content starts at the interior's left
+                // edge, so `EL` would reach past the pane's right border and wipe it, leaving the
+                // frame with its top and bottom edges and no sides.
+                var buffer: [48]u8 = undefined;
+                const move = blankRow(&buffer, painter.rect, painter.row_index.*) catch {
                     painter.failed = true;
                     return false;
                 };
@@ -1337,53 +1338,46 @@ fn appendBorder(
     if (rect.width < 3 or rect.height < 3) return true;
 
     const horizontal = rect.width - 2;
-    // A horizontal edge is three bytes per cell in UTF-8, plus the cursor move that introduces it.
-    // A fixed writer that overflows reports it rather than truncating, so this is sized from the
-    // rectangle instead of guessed: a wide pane on a wide terminal must not lose its border.
-    const edge_bytes = 32 + @as(usize, horizontal) * 3;
-    var scratch: [512]u8 = undefined;
-    if (edge_bytes > scratch.len) return true;
+
+    // The edges are written straight into the frame buffer, which grows as needed, rather than
+    // through a fixed scratch buffer. A fixed buffer would cap how wide a pane could be before its
+    // border was silently dropped, and a terminal wide enough to hit that cap is not exotic.
 
     // The top edge, with corners.
-    {
-        var writer = std.Io.Writer.fixed(&scratch);
-        writer.print("\x1b[{d};{d}H\u{250c}", .{ rect.y + 1, rect.x + 1 }) catch return false;
-        appendRepeated(&writer, "\u{2500}", horizontal) catch return false;
-        writer.writeAll("\u{2510}") catch return false;
-        buffer.appendSlice(gpa, writer.buffered()) catch return false;
-    }
+    buffer.print(gpa, "\x1b[{d};{d}H\u{250c}", .{ rect.y + 1, rect.x + 1 }) catch return false;
+    appendRepeated(buffer, gpa, "\u{2500}", horizontal) catch return false;
+    buffer.appendSlice(gpa, "\u{2510}") catch return false;
 
     // The middle rows: a vertical marker at each side.
     var row: u16 = 1;
     while (row < rect.height - 1) : (row += 1) {
-        var writer = std.Io.Writer.fixed(&scratch);
-        writer.print("\x1b[{d};{d}H\u{2502}\x1b[{d};{d}H\u{2502}", .{
+        buffer.print(gpa, "\x1b[{d};{d}H\u{2502}\x1b[{d};{d}H\u{2502}", .{
             rect.y + row + 1,
             rect.x + 1,
             rect.y + row + 1,
             rect.x + rect.width,
         }) catch return false;
-        buffer.appendSlice(gpa, writer.buffered()) catch return false;
     }
 
     // The bottom edge.
-    {
-        var writer = std.Io.Writer.fixed(&scratch);
-        writer.print("\x1b[{d};{d}H\u{2514}", .{ rect.y + rect.height, rect.x + 1 }) catch return false;
-        appendRepeated(&writer, "\u{2500}", horizontal) catch return false;
-        writer.writeAll("\u{2518}") catch return false;
-        buffer.appendSlice(gpa, writer.buffered()) catch return false;
-    }
+    buffer.print(gpa, "\x1b[{d};{d}H\u{2514}", .{ rect.y + rect.height, rect.x + 1 }) catch return false;
+    appendRepeated(buffer, gpa, "\u{2500}", horizontal) catch return false;
+    buffer.appendSlice(gpa, "\u{2518}") catch return false;
 
     // A colour cannot bleed into the neighbouring pane.
     buffer.appendSlice(gpa, "\x1b[0m") catch return false;
     return true;
 }
 
-/// Write `count` copies of a string, which is always a single box-drawing character here.
-fn appendRepeated(writer: *std.Io.Writer, text: []const u8, count: u16) !void {
+/// Write `count` copies of a box-drawing character.
+fn appendRepeated(
+    buffer: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    text: []const u8,
+    count: u16,
+) !void {
     var written: u16 = 0;
-    while (written < count) : (written += 1) try writer.writeAll(text);
+    while (written < count) : (written += 1) try buffer.appendSlice(gpa, text);
 }
 
 /// The size a pane's terminal should have for a given rectangle, or null when it cannot have one.
@@ -1397,6 +1391,24 @@ fn resizeTarget(rect: protocol.Rect) ?protocol.Rect {
     const interior = rect.interior();
     if (interior.width == 0 or interior.height == 0) return null;
     return interior;
+}
+
+/// The escape sequence that puts the cursor on one interior row and blanks exactly that row.
+///
+/// `ECH` with an explicit count, not `EL`. `EL` (`\x1b[K`) erases to the end of the whole screen
+/// line, and since the interior starts one column in from the pane's left edge, it reaches past the
+/// pane's right border and erases it. The frame then keeps its top and bottom edges and loses both
+/// sides — and only on rows whose content did not already fill the interior, which is what makes it
+/// look like the border is intermittently broken rather than absent.
+///
+/// Writing this by hand in the test would only check the test, so the sequence is built here and the
+/// test calls it.
+fn blankRow(buffer: []u8, rect: protocol.Rect, row_index: u16) ![]const u8 {
+    return std.fmt.bufPrint(
+        buffer,
+        "\x1b[{d};{d}H\x1b[{d}X",
+        .{ rect.y + row_index + 1, rect.x + 1, rect.width },
+    );
 }
 
 /// Hide the window's cursor.
@@ -1753,4 +1765,59 @@ test "the resize target is the interior, and absent when there is no room" {
     const narrow = resizeTarget(.{ .x = 0, .y = 0, .width = 2, .height = 10 }).?;
     try std.testing.expectEqual(@as(u16, 2), narrow.width);
     try std.testing.expectEqual(@as(u16, 10), narrow.height);
+}
+
+test "a content row cannot erase the border beside it" {
+    // Every content row is blanked before it is written. Blanking with `EL` (`\x1b[K`) erases to the
+    // end of the *screen* line, which reaches past the pane's right border and wipes it: the frame
+    // kept its top and bottom edges and lost both sides, and only on panes wider than the content
+    // actually filled, which is why it looked like the border was "partly" missing.
+    //
+    // The sequence used is `ECH` with an explicit count, so it stops at the interior's last column.
+    // This pins that down, because the two differ by one letter and the failure is visual.
+    var buffer: [48]u8 = undefined;
+    const interior = protocol.Rect{ .x = 1, .y = 1, .width = 18, .height = 8 };
+    const move = try blankRow(&buffer, interior, 0);
+    try std.testing.expectEqualStrings("\x1b[2;2H\x1b[18X", move);
+    // `EL`, which is the mistake this guards against, would be the same prefix with a bare K and
+    // no count, erasing to the end of the screen line instead of to the pane's edge.
+    try std.testing.expect(std.mem.indexOf(u8, move, "[K") == null);
+    try std.testing.expect(std.mem.endsWith(u8, move, "[18X"));
+
+    // The count is the interior's width, so the last cell it clears is one short of the pane's
+    // right border column: the border survives.
+    try std.testing.expectEqual(@as(u16, 20), interior.x + interior.width + 1);
+
+    // The row addressed is the interior's, not the pane's: the frame owns the first one.
+    const later = try blankRow(&buffer, interior, 3);
+    try std.testing.expectEqualStrings("\x1b[5;2H\x1b[18X", later);
+}
+
+test "the border is drawn at any width, however wide the terminal" {
+    // The edges were built in a fixed 512-byte scratch buffer, and a pane wide enough to overflow it
+    // lost its whole border silently: the function returned success without writing anything. At
+    // three bytes per box-drawing cell that is a pane of about 160 columns, which a maximised
+    // terminal on a wide monitor reaches. The frame buffer grows, so there is no such width.
+    const gpa = std.testing.allocator;
+    const wide = protocol.Rect{ .x = 0, .y = 0, .width = 400, .height = 3 };
+
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    try std.testing.expect(appendBorder(&line, gpa, wide));
+
+    // A horizontal edge of 398 cells, three bytes each, is far past the old limit.
+    try std.testing.expect(line.items.len > 1200);
+    // Both corners and both sides are present.
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{250c}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2510}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2514}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2518}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2502}") != null);
+
+    // A pane too small for a frame is left alone and reports success, rather than drawing a frame
+    // over the only cell the program has.
+    var tiny: std.ArrayList(u8) = .empty;
+    defer tiny.deinit(gpa);
+    try std.testing.expect(appendBorder(&tiny, gpa, .{ .x = 0, .y = 0, .width = 2, .height = 2 }));
+    try std.testing.expectEqual(@as(usize, 0), tiny.items.len);
 }
