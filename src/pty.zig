@@ -143,7 +143,16 @@ fn openMaster() Error!i32 {
     return fd;
 }
 
-/// Unlock the slave and open it by its `/dev/pts/N` path.
+/// Open the slave side of a pty by its `/dev/pts/N` path.
+///
+/// The slave is opened with `O_NOCTTY`, which matters more than it looks. If
+/// the calling process is a session leader with no controlling terminal — which
+/// the server is, because it calls `setsid` to outlive its parent — then opening
+/// a tty *without* `O_NOCTTY` silently makes that tty the caller's controlling
+/// terminal. The child's `TIOCSCTTY` then fails, because the terminal already
+/// belongs to another session, and the child exits without ever running the
+/// program. The parent only needs the descriptor so the child can inherit it on
+/// fds 0/1/2; the child claims the terminal itself.
 fn openSlave(master: i32) Error!i32 {
     // The slave starts locked; unlocking is what allows it to be opened.
     var unlock: c_int = 0;
@@ -156,12 +165,10 @@ fn openSlave(master: i32) Error!i32 {
     const path = std.fmt.bufPrintZ(&path_buffer, "/dev/pts/{d}", .{number}) catch
         return Error.SyscallFailed;
 
-    // The slave must NOT be opened with NOCTTY: the child opens it as its
-    // controlling terminal, which the kernel refuses for a NOCTTY descriptor.
     const fd = std.posix.openatZ(
         linux.AT.FDCWD,
         path,
-        .{ .ACCMODE = .RDWR },
+        .{ .ACCMODE = .RDWR, .NOCTTY = true },
         0,
     ) catch return Error.SyscallFailed;
     return fd;
@@ -291,4 +298,51 @@ test "spawn a child on the pty and read its output" {
     const status = pty.reap() orelse return error.TestChildNotReaped;
     try std.testing.expectEqual(@as(u8, 0), status.code);
     try std.testing.expect(!status.signaled);
+}
+
+test "a child runs when the parent is a session leader without a terminal" {
+    // This is the server's situation, and it is where the slave-open bug hid.
+    // After `setsid` the process has no controlling terminal, and opening the
+    // slave without `O_NOCTTY` silently adopts that pty as the caller's own
+    // terminal. The child's `TIOCSCTTY` then fails and it exits before exec, so
+    // the only symptom is a session that reports a pid and never runs anything.
+    //
+    // A forked child does the spawning, because `setsid` may only be called by a
+    // process that is not already a group leader, and the test runner is one.
+    const pid = linux.fork();
+    if (linux.errno(pid) != .SUCCESS) return error.ForkFailed;
+    const child: linux.pid_t = @intCast(@as(isize, @bitCast(pid)));
+
+    if (child == 0) {
+        // In the child: become a session leader with no controlling terminal.
+        if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit(10);
+
+        const argv = [_:null]?[*:0]const u8{ "/bin/echo", "ran anyway" };
+        const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+
+        var pty = Pty.spawn(&argv, envp, .{ .rows = 24, .cols = 80 }) catch {
+            linux.exit(11);
+        };
+        pty.setNonBlocking();
+
+        var collected: [256]u8 = undefined;
+        var attempts: usize = 0;
+        var len: usize = 0;
+        while (attempts < 10_000 and len == 0) : (attempts += 1) {
+            len = pty.read(&collected) catch |err| switch (err) {
+                Error.Closed => break,
+                else => linux.exit(12),
+            };
+            if (len == 0) sleepMillis(1);
+        }
+
+        // Exit 0 only if the program actually ran and spoke.
+        if (len == 0) linux.exit(13);
+        if (std.mem.indexOf(u8, collected[0..len], "ran anyway") == null) linux.exit(14);
+        linux.exit(0);
+    }
+
+    var status: u32 = 0;
+    if (linux.errno(linux.waitpid(child, &status, 0)) != .SUCCESS) return error.WaitFailed;
+    try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
 }

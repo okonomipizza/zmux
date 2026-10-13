@@ -17,20 +17,32 @@ and the TUI. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and
 
 ## Status
 
-Phases 0, 0.5 and 1 of the roadmap are complete. Escape sequence handling comes
-from libghostty-vt, the command line is parsed with
-[zig-clap](https://github.com/Hejsil/zig-clap), and a program can be run on a
-pty that zmux renders.
+Phases 0, 0.5, 1 and 3 of the roadmap are complete. Escape sequence handling
+comes from libghostty-vt, the command line is parsed with
+[zig-clap](https://github.com/Hejsil/zig-clap), and there is a server that owns
+the sessions.
 
 ```sh
-# Run a program on a new pty and render it here. With no program, starts $SHELL.
+# Start a session and attach to it. With no program, starts $SHELL.
 zmux run
 zmux run htop
-zmux run vi notes.txt
+
+# Start one without attaching.
+zmux run -d -n build -- make
+
+# See what is running.
+zmux ls
+# build: 80x24, 1 client(s), pid 4321, running
+
+zmux attach build   # ctrl-a detaches, leaving the program running
+zmux kill build
+zmux kill-all
 ```
 
-Ctrl-a detaches, leaving the program running; the child is terminated when zmux
-exits, since there is no server to hand it to yet.
+A session's pty and screen live in the server, so detaching costs the session
+nothing: the program keeps running while nothing is watching, and reattaching
+redraws the screen as it stands. A server is started on first use and keeps
+running until `kill-all`.
 
 `dump` parses escape sequences on stdin and prints the resulting screen, which
 is useful for inspecting what zmux makes of a byte stream:
@@ -39,16 +51,9 @@ is useful for inspecting what zmux makes of a byte stream:
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-The session commands are accepted but have no server behind them yet, so they
-report that and exit non-zero. The server and the TUI are phases 2 and 3.
-
-```sh
-zmux ls
-zmux attach <session>
-zmux detach
-zmux kill <session>
-zmux kill-all
-```
+Not yet built: panes and splits, floating panes, and the status line. `zmux
+detach` outside an attached client reports that, because the prefix key is how a
+client detaches. See [ROADMAP.md](ROADMAP.md).
 
 ## Development
 
@@ -105,7 +110,12 @@ src/main.zig        entry point and command line parsing
 src/vt.zig          the only module that knows libghostty-vt's C ABI
 src/pty.zig         pty allocation, child spawning, raw fd I/O
 src/terminal.zig    the local terminal: raw mode, and the screen renderer
-src/session.zig     the event loop tying pty, parser and renderer together
+src/session.zig     the single-pane event loop from phase 1
+src/socket.zig      unix sockets and length-prefixed message framing
+src/protocol.zig    the client/server message set and its encoding
+src/runtime.zig     where the socket lives, and starting a server on demand
+src/server.zig      the session registry and its epoll loop
+src/client.zig      attach, detach, and rendering what the server sends
 tools/drive.zig     test driver that plays keystrokes into a program
 flake.nix           dev shell, package, and formatter
 ARCHITECTURE.md     process model, data structures, and design decisions

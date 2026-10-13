@@ -155,7 +155,13 @@ Draw the screen and a minimal frame around it.
 
 Judgement: an editor is usable, with correct colors and a visible cursor.
 
-## Phase 3 — server, sessions and IPC
+Much of what this phase listed arrived early, in Phase 1: the alternate screen,
+raw mode with restoration, incremental repainting of the rows the library marks
+dirty, and the cursor at its reported position. What remains is the frame around
+the screen — a status line — and reacting to `SIGWINCH` while attached rather
+than only measuring the terminal at attach time.
+
+## Phase 3 — server, sessions and IPC (done)
 
 Split into server and client, and add the session commands.
 
@@ -168,6 +174,72 @@ Split into server and client, and add the session commands.
 
 Judgement: detach and reattach preserves a running program and its scrollback,
 and two clients can view one session at once.
+
+### What was built
+
+The server was built before the TUI, because the TUI's shape depends on what a
+client can ask for. That is why this phase is done and Phase 2 is not.
+
+The decision that shapes the phase is that a session's pty and its terminal live
+in the **server**. A client that disconnects therefore costs the session nothing:
+the program keeps running and its screen keeps being parsed, so a reconnecting
+client is simply shown the current screen. If the terminal lived in the client,
+detaching would mean killing the program or replaying every byte it had ever
+produced.
+
+The cost is that the server must render for clients that may be a different size
+than the session was created at. zmux keeps the session's terminal at the size the
+most recent resize asked for and forwards the pty's bytes to clients unchanged;
+each client parses those bytes with its own terminal. Several clients may watch
+one session and they share its size, which is the compromise tmux makes.
+
+Two smaller choices are worth recording. Client indices, not pointers, are what
+sessions store, because the client list reorders as clients come and go; the
+sweep that removes a dead client therefore has to rewrite the indices of the client
+that `swapRemove` moves into its slot, and getting that wrong sends one client's
+screen to another's terminal. And a reattaching client is sent the screen re-emitted
+as the VT sequences that would produce it, rather than a snapshot: the client
+already has a terminal, so this reuses the one rendering path instead of adding a
+second that has to track libghostty-vt.
+
+Verified: `zig build test` passes 46 tests. A detached session survives, `ls`
+reports it, `attach` from a separate process redraws the screen it accumulated
+while nothing was watching, `ctrl-a` detaches without ending it, and `kill`,
+`kill-all` and the empty and unknown-session cases behave. Checked with both a
+`zig build` and a `nix build` binary.
+
+`signalfd` is not used. The child is reaped with a non-blocking `waitpid` on each
+pass of the loop, which needs no signal plumbing and cannot miss a child, because
+the pty's readability already wakes the loop when the child dies.
+
+### Two bugs this phase found
+
+**Opening the pty slave without `O_NOCTTY` steals the caller's controlling
+terminal.** This is the one that cost the most time, because its only symptom was
+a session that reported a pid and never ran anything. The server calls `setsid` so
+that it outlives the shell that started it, which leaves it a session leader with
+no controlling terminal. In that state, opening `/dev/pts/N` *without* `O_NOCTTY`
+silently makes that pty the server's own controlling terminal, and the child's
+`TIOCSCTTY` then fails because the terminal belongs to another session — so the
+child exits before `exec` and no program ever runs. The parent only needs the
+descriptor for the child to inherit on fds 0/1/2, so it opens with `O_NOCTTY` and
+lets the child claim the terminal. There is a regression test that forks, calls
+`setsid`, and checks that a program still runs.
+
+**A clap positional is only valid until the iterator advances.** `Args.Iterator.next`
+returns a slice into the iterator's own buffer, which the next call reuses. clap
+stores that slice, so the name read out of a `clap.ResultEx` is valid only until
+some other argument is parsed. The symptom was an `attach` that reported "no such
+session" for a session `ls` plainly listed, because the name it sent had been
+overwritten by a stale argument. Names are copied into local storage before
+anything else touches the iterator.
+
+A second trap in the same area, which cost time while diagnosing rather than in
+the product: clap numbers positionals by declaration order across *all* parameters,
+so an option whose value name matches a positional's shifts the positional's slot.
+`attach` and `kill` now have their own parameter lists, and only `run` declares
+`--name`.
+
 
 ## Phase 4 — multiple panes
 
@@ -200,12 +272,22 @@ interruption to the program inside it.
 
 ## Open questions
 
-These are not yet decided. None of them block Phase 1.
+These are not yet decided. None of them block the remaining work.
 
 **Session persistence across a server restart.** libghostty-vt's headers
 describe a snapshot API, but the pinned build does not export those symbols, so
-serialising terminal state is not available today. Either sessions are simply
-lost on restart, or a future revision provides the API.
+serialising terminal state is not available today. Sessions are therefore lost
+when the server exits, and a client reports that the connection went away.
+
+**SIGWINCH while attached.** A client measures its terminal once, when it
+attaches. Resizing the terminal mid-session is not yet noticed, so the session
+keeps its old size until the client reattaches. Handling it means watching for
+the signal and sending a `resize` request.
+
+**Several clients of different sizes.** Attaching resizes the session to the
+newest client's terminal, so two clients of different sizes fight over it. The
+compromise is the one tmux makes; a better answer is to size to the smallest and
+letterbox the rest.
 
 **Copy mode.** Scrollback browsing, selection and search are natural for a
 multiplexer but are a phase of their own. `ghostty_terminal_scroll_viewport`
