@@ -1064,15 +1064,18 @@ pub const Client = struct {
                 // ended rather than still live.
                 self.exited = true;
                 if (self.local != null) {
-                    // Not fatal: the panes keep their final screens until the client is
-                    // told to leave. Saying so and staying attached is more useful than
-                    // tearing the screen down the moment the last program exits.
+                    // The session is gone, so there is nothing left to be attached to. This used to
+                    // stay attached and keep the last screen up, which was right while the server
+                    // kept a finished session; now that it discards one, staying would leave the
+                    // client showing a dead window whose only content is this message. Detaching
+                    // restores the terminal zmux was started from, with the status above it.
                     try self.err.print("\nzmux: session {s} exited with status {d}\n", .{
                         exited.name.slice(),
                         exited.status,
                     });
                     try self.err.flush();
                 }
+                self.finished = true;
             },
             .failure => |failure| {
                 try self.err.print("zmux: {s}\n", .{failure.message});
@@ -1820,4 +1823,42 @@ test "the border is drawn at any width, however wide the terminal" {
     defer tiny.deinit(gpa);
     try std.testing.expect(appendBorder(&tiny, gpa, .{ .x = 0, .y = 0, .width = 2, .height = 2 }));
     try std.testing.expectEqual(@as(usize, 0), tiny.items.len);
+}
+
+test "a finished session detaches the client rather than leaving the window up" {
+    // The server discards a session whose last pane exits, so a client that stays attached is
+    // attached to nothing: it keeps drawing a dead window whose only content is the exit message.
+    // Leaving the alternate screen is what takes the TUI down, and that happens when the client
+    // finishes.
+    //
+    // The event handler is exercised through the state it sets, because the printing and the screen
+    // restore need a real terminal. What matters is that `finished` ends the loop, which is what
+    // makes the client leave the alternate screen and restore the terminal it was started from.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // A client that has not been told anything keeps running.
+    try std.testing.expect(!client.finished);
+
+    // The exit event is what the loop watches, and no local terminal means nothing is printed, so
+    // the handler is safe to call here.
+    try client.handleEvent(.{ .exited = .{
+        .name = try protocol.Name.init("s"),
+        .status = 3,
+    } });
+    try std.testing.expect(client.finished);
+    try std.testing.expect(client.exited);
+    try std.testing.expectEqual(@as(u8, 3), client.exit_status);
 }

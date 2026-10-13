@@ -174,6 +174,23 @@ fn openSlave(master: i32) Error!i32 {
     return fd;
 }
 
+/// The pty's line settings are deliberately left exactly as the kernel creates them.
+///
+/// A new pty comes up in cooked mode: echo, line buffering, the signal characters, newline
+/// translation and software flow control. That is what a program behind a terminal emulator
+/// expects, and it is what tmux gives its panes; this was checked by reading a tmux pane's termios
+/// and by sending it ctrl-s, which stops the pane until ctrl-q exactly as it did here.
+///
+/// `IXON` in particular is not a bug to be fixed. ctrl-s is the flow-control stop character and
+/// ctrl-q resumes, which is a documented terminal feature: a user who finds ctrl-s in the way turns
+/// it off with `stty -ixon`, and that is their choice to make rather than the multiplexer's. Turning
+/// it off here made zmux behave unlike every other terminal, which is worse than the inconvenience
+/// it was meant to remove.
+///
+/// An earlier attempt cleared these flags in the name of raw mode and broke typing: echo and line
+/// buffering went away before the program could configure its own terminal, so characters did not
+/// appear until the program redrew itself, and Enter arrived as a bare carriage return. A program
+/// that wants a raw terminal enters its own raw mode, which fish and vim both do.
 fn setSize(fd: i32, size: Size) Error!void {
     const ws = std.posix.winsize{
         .row = size.rows,
@@ -365,4 +382,103 @@ test "a child runs when the parent is a session leader without a terminal" {
     var status: u32 = 0;
     if (linux.errno(linux.waitpid(child, &status, 0)) != .SUCCESS) return error.WaitFailed;
     try std.testing.expectEqual(@as(u8, 0), linux.W.EXITSTATUS(status));
+}
+
+test "a pane's pty is left as the kernel made it, like tmux" {
+    // zmux configures nothing here, and that is the decision, not an omission. The flags are
+    // asserted so that a later change has to argue with this test rather than quietly diverge from
+    // every other terminal.
+    //
+    // The value of the test is in what it stops: an earlier attempt cleared these in the name of
+    // raw mode. Echo and line buffering going away meant typed characters did not appear until the
+    // program redrew itself, and clearing ICRNL made Enter a bare carriage return. A program that
+    // wants a raw terminal enters its own raw mode, which fish and vim both do.
+    var pty = try Pty.spawn(
+        @ptrCast(&[_:null]?[*:0]const u8{"/bin/cat"}),
+        @ptrCast(&[_:null]?[*:0]const u8{"PATH=/bin:/usr/bin"}),
+        .{ .rows = 24, .cols = 80 },
+    );
+    defer pty.deinit();
+
+    // The flags are read back through the slave, which is the same terminal the program has.
+    // `TCGETS` is not exported by every port's ioctl table, but the std wrapper is.
+    const probe = try openSlave(pty.master);
+    defer _ = linux.close(probe);
+    const attrs = std.posix.tcgetattr(probe) catch return error.SkipZigTest;
+
+    // Cooked mode, exactly as a program behind a terminal expects it.
+    try std.testing.expect(attrs.lflag.ECHO);
+    try std.testing.expect(attrs.lflag.ICANON);
+    try std.testing.expect(attrs.lflag.ISIG);
+    try std.testing.expect(attrs.iflag.ICRNL);
+    try std.testing.expect(attrs.oflag.OPOST);
+
+    // Software flow control included. ctrl-s stopping a pane until ctrl-q is the documented
+    // behaviour of a terminal, and tmux's panes do it too; a user who dislikes it runs `stty -ixon`.
+    try std.testing.expect(attrs.iflag.IXON);
+
+    _ = linux.kill(pty.child, linux.SIG.KILL);
+    _ = pty.reap();
+}
+
+test "ctrl-s stops a pane and ctrl-q resumes it, as a terminal does" {
+    // This is the behaviour the report was about, and it is deliberately kept. ctrl-s is the
+    // flow-control stop character and ctrl-q resumes; a user who presses ctrl-s by mistake while
+    // reaching for ctrl-a sees the pane stop, and ctrl-q brings it back. That is what a terminal
+    // does, and it is what tmux does: its pane's termios has IXON set and ctrl-s stops it until
+    // ctrl-q, which was checked against a real tmux pane before deciding this.
+    //
+    // The program is `cat` rather than a shell on purpose, because a shell like fish turns `IXON`
+    // off for itself while setting up its prompt. `cat` does not touch its termios, so what this
+    // observes is the driver's own behaviour rather than a shell's opinion of it.
+    var pty = try Pty.spawn(
+        @ptrCast(&[_:null]?[*:0]const u8{"/bin/cat"}),
+        @ptrCast(&[_:null]?[*:0]const u8{"PATH=/bin:/usr/bin"}),
+        .{ .rows = 24, .cols = 80 },
+    );
+    defer pty.deinit();
+    pty.setNonBlocking();
+
+    sleepForTest(200);
+    var buffer: [4096]u8 = undefined;
+    _ = drainQuietly(&pty, &buffer);
+
+    // The stop character, then something that should be held back.
+    _ = pty.write("\x13") catch {};
+    sleepForTest(200);
+    _ = drainQuietly(&pty, &buffer);
+
+    _ = pty.write("HELD-BACK") catch {};
+    sleepForTest(400);
+    const while_stopped = drainQuietly(&pty, &buffer);
+    // Nothing comes back while the pty is stopped.
+    try std.testing.expect(std.mem.indexOf(u8, while_stopped, "HELD-BACK") == null);
+
+    // The start character, and what was waiting arrives.
+    _ = pty.write("\x11") catch {};
+    sleepForTest(400);
+    const after_resume = drainQuietly(&pty, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, after_resume, "HELD-BACK") != null);
+
+    _ = linux.kill(pty.child, linux.SIG.KILL);
+    _ = pty.reap();
+}
+
+/// Read whatever is waiting, discarding it, and return how much there was.
+fn drainQuietly(pty: *Pty, buffer: []u8) []const u8 {
+    var total: usize = 0;
+    while (total < buffer.len) {
+        const read = pty.read(buffer[total..]) catch break;
+        if (read == 0) break;
+        total += read;
+    }
+    return buffer[0..total];
+}
+
+fn sleepForTest(milliseconds: u64) void {
+    const request = linux.timespec{
+        .sec = @intCast(milliseconds / 1000),
+        .nsec = @intCast((milliseconds % 1000) * std.time.ns_per_ms),
+    };
+    _ = linux.nanosleep(&request, null);
 }

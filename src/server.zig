@@ -1311,9 +1311,9 @@ pub const Server = struct {
             const read = pane.pty.read(pane.read_buffer) catch |err| switch (err) {
                 pty_mod.Error.Closed => {
                     // The slave closed, so the child is gone even if the exit status has not been
-                    // collected yet. A pane whose child has exited keeps its screen, so this is not
-                    // the same as closing it.
-                    try self.paneEnded(session_index, pane_index, pane.status);
+                    // collected yet. This is the last thing done with this pane: ending it may also
+                    // end the session, which would leave `pane` and `session` dangling.
+                    self.paneEnded(session_index, pane_index, pane.status) catch {};
                     return;
                 },
                 else => return err,
@@ -1339,11 +1339,28 @@ pub const Server = struct {
     }
 
     fn reapChildren(self: *Server) void {
-        for (self.sessions.items, 0..) |*session, session_index| {
-            for (session.panes.items, 0..) |*pane, pane_index| {
-                if (pane.exited) continue;
-                const status = pane.pty.reap() orelse continue;
+        // Ending a pane can end the session it belongs to, and removing a session moves the last one
+        // into its slot. Both the session and the pane are addressed by index rather than held as
+        // pointers, and the bounds are re-checked after every reap, so that a freed session is never
+        // written through. Restarting the scan from the same index is what makes the swapped-in
+        // session get its turn.
+        var session_index: usize = 0;
+        while (session_index < self.sessions.items.len) : (session_index += 1) {
+            var pane_index: usize = 0;
+            while (pane_index < self.sessions.items[session_index].panes.items.len) {
+                if (self.sessions.items[session_index].panes.items[pane_index].exited) {
+                    pane_index += 1;
+                    continue;
+                }
+                const status = self.sessions.items[session_index].panes.items[pane_index].pty.reap() orelse {
+                    pane_index += 1;
+                    continue;
+                };
                 self.paneEnded(session_index, pane_index, exitCode(status)) catch {};
+                // The session may be gone, and with it every pane. The list length is the only thing
+                // that can be checked, so it is.
+                if (session_index >= self.sessions.items.len) break;
+                pane_index += 1;
             }
         }
     }
@@ -1376,21 +1393,15 @@ pub const Server = struct {
             return;
         }
 
-        // The only pane. Its screen is kept and it is marked finished, so that a client can say so
-        // rather than waiting for output that will never come.
+        // The only pane. Its program has finished, so the session has nothing left to run and is
+        // discarded: the window the user was working in goes away rather than being left as a dead
+        // rectangle that has to be closed by hand. The status is recorded first, because the exit
+        // event that `killSession` broadcasts carries the code the program actually returned.
         const pane = &session.panes.items[pane_index];
         pane.exited = true;
         pane.status = status;
 
-        // The pty stays open so that a client attaching later still sees the final
-        // screen, but its readability is no longer of interest.
-        self.unregister(pane.pty.master);
-
-        try self.sendLayout(session);
-        try self.broadcast(session, .{ .exited = .{
-            .name = session.name,
-            .status = status,
-        } });
+        try self.killSession(session_index);
     }
 
     /// Queue an event for one client.
@@ -2134,4 +2145,45 @@ test "closing a pane forgets it in the float list as well" {
     session.forgetPane(a);
     try std.testing.expect(session.focus_before_float == null);
     try std.testing.expectEqual(@as(usize, 0), session.floats.items.len);
+}
+
+test "the last pane's exit status is recorded before its session is discarded" {
+    // Exiting the only pane now discards the session, and the exit event that goes out with it
+    // carries `exitStatusOf`, which reads each pane's `exited` flag and `status`. Those have to be
+    // set *before* the session is torn down, and the session is torn down by removing the pane that
+    // holds them. Recording the status afterwards would report success for every session, whatever
+    // the program actually returned.
+    const gpa = std.testing.allocator;
+    var session = Session.init(gpa, try protocol.Name.init("s"));
+    defer {
+        session.panes.deinit(gpa);
+        session.floats.deinit(gpa);
+        session.watchers.deinit(gpa);
+        session.placements.deinit(gpa);
+        session.tree.deinit();
+    }
+
+    const id = session.tree.allocateId();
+    try session.tree.setRoot(id);
+    try session.panes.append(gpa, .{
+        .id = id,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+
+    // A session whose pane is still running has nothing to report.
+    try std.testing.expectEqual(@as(u8, 0), exitStatusOf(&session));
+    try std.testing.expect(!session.allExited());
+
+    // The status a pane records when its program finishes is what the session reports.
+    session.panes.items[0].exited = true;
+    session.panes.items[0].status = 42;
+    try std.testing.expectEqual(@as(u8, 42), exitStatusOf(&session));
+    try std.testing.expect(session.allExited());
+
+    // And it survives the pane being removed, which is the order `paneEnded` relies on: the value is
+    // read for the event before the session holding it is dropped.
+    const recorded = exitStatusOf(&session);
+    _ = session.panes.pop();
+    try std.testing.expectEqual(@as(u8, 42), recorded);
 }
