@@ -1,7 +1,6 @@
 const std = @import("std");
 const clap = @import("clap");
 const vt = @import("vt.zig");
-const session_mod = @import("session.zig");
 const terminal_mod = @import("terminal.zig");
 const protocol = @import("protocol.zig");
 const runtime = @import("runtime.zig");

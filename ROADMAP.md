@@ -98,6 +98,13 @@ name mean" below.
 Still no server and no socket in this phase: one process owns one pty and
 renders to its own terminal.
 
+That single-pane loop lived in `src/session.zig`, and it is gone. The server and
+the client replaced it, and once `main.zig` stopped reaching the file it was no
+longer compiled at all, so nothing noticed when it came to reference a type that
+had been deleted. Dead code that is not even type-checked is worse than dead
+code, because it still reads as live. The pty, parser and input paths it covered
+are exercised through `attach` instead.
+
 ### A bug this phase found
 
 The session originally passed its own address to the terminal for the reply

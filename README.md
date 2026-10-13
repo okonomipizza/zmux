@@ -156,7 +156,6 @@ src/vt.zig          the only module that knows libghostty-vt's C ABI
 src/pty.zig         pty allocation, child spawning, raw fd I/O
 src/terminal.zig    the local terminal: raw mode, the screen renderer, and the
                     status line
-src/session.zig     the single-pane event loop from phase 1
 src/layout.zig      the pane tree: splits, ratios, rectangle computation, and parking
 src/socket.zig      unix sockets and length-prefixed message framing
 src/protocol.zig    the client/server message set and its encoding

@@ -103,8 +103,18 @@ const Pane = struct {
     id: layout.PaneId,
     pty: pty_mod.Pty,
     terminal: vt.Terminal,
-    /// Bytes the terminal wants sent to the pty, from the write_pty callback.
-    reply: std.ArrayList(u8) = .empty,
+    /// Bytes waiting to be written to the pty, in the order they were produced.
+    ///
+    /// Everything the program receives passes through here: the terminal's replies and the
+    /// keystrokes routed to this pane. One queue rather than two, because the pty is a single
+    /// ordered byte stream. A keystroke and a cursor-position report are both just bytes to the
+    /// program, and a program that reads its own input interleaved with a reply it asked for will
+    /// misparse if they arrive in the wrong order.
+    ///
+    /// The queue backs up only when the pty is full, which is the program not reading its input.
+    /// Terminal replies are a few dozen bytes and are produced only in answer to a query, so the
+    /// queue is bounded by how many queries a program makes without reading.
+    to_program: std.ArrayList(u8) = .empty,
     /// The handle the terminal holds; heap-allocated and owned by this pane.
     ///
     /// It is a separate allocation rather than a field because `setWritePty` stores the
@@ -122,10 +132,16 @@ const Pane = struct {
     exited: bool = false,
     /// The exit status, once known.
     status: u8 = 0,
+    /// Whether epoll is currently watching this pty for writability.
+    ///
+    /// Tracked so that the interest is only changed when it needs to be. Level-triggered epoll
+    /// reports a writable descriptor on every wait, so leaving the interest set after the queue has
+    /// drained would spin the loop.
+    watched_for_write: bool = false,
 
     fn deinit(self: *Pane, gpa: std.mem.Allocator) void {
         gpa.destroy(self.route);
-        self.reply.deinit(gpa);
+        self.to_program.deinit(gpa);
         gpa.free(self.read_buffer);
         self.terminal.deinit();
         self.pty.deinit();
@@ -142,11 +158,28 @@ const Pane = struct {
         return .{ .rows = self.rect.height, .cols = self.rect.width };
     }
 
-    /// Forward whatever the pane's terminal wants written back to its program.
-    fn flushReply(self: *Pane) void {
-        if (self.reply.items.len == 0) return;
-        _ = self.pty.write(self.reply.items) catch {};
-        self.reply.clearRetainingCapacity();
+    /// Write as much of what the program is owed as the pty will take.
+    ///
+    /// Only the bytes that were actually accepted are dropped. A pty whose buffer is full returns
+    /// zero rather than failing, and a short write returns less than was offered; treating either
+    /// as success would throw away the rest.
+    ///
+    /// Losing an answer is not a cosmetic problem. A program that asks the terminal where the cursor
+    /// is blocks until the answer arrives, so a reply dropped here leaves that program waiting
+    /// forever. A keystroke dropped is a character the user typed and will never see. What is left
+    /// stays queued for the next pass, which the pty becoming writable provokes.
+    fn flushToProgram(self: *Pane) void {
+        while (self.to_program.items.len > 0) {
+            const written = self.pty.write(self.to_program.items) catch {
+                // A genuine failure, not a full buffer. Retrying would spin on a pty that is gone,
+                // so the queue is abandoned; the pane is about to end anyway.
+                self.to_program.clearRetainingCapacity();
+                return;
+            };
+            if (written == 0) return;
+
+            consumeFront(&self.to_program, written);
+        }
     }
 };
 
@@ -338,6 +371,21 @@ pub const Server = struct {
 
     fn unregister(self: *Server, fd: i32) void {
         _ = linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_DEL, fd, null);
+    }
+
+    /// Add or remove interest in writing to a pane's pty.
+    ///
+    /// A pane is normally watched for reading only. When the program is owed bytes that would not
+    /// fit, writing is watched as well, so that the buffer draining wakes the loop and the rest can
+    /// go out. Level-triggered epoll reports a writable fd on every wait, so the interest is dropped
+    /// as soon as the queue is empty; leaving it set would spin the loop.
+    fn setPtyWritable(self: *Server, pane: *Pane, wanted: bool) void {
+        if (pane.watched_for_write == wanted) return;
+        const events: u32 = if (wanted) linux.EPOLL.IN | linux.EPOLL.OUT else linux.EPOLL.IN;
+        var event = linux.epoll_event{ .events = events, .data = .{ .fd = pane.pty.master } };
+        if (linux.errno(linux.epoll_ctl(self.epfd, linux.EPOLL.CTL_MOD, pane.pty.master, &event)) != .SUCCESS)
+            return;
+        pane.watched_for_write = wanted;
     }
 
     /// Start a session and return its index.
@@ -551,14 +599,46 @@ pub const Server = struct {
                 } else if (self.paneByFd(fd)) |which| {
                     // The session may have been removed by an earlier event in this same
                     // batch, so the indices are re-checked rather than trusted.
-                    if (which.session < self.sessions.items.len) {
+                    if (which.session < self.sessions.items.len and
+                        which.pane < self.sessions.items[which.session].panes.items.len)
+                    {
+                        // A writable pty is the signal that a queue which could not fit has room
+                        // now. There is no need to know which of the two the wakeup was for:
+                        // flushing and reading are both safe on either, and the interest is
+                        // recomputed from the queue's length afterwards.
+                        self.sessions.items[which.session].panes.items[which.pane].flushToProgram();
                         try self.servicePane(which.session, which.pane);
+
+                        // `servicePane` may have ended the pane, which removes it and shifts the
+                        // list, so nothing from before it is trusted here.
+                        if (which.session < self.sessions.items.len and
+                            which.pane < self.sessions.items[which.session].panes.items.len)
+                        {
+                            const pane = &self.sessions.items[which.session].panes.items[which.pane];
+                            if (pane.pty.master == fd) {
+                                self.setPtyWritable(pane, pane.to_program.items.len > 0);
+                            }
+                        }
                     }
                 }
             }
 
             self.reapChildren();
             self.sweepClients();
+
+            // Every pane's queue is given a chance to drain once per pass, for the same reason the
+            // clients are flushed here: a queue that is only retried when its own pane produces
+            // more output is a queue that never drains for a program that is waiting rather than
+            // producing. A program blocked on a reply it has not been given sends nothing, so
+            // without this it would wait forever.
+            for (self.sessions.items) |*session| {
+                for (session.panes.items) |*pane| {
+                    if (pane.exited) continue;
+                    if (pane.to_program.items.len == 0) continue;
+                    pane.flushToProgram();
+                    self.setPtyWritable(pane, pane.to_program.items.len > 0);
+                }
+            }
 
             // Every client is flushed once per pass, after all the events have been handled. Replies
             // are queued from several places -- a client request, a pane's output, a pane ending -- and
@@ -729,7 +809,12 @@ pub const Server = struct {
                 const pane_index = session.findPane(input.pane) orelse return;
                 const pane = &session.panes.items[pane_index];
                 if (pane.exited) return;
-                _ = pane.pty.write(input.data) catch {};
+
+                // Queued rather than written straight out, so that it joins the same ordered
+                // stream as the terminal's replies. A pty whose buffer is full accepts nothing, and
+                // a keystroke dropped there is a character the user typed and never sees.
+                pane.to_program.appendSlice(self.gpa, input.data) catch return;
+                pane.flushToProgram();
             },
             .resize => |resize| {
                 const index = self.findSession(resize.name.slice()) orelse return;
@@ -1191,9 +1276,10 @@ pub const Server = struct {
 
             pane.terminal.write(pane.read_buffer[0..read]);
 
-            // Replies the parser produced go back to the program before any output is forwarded,
-            // because a program waiting on one is not producing more.
-            pane.flushReply();
+            // Anything the program is owed goes out before its output is forwarded, because a
+            // program waiting on a reply is not producing more. That includes keystrokes queued
+            // while the pty was full, which this is the natural moment to retry.
+            pane.flushToProgram();
 
             // The bytes are forwarded unchanged, tagged with the pane. The client has its own terminal
             // per pane and parses them itself, which is what lets the two sides disagree about the
@@ -1500,6 +1586,22 @@ fn exitStatusOf(session: *Session) u8 {
     return last;
 }
 
+/// Drop `count` bytes from the front of a queue, keeping the order of the rest.
+///
+/// The queue holds bytes owed to a program in the order they were produced, so a write that
+/// accepted less than was offered has to remove exactly what went out and leave the rest in place.
+/// Removing the wrong amount either resends bytes the program already consumed, which corrupts its
+/// input, or drops bytes it never saw.
+fn consumeFront(queue: *std.ArrayList(u8), count: usize) void {
+    std.debug.assert(count <= queue.items.len);
+    std.mem.copyForwards(
+        u8,
+        queue.items[0 .. queue.items.len - count],
+        queue.items[count..],
+    );
+    queue.shrinkRetainingCapacity(queue.items.len - count);
+}
+
 /// Whether a pane is currently floating.
 fn isFloating(session: *Session, id: layout.PaneId) bool {
     for (session.floats.items) |float| {
@@ -1602,7 +1704,7 @@ fn onWritePty(
     // to report it from a C callback. The missing reply surfaces as a stalled program
     // instead.
     const pane = &route.server.sessions.items[session_index].panes.items[pane_index];
-    pane.reply.appendSlice(route.server.gpa, data[0..len]) catch {};
+    pane.to_program.appendSlice(route.server.gpa, data[0..len]) catch {};
 }
 
 test "removing a client rewrites the indices of the one moved into its slot" {
@@ -1885,4 +1987,33 @@ test "TERM is matched by prefix, not by substring" {
     replaceUselessTerm(&entries);
     try std.testing.expectEqualStrings("COLORTERM=dumb", std.mem.span(entries.items[0].?));
     try std.testing.expectEqualStrings("TERM=xterm", std.mem.span(entries.items[1].?));
+}
+
+test "a partial write keeps the bytes the program has not seen" {
+    // The defect this guards against: clearing the whole queue after a write that
+    // accepted only part of it. The bytes that did not go out are never sent, so a
+    // program waiting on a reply blocks forever, and a keystroke the user typed is
+    // simply gone.
+    const gpa = std.testing.allocator;
+    var queue: std.ArrayList(u8) = .empty;
+    defer queue.deinit(gpa);
+
+    try queue.appendSlice(gpa, "abcdef");
+    consumeFront(&queue, 2);
+    // The first two bytes went out, so they are the ones dropped.
+    try std.testing.expectEqualStrings("cdef", queue.items);
+
+    // One byte at a time, which is what a nearly full pty gives back.
+    consumeFront(&queue, 1);
+    try std.testing.expectEqualStrings("def", queue.items);
+
+    // Everything written leaves an empty queue, not a corrupt one.
+    consumeFront(&queue, 3);
+    try std.testing.expectEqual(@as(usize, 0), queue.items.len);
+
+    // A write of zero bytes, which is how a full pty reports itself, must leave the
+    // queue untouched; the caller returns early on zero rather than consuming.
+    try queue.appendSlice(gpa, "xy");
+    consumeFront(&queue, 0);
+    try std.testing.expectEqualStrings("xy", queue.items);
 }
