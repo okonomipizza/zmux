@@ -43,8 +43,10 @@ pub const Terminal = struct {
     };
 
     pub fn init(options: Options) Error!Terminal {
-        std.debug.assert(options.cols > 0);
-        std.debug.assert(options.rows > 0);
+        // libghostty-vt requires at least one cell in each direction, and a
+        // zero-sized terminal is the kind of thing that only shows up much
+        // later as an empty screen, so reject it here.
+        if (options.cols == 0 or options.rows == 0) return Error.InvalidValue;
 
         var handle: c.GhosttyTerminal = null;
         try check(c.ghostty_terminal_new(null, &handle, options.cols, options.rows));
@@ -568,4 +570,227 @@ test "render state reports colors for a styled cell" {
     try std.testing.expectEqual(@as(u8, 255), red.r);
     try std.testing.expectEqual(@as(u8, 0), red.g);
     try std.testing.expectEqual(@as(u8, 0), red.b);
+}
+
+/// Encodes key events into the byte sequences a terminal program expects.
+///
+/// The encoding is not fixed: a program that enables the kitty keyboard
+/// protocol or DECCKM must receive different bytes for the same key. Rather
+/// than track those modes ourselves, `syncFromTerminal` copies the state out of
+/// the terminal that is already parsing the program's output.
+pub const KeyEncoder = struct {
+    handle: c.GhosttyKeyEncoder,
+    event: c.GhosttyKeyEvent,
+
+    pub fn init(terminal: Terminal) Error!KeyEncoder {
+        var handle: c.GhosttyKeyEncoder = null;
+        try check(c.ghostty_key_encoder_new(null, &handle));
+        errdefer c.ghostty_key_encoder_free(handle);
+
+        var event: c.GhosttyKeyEvent = null;
+        try check(c.ghostty_key_event_new(null, &event));
+        errdefer c.ghostty_key_event_free(event);
+
+        var encoder = KeyEncoder{ .handle = handle, .event = event };
+        encoder.syncFromTerminal(terminal);
+        return encoder;
+    }
+
+    pub fn deinit(self: *KeyEncoder) void {
+        c.ghostty_key_event_free(self.event);
+        c.ghostty_key_encoder_free(self.handle);
+        self.event = null;
+        self.handle = null;
+    }
+
+    /// Adopt the terminal's current keyboard-related modes.
+    ///
+    /// Call this after feeding the terminal any output that may have changed
+    /// them, or the encoding will lag behind the program's expectations.
+    pub fn syncFromTerminal(self: KeyEncoder, terminal: Terminal) void {
+        c.ghostty_key_encoder_setopt_from_terminal(self.handle, terminal.handle);
+    }
+
+    /// Encode a key press into `buffer`.
+    ///
+    /// Returns the slice of `buffer` holding the bytes to write to the pty, or
+    /// an empty slice when the key produces no output (for example a bare
+    /// modifier press).
+    pub fn encode(
+        self: KeyEncoder,
+        key: c.GhosttyKey,
+        mods: c.GhosttyMods,
+        action: c.GhosttyKeyAction,
+        utf8: ?[]const u8,
+        buffer: []u8,
+    ) Error![]const u8 {
+        c.ghostty_key_event_set_key(self.event, key);
+        c.ghostty_key_event_set_mods(self.event, mods);
+        c.ghostty_key_event_set_action(self.event, action);
+
+        if (utf8) |text| {
+            c.ghostty_key_event_set_utf8(self.event, text.ptr, text.len);
+        } else {
+            c.ghostty_key_event_set_utf8(self.event, null, 0);
+        }
+
+        var written: usize = 0;
+        try check(c.ghostty_key_encoder_encode(
+            self.handle,
+            self.event,
+            buffer.ptr,
+            buffer.len,
+            &written,
+        ));
+        return buffer[0..written];
+    }
+};
+
+/// Look up the key for an ASCII character, for the printable range.
+///
+/// libghostty-vt names keys for letters, digits and punctuation; anything
+/// outside that set is sent as text rather than as a key.
+///
+/// `GhosttyKey` is an unsigned integer rather than an enum, so letters and
+/// digits are reached by offsetting from the first of each run. The offsets
+/// hold because the header declares `A` through `Z` and `DIGIT_0` through
+/// `DIGIT_9` contiguously.
+pub fn keyForAscii(character: u8) ?c.GhosttyKey {
+    const Key = c.GhosttyKey;
+    return switch (character) {
+        'a'...'z' => @as(Key, @intCast(c.GHOSTTY_KEY_A)) + (character - 'a'),
+        'A'...'Z' => @as(Key, @intCast(c.GHOSTTY_KEY_A)) + (character - 'A'),
+        '0'...'9' => @as(Key, @intCast(c.GHOSTTY_KEY_DIGIT_0)) + (character - '0'),
+        ' ' => @intCast(c.GHOSTTY_KEY_SPACE),
+        '-' => @intCast(c.GHOSTTY_KEY_MINUS),
+        '.' => @intCast(c.GHOSTTY_KEY_PERIOD),
+        '\'' => @intCast(c.GHOSTTY_KEY_QUOTE),
+        ';' => @intCast(c.GHOSTTY_KEY_SEMICOLON),
+        '/' => @intCast(c.GHOSTTY_KEY_SLASH),
+        else => null,
+    };
+}
+
+test "key encoder sends a plain letter as itself" {
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    var encoder = try KeyEncoder.init(term);
+    defer encoder.deinit();
+
+    var buffer: [64]u8 = undefined;
+    const encoded = try encoder.encode(
+        c.GHOSTTY_KEY_A,
+        0,
+        c.GHOSTTY_KEY_ACTION_PRESS,
+        "a",
+        &buffer,
+    );
+    try std.testing.expectEqualStrings("a", encoded);
+}
+
+test "key encoder sends ctrl-c as the interrupt byte" {
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    var encoder = try KeyEncoder.init(term);
+    defer encoder.deinit();
+
+    var buffer: [64]u8 = undefined;
+    const encoded = try encoder.encode(
+        c.GHOSTTY_KEY_C,
+        c.GHOSTTY_MODS_CTRL,
+        c.GHOSTTY_KEY_ACTION_PRESS,
+        null,
+        &buffer,
+    );
+    try std.testing.expectEqualStrings("\x03", encoded);
+}
+
+test "key encoder follows the terminal into application cursor mode" {
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    var encoder = try KeyEncoder.init(term);
+    defer encoder.deinit();
+
+    var buffer: [64]u8 = undefined;
+
+    // In normal mode the up arrow is CSI A.
+    const normal = try encoder.encode(
+        c.GHOSTTY_KEY_ARROW_UP,
+        0,
+        c.GHOSTTY_KEY_ACTION_PRESS,
+        null,
+        &buffer,
+    );
+    try std.testing.expectEqualStrings("\x1b[A", normal);
+
+    // DECCKM (DEC private mode 1) switches the arrows to SS3 A. Syncing from
+    // the terminal is what picks this up, so it must change the result.
+    term.write("\x1b[?1h");
+    encoder.syncFromTerminal(term);
+
+    const application = try encoder.encode(
+        c.GHOSTTY_KEY_ARROW_UP,
+        0,
+        c.GHOSTTY_KEY_ACTION_PRESS,
+        null,
+        &buffer,
+    );
+    try std.testing.expectEqualStrings("\x1bOA", application);
+}
+
+test "keyForAscii maps letters, digits and punctuation" {
+    const Key = c.GhosttyKey;
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_A)), keyForAscii('a').?);
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_Z)), keyForAscii('z').?);
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_J)), keyForAscii('J').?);
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_DIGIT_0)), keyForAscii('0').?);
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_DIGIT_9)), keyForAscii('9').?);
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_SPACE)), keyForAscii(' ').?);
+    try std.testing.expectEqual(@as(Key, @intCast(c.GHOSTTY_KEY_SLASH)), keyForAscii('/').?);
+}
+
+test "write_pty keeps working when the owner is heap-allocated" {
+    // A session used to pass its own address to the terminal, then return
+    // itself by value. The copy left the terminal pointing at the stack slot,
+    // and the first program that sent a query corrupted memory. Heap
+    // allocation is what makes the address stable, so this checks that the
+    // callback still reaches its owner after many replies.
+    const Owner = struct {
+        context: WritePtyContext = undefined,
+        replies: usize = 0,
+
+        fn callback(
+            terminal: c.GhosttyTerminal,
+            userdata: ?*anyopaque,
+            data: [*c]const u8,
+            len: usize,
+        ) callconv(.c) void {
+            _ = terminal;
+            _ = data;
+            _ = len;
+            const ctx: *WritePtyContext = @ptrCast(@alignCast(userdata.?));
+            const self: *@This() = @ptrCast(@alignCast(ctx.owner));
+            self.replies += 1;
+        }
+    };
+
+    var term = try Terminal.init(.{ .cols = 80, .rows = 24 });
+    defer term.deinit();
+
+    const owner = try std.testing.allocator.create(Owner);
+    defer std.testing.allocator.destroy(owner);
+    owner.* = .{};
+    owner.context = .{ .owner = @ptrCast(owner) };
+
+    const callback: WritePtyFn = Owner.callback;
+    term.setWritePty(&owner.context, callback);
+
+    // Each cursor position report produces one reply. Sending many exercises
+    // the callback repeatedly, which is what a full-screen editor does.
+    for (0..64) |_| term.write("\x1b[6n");
+
+    try std.testing.expectEqual(@as(usize, 64), owner.replies);
 }

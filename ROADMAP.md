@@ -85,8 +85,28 @@ Judgement: `vim` starts and responds. An editor probes the terminal at startup
 and blocks without a cursor position report, so this single test exercises the
 pty, the parser, the reply path and the input encoder at once.
 
+This is done. `zmux run [program]` starts a program on a new pty and renders it
+to the terminal zmux was started from. Verified by driving `vim` through a pty:
+typing text, leaving insert mode, `:w` and `:q!` all work, and the file is
+written. `tools/drive.zig` is the harness that feeds those keystrokes on a
+schedule; build it with `zig build drive`.
+
 Still no server and no socket in this phase: one process owns one pty and
-renders to its own stdout.
+renders to its own terminal.
+
+### A bug this phase found
+
+The session originally passed its own address to the terminal for the reply
+callback, then returned itself by value. The copy left the terminal holding a
+pointer to the stack slot the copy came from, so the callback wrote through a
+stale address. Against a single cursor position query it appeared to work; `vim`
+issues them continuously and crashed almost immediately with
+`incorrect alignment`.
+
+The fix is to heap-allocate the session so its address is stable. The general
+lesson is worth keeping: a pointer handed across a C boundary must not point
+into a value that is later copied, and the failure only shows up under a caller
+that uses the callback repeatedly. There is a regression test for it.
 
 ### What Zig 0.16 changed underneath this phase
 

@@ -1,6 +1,8 @@
 const std = @import("std");
 const clap = @import("clap");
 const vt = @import("vt.zig");
+const session_mod = @import("session.zig");
+const terminal_mod = @import("terminal.zig");
 
 pub const version = "0.1.0";
 
@@ -15,6 +17,7 @@ const Command = enum {
     kill,
     kill_all,
     dump,
+    run,
 
     /// The name as typed on the command line.
     ///
@@ -67,6 +70,17 @@ const kill_params = clap.parseParamsComptime(
 
 const session_parsers = .{
     .SESSION = clap.parsers.string,
+};
+
+/// `run` takes the command to start, or uses `$SHELL` when given none.
+const run_params = clap.parseParamsComptime(
+    \\-h, --help  Display this help and exit.
+    \\<PROGRAM>...
+    \\
+);
+
+const run_parsers = .{
+    .PROGRAM = clap.parsers.string,
 };
 
 pub fn main(init: std.process.Init.Minimal) !void {
@@ -132,6 +146,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .kill => try runKill(gpa, err, &args_iter, &diag),
         .kill_all => try reportUnimplemented(err, .kill_all),
         .dump => try runDump(gpa, io, out),
+        .run => try runProgram(gpa, init.environ, err, &args_iter, &diag),
     }
 
     try out.flush();
@@ -148,8 +163,9 @@ fn printHelp(out: *std.Io.Writer) !void {
         \\  ls              List sessions
         \\  attach <name>   Attach to a session, opening the TUI
         \\  detach          Detach the current client from its session
-        \\  kill <name>     Terminate a session
+        \\  kill <session>  Terminate a session
         \\  kill-all        Terminate every session
+        \\  run [program]   Run a program on a new pty and render it here
         \\  dump            Parse VT data from stdin and print the resulting screen
         \\
         \\Options:
@@ -238,8 +254,101 @@ fn runKill(
     try reportUnimplemented(err, .kill);
 }
 
-fn runDump(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer) !void {
-    // Verification path: read VT bytes from stdin, parse them with
+/// Run one program on a fresh pty and render it to this terminal.
+///
+/// This is the Phase 1 path: no session registry, no socket, no panes. It
+/// exists to prove the pipeline end to end, which is why it draws to the
+/// terminal it was started from.
+fn runProgram(
+    gpa: std.mem.Allocator,
+    environ: std.process.Environ,
+    err: *std.Io.Writer,
+    args_iter: *std.process.Args.Iterator,
+    diag: *clap.Diagnostic,
+) !void {
+    var result = clap.parseEx(clap.Help, &run_params, run_parsers, args_iter, .{
+        .diagnostic = diag,
+        .allocator = gpa,
+    }) catch |parse_error| {
+        try diag.report(err, parse_error);
+        try err.flush();
+        std.process.exit(2);
+    };
+    defer result.deinit();
+
+    // With no program given, start the user's shell. With one, argv[0] is that
+    // program and the remaining positionals are its arguments.
+    const shell = environ.getPosix("SHELL") orelse "/bin/sh";
+    const given = result.positionals[0];
+
+    // `execve` takes null-terminated C strings, so every argument is copied
+    // into its own buffer. These must outlive the call to `Session.start`,
+    // which is why they are declared here rather than inside the loop.
+    const max_arguments = 64;
+
+    var argument_buffers: [max_arguments][std.fs.max_path_bytes]u8 = undefined;
+    var argv: [max_arguments]?[*:0]const u8 = undefined;
+    var argument_count: usize = 0;
+
+    if (given.len == 0) {
+        // No program: run the shell with no arguments.
+        argv[argument_count] = (try std.fmt.bufPrintZ(
+            &argument_buffers[argument_count],
+            "{s}",
+            .{shell},
+        )).ptr;
+        argument_count += 1;
+    } else {
+        for (given) |argument| {
+            if (argument_count >= max_arguments - 1) break;
+            argv[argument_count] = (try std.fmt.bufPrintZ(
+                &argument_buffers[argument_count],
+                "{s}",
+                .{argument},
+            )).ptr;
+            argument_count += 1;
+        }
+    }
+    argv[argument_count] = null;
+
+    // Inherit the environment unchanged, including the terminfo and locale
+    // variables the program will need.
+    const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
+
+    var session = session_mod.Session.start(
+        gpa,
+        @ptrCast(&argv),
+        envp,
+    ) catch |start_error| switch (start_error) {
+        // Drawing requires a terminal on stdin. Say so rather than leaving the
+        // user with a bare error name.
+        error.NotATerminal => {
+            try err.writeAll("zmux: run needs a terminal on stdin\n");
+            try err.flush();
+            std.process.exit(1);
+        },
+        else => return start_error,
+    };
+    defer session.deinit();
+
+    session.run() catch |run_error| switch (run_error) {
+        // The child exited, which is the normal way this ends.
+        session_mod.Error.ChildExited => {},
+        else => return run_error,
+    };
+
+    // Report how the program finished, once the screen is restored.
+    if (session.pty.reap()) |status| {
+        if (status.signaled) {
+            try err.print("zmux: terminated by signal {d}\n", .{status.signal});
+        } else if (status.code != 0) {
+            try err.print("zmux: exited with status {d}\n", .{status.code});
+        }
+    }
+    try err.flush();
+}
+
+fn runDump(gpa: std.mem.Allocator, io: std.Io, out: *std.Io.Writer) !void { // Verification path: read VT bytes from stdin, parse them with
     // libghostty-vt, and print the resulting screen as text.
     var stdin_buffer: [64 * 1024]u8 = undefined;
     var stdin_reader = std.Io.File.stdin().reader(io, &stdin_buffer);

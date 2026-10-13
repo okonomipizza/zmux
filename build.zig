@@ -47,6 +47,26 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // A test driver that runs a program on a pty and feeds it keystrokes, so
+    // an interactive program can be exercised without a human at the keyboard.
+    // Not installed; it exists for manual verification.
+    const drive = b.addExecutable(.{
+        .name = "drive",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/drive.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    drive.root_module.addImport("pty", b.createModule(.{
+        .root_source_file = b.path("src/pty.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+
+    const drive_step = b.step("drive", "Build the interactive test driver");
+    drive_step.dependOn(&b.addInstallArtifact(drive, .{}).step);
+
     // Zig's cache must not reuse translated headers built against a different
     // libghostty-vt revision, so the include directory is part of the config.
     const docs = b.addInstallFileWithDir(
