@@ -1,5 +1,4 @@
-//! Measures what a keystroke costs, by running zmux on a pty and counting the
-//! bytes it writes back.
+//! Measures what a keystroke costs, and checks that the cursor appears.
 //!
 //! A client repaints after every keystroke, so the bytes it writes are what a
 //! user perceives as flicker: repainting every cell of every pane is a lot of
@@ -83,12 +82,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Let the client start and the shell print its prompt.
     sleepMillis(settle_ms);
-    drain(&pty, &buffer, &collected, gpa);
+    collect(&pty, &buffer, &collected, gpa);
+
+    // The cursor is hidden when the session starts and only the client can show
+    // it again, so a prompt with no visible cursor means the user is typing blind.
+    // Reported before the timing runs disturb the screen.
+    const cursor = findCursor(collected.items);
+    std.debug.print("cursor at the prompt     : {s}\n", .{
+        if (cursor.shown) "shown" else "NOT SHOWN",
+    });
+    if (cursor.shown) {
+        std.debug.print("cursor position          : row {d}, column {d}\n", .{
+            cursor.row, cursor.column,
+        });
+    }
 
     // An idle period. Output here is repainting that nothing asked for.
     collected.clearRetainingCapacity();
     sleepMillis(idle_ms);
-    drain(&pty, &buffer, &collected, gpa);
+    collect(&pty, &buffer, &collected, gpa);
     const idle_bytes = collected.items.len;
 
     const keys = "abcdefghijklmnop";
@@ -104,7 +116,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = pty.write("\x01f") catch {};
     sleepMillis(1000);
     collected.clearRetainingCapacity();
-    drain(&pty, &buffer, &collected, gpa);
+    collect(&pty, &buffer, &collected, gpa);
+    const floated_cursor = findCursor(collected.items);
 
     var floated: [keys.len]usize = undefined;
     for (keys, 0..) |key, index| {
@@ -114,7 +127,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Leave cleanly, so no server is left behind for the next run.
     _ = pty.write("\x01q") catch {};
     sleepMillis(600);
-    drain(&pty, &buffer, &collected, gpa);
+    collect(&pty, &buffer, &collected, gpa);
     if (pty.reap()) |status| {
         if (!status.signaled and status.code != 0) {
             std.debug.print("[drive] client exited with code {d}\n", .{status.code});
@@ -125,11 +138,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     report("tiled", &tiled);
     report("floated", &floated);
 
-    // A keystroke should cost about one row, and an idle frame nothing. These
-    // are the properties a regression would break, so they are stated as a
-    // verdict rather than left for the reader to eyeball.
+    // The properties a regression would break, stated as a verdict rather than
+    // left for the reader to eyeball.
     const tiled_mean = mean(&tiled);
-    if (idle_bytes > 64) {
+    if (!cursor.shown) {
+        std.debug.print("verdict: FAIL, the cursor was never shown\n", .{});
+    } else if (!floated_cursor.shown) {
+        std.debug.print("verdict: FAIL, the cursor vanished when the pane floated\n", .{});
+    } else if (idle_bytes > 64) {
         std.debug.print("verdict: FAIL, an idle frame wrote {d} bytes\n", .{idle_bytes});
     } else if (tiled_mean > 2_000) {
         std.debug.print(
@@ -139,6 +155,66 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else {
         std.debug.print("verdict: OK\n", .{});
     }
+}
+
+/// Where the last cursor placement in the output put the cursor.
+const Cursor = struct {
+    shown: bool = false,
+    /// One-based, as the terminal addresses them.
+    row: usize = 0,
+    column: usize = 0,
+};
+
+/// Find the last cursor placement, and whether the cursor was left visible.
+///
+/// The client writes `ESC[<row>;<col>H` followed by `ESC[?25h` when it wants the
+/// cursor seen, and a bare `ESC[?25l` when it does not. The last of the two wins,
+/// because that is what the terminal would end up displaying.
+fn findCursor(bytes: []const u8) Cursor {
+    var cursor = Cursor{};
+    var index: usize = 0;
+    while (index + 1 < bytes.len) : (index += 1) {
+        if (bytes[index] != 0x1b or bytes[index + 1] != '[') continue;
+
+        if (startsWith(bytes[index..], "\x1b[?25h")) {
+            cursor.shown = true;
+            continue;
+        }
+        if (startsWith(bytes[index..], "\x1b[?25l")) {
+            cursor.shown = false;
+            continue;
+        }
+
+        // A cursor move: ESC [ digits ; digits H. Anything else in this shape,
+        // such as the erase-to-end-of-line sequence, fails the parse and is left
+        // alone.
+        var scan = index + 2;
+        var row: usize = 0;
+        while (scan < bytes.len and bytes[scan] >= '0' and bytes[scan] <= '9') : (scan += 1) {
+            row = row * 10 + (bytes[scan] - '0');
+        }
+        if (scan >= bytes.len or bytes[scan] != ';') continue;
+        scan += 1;
+        var column: usize = 0;
+        while (scan < bytes.len and bytes[scan] >= '0' and bytes[scan] <= '9') : (scan += 1) {
+            column = column * 10 + (bytes[scan] - '0');
+        }
+        if (scan >= bytes.len or bytes[scan] != 'H') continue;
+        // Only a move that is immediately followed by a show is the cursor's own
+        // placement; every row of every pane moves the cursor too.
+        if (!startsWith(bytes[scan + 1 ..], "\x1b[?25h")) continue;
+
+        cursor.row = row;
+        cursor.column = column;
+        cursor.shown = true;
+        index = scan;
+    }
+    return cursor;
+}
+
+fn startsWith(bytes: []const u8, prefix: []const u8) bool {
+    if (bytes.len < prefix.len) return false;
+    return std.mem.eql(u8, bytes[0..prefix.len], prefix);
 }
 
 /// Send one key and return how many bytes came back.
@@ -152,7 +228,7 @@ fn keystroke(
     _ = pty.write(&.{key}) catch return 0;
     collected.clearRetainingCapacity();
     sleepMillis(per_key_ms);
-    drain(pty, buffer, collected, gpa);
+    collect(pty, buffer, collected, gpa);
     return collected.items.len;
 }
 
@@ -170,7 +246,7 @@ fn report(label: []const u8, counts: []const usize) void {
     std.debug.print("{s:<24} : mean {d} bytes per keystroke\n", .{ label, mean(counts) });
 }
 
-fn drain(
+fn collect(
     pty: *pty_mod.Pty,
     buffer: []u8,
     collected: *std.ArrayList(u8),

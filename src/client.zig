@@ -464,6 +464,49 @@ pub const Client = struct {
             const text = self.statusText(&text_buffer);
             status.render(self.gpa, local, window.rows - 1, text, window.cols) catch {};
         }
+
+        // The cursor goes last, because every other write moves it. `Terminal.enter` hides the
+        // cursor for the duration of the session so that painting a frame does not leave it
+        // flickering around the screen, so unless this puts it back the user is typing blind.
+        self.drawCursor(local);
+    }
+
+    /// Place the terminal's cursor where the focused pane's program wants it, and show it.
+    ///
+    /// One cursor is shared by the whole window, so only the focused pane gets one: a cursor in
+    /// every pane would be drawing something no program asked for and no user could act on. A
+    /// pane that is not focused, has nothing on screen, or has a program that hid its own cursor
+    /// leaves the window's cursor hidden, which is the state the session starts in.
+    ///
+    /// The position is in the pane's own coordinates, so the pane's origin is added to reach
+    /// window coordinates. A program that scrolled its cursor out of view reports no position at
+    /// all, which is why the position is optional rather than assumed to be in range.
+    fn drawCursor(self: *Client, local: terminal_mod.Terminal) void {
+        const pane = self.focusedPane() orelse return hideCursor(local);
+        // A float takes the focus when one is raised, and the server says which; the tiled focus
+        // is not what the user is typing into while a float is up.
+        if (!pane.render.cursorVisible()) return hideCursor(local);
+        const position = pane.render.cursorPosition() orelse return hideCursor(local);
+
+        var buffer: [32]u8 = undefined;
+        const move = std.fmt.bufPrint(
+            &buffer,
+            "\x1b[{d};{d}H\x1b[?25h",
+            .{ pane.rect.y + position.y + 1, pane.rect.x + position.x + 1 },
+        ) catch return hideCursor(local);
+        local.writeAll(move) catch {};
+    }
+
+    /// The pane the user's keystrokes go to, which is the one that should show a cursor.
+    ///
+    /// Mirrors the choice `sendInput` makes, so that the cursor is drawn in the pane that is
+    /// actually receiving what the user types.
+    fn focusedPane(self: *Client) ?*RemotePane {
+        if (self.focused_float != 0) {
+            if (self.findPane(self.focused_float)) |pane| return pane;
+        }
+        if (self.focused == 0) return null;
+        return self.findPane(self.focused);
     }
 
     /// Mark the panes whose visibility changed since the last frame.
@@ -572,6 +615,11 @@ pub const Client = struct {
             /// Whether any row was actually written, so that an empty frame does not cost a
             /// write syscall.
             wrote: bool = false,
+            /// Set when a row could not be built and the walk was abandoned.
+            ///
+            /// Returning `false` from the visitor stops the walk without an error, so this is
+            /// the only way to tell a complete frame from one that stopped in the middle.
+            failed: bool = false,
             /// The style the terminal is currently in, which decides when the next cell has to
             /// write a new escape. Reset at the start of every row, because each row is written
             /// after a cursor move and the terminal keeps whatever the last cell of the previous
@@ -593,6 +641,11 @@ pub const Client = struct {
                 if (!needs_paint) return true;
 
                 painter.wrote = true;
+                // From here the row is committed to: the cursor move and the glyphs have to go
+                // out together or the screen is left describing a row that was never written.
+                // Each failure below abandons the frame rather than continuing with a partial
+                // rectangle, and says so through `failed`.
+                //
                 // Move to this row's first column inside the pane's rectangle, erase the
                 // row, and write the cells. Erasing matters because a row that got shorter
                 // would otherwise keep the tail of the previous frame.
@@ -601,20 +654,32 @@ pub const Client = struct {
                     &buffer,
                     "\x1b[{d};{d}H\x1b[K",
                     .{ painter.rect.y + painter.row_index.* + 1, painter.rect.x + 1 },
-                ) catch return false;
-                painter.pane.line.appendSlice(painter.gpa, move) catch return false;
+                ) catch {
+                    painter.failed = true;
+                    return false;
+                };
+                painter.pane.line.appendSlice(painter.gpa, move) catch {
+                    painter.failed = true;
+                    return false;
+                };
 
                 // Both are per row: the terminal's style after this row's cursor move is whatever
                 // the previous row's last cell left it in, so the first cell of this row has to
                 // consider itself unstyled until it says otherwise.
                 painter.current_style = .{};
                 painter.columns_written = 0;
-                _ = row.forEachCell(painter, collect) catch return false;
+                _ = row.forEachCell(painter, collect) catch {
+                    painter.failed = true;
+                    return false;
+                };
 
                 // The row ends with a reset, so that a colour cannot bleed into the cursor move
                 // that follows or into the pane next to this one. It goes into the frame buffer
                 // rather than to the terminal, so that the whole frame is one write.
-                painter.pane.line.appendSlice(painter.gpa, "\x1b[0m") catch return false;
+                painter.pane.line.appendSlice(painter.gpa, "\x1b[0m") catch {
+                    painter.failed = true;
+                    return false;
+                };
 
                 return true;
             }
@@ -633,18 +698,26 @@ pub const Client = struct {
                         &painter.pane.line,
                         painter.gpa,
                         style,
-                    ) catch {};
+                    ) catch {
+                        // A dropped escape would colour the rest of the row wrongly, which is
+                        // harder to notice than a missing glyph, so the row is abandoned.
+                        painter.failed = true;
+                        return;
+                    };
                     painter.current_style = style;
                 }
 
                 var codepoints: [8]u32 = undefined;
                 var utf8: [32]u8 = undefined;
                 const bytes = cell.graphemesUtf8(&codepoints, &utf8);
-                if (bytes.len == 0) {
-                    painter.pane.line.append(painter.gpa, ' ') catch {};
-                    return;
-                }
-                painter.pane.line.appendSlice(painter.gpa, bytes) catch {};
+                // A cell with no graphemes is a blank one, which the grid still has to be told
+                // about: skipping it would shift every cell after it one column to the left.
+                const text: []const u8 = if (bytes.len == 0) " " else bytes;
+                painter.pane.line.appendSlice(painter.gpa, text) catch {
+                    // A dropped glyph leaves a hole in the row that nothing would ever repair,
+                    // because the row is marked clean once the frame is out.
+                    painter.failed = true;
+                };
             }
         };
 
@@ -655,17 +728,34 @@ pub const Client = struct {
             .gpa = self.gpa,
             .repaint_all = repaint_all,
         };
-        pane.render.forEachRow(&painter, Painter.visit) catch {};
+        // `forEachRow` reports a failure of the walk itself; the visitor reports a row it could
+        // not build through `failed`, because stopping the walk with `false` is not an error. Both
+        // mean the same thing to the frame, so both set the same flag.
+        pane.render.forEachRow(&painter, Painter.visit) catch {
+            painter.failed = true;
+        };
 
-        // The frame goes out in one write, and only when a row was actually painted. Writing an
-        // empty frame would cost a syscall per pane per frame for a screen that did not change,
-        // which is most of them while a program is idle.
-        if (painter.wrote) local.writeAll(pane.line.items) catch {};
+        // The frame is written only if it is whole. Anything else and the pane is marked stale and
+        // left dirty, so that the next frame paints all of it. Writing a partial frame would leave
+        // the rows it did not reach showing the previous one, with their flags cleared and nothing
+        // left to ask for them again.
+        const outcome = commitFrame(&painter);
+        if (outcome == .incomplete) {
+            pane.stale = true;
+            return;
+        }
+        if (outcome == .nothing) return;
 
-        // The global flag is cleared only once the frame is out. Clearing it before the write
-        // would lose the frame if the write failed, leaving the pane showing stale cells that
-        // nothing would ask to be repainted again.
-        pane.render.clearDirty();
+        if (local.writeAll(pane.line.items)) |_| {
+            // The flags are cleared only once the frame is out and whole.
+            pane.render.clearDirty();
+        } else |_| {
+            // The frame did not reach the terminal, so the rows it described are still showing the
+            // previous one, and there is no way to say how much of it got out. Clearing the flags
+            // here would leave those rows out of date forever. Repainting the whole rectangle next
+            // frame also covers the rows a partial write did manage to place.
+            pane.stale = true;
+        }
     }
 
     /// Whether a float is currently over this pane, so that painting it would be wasted work.
@@ -885,12 +975,15 @@ pub const Client = struct {
         if (data.len == 0) return;
         if (self.watching.len == 0) return;
 
-        const target = if (self.focused_float != 0) self.focused_float else self.focused;
-        if (target == 0) return;
+        // The same choice `drawCursor` makes, so that the cursor is drawn in the pane this
+        // reaches. Going through the pane rather than the identifier means a pane the client has
+        // not been told about yet simply receives nothing, which is what the server would do with
+        // its bytes anyway.
+        const target = self.focusedPane() orelse return;
 
         try self.sendRequest(.{ .input = .{
             .name = self.watching,
-            .pane = target,
+            .pane = target.id,
             .data = data,
         } });
     }
@@ -1174,6 +1267,38 @@ fn register(epfd: i32, fd: i32, events: u32) !void {
         return Error.SyscallFailed;
 }
 
+/// What should happen to a frame the painter has just built.
+///
+/// Three outcomes, and the difference between the first two is the whole point: a frame that was
+/// never completed must not be written, and must not have its dirty flags cleared either, because
+/// those flags are the only record of work still owed. A frame with nothing in it is complete and
+/// simply has no work to do, which is the common case for an idle program.
+const FrameOutcome = enum {
+    /// Every row that needed painting was built. Write it and clear the flags.
+    complete,
+    /// Nothing needed painting. There is nothing to write, and the flags are already clear.
+    nothing,
+    /// A row could not be built. The buffer holds a prefix of the frame, which must not be
+    /// written: the rows it does not reach would keep the previous frame's cells with their
+    /// flags cleared, and nothing would ever repaint them.
+    incomplete,
+};
+
+/// Decide what to do with a painted frame.
+fn commitFrame(painter: anytype) FrameOutcome {
+    if (painter.failed) return .incomplete;
+    if (!painter.wrote) return .nothing;
+    return .complete;
+}
+
+/// Hide the window's cursor.
+///
+/// `Terminal.enter` hides it for the session and every frame has to say what it wants, so this is
+/// the answer whenever there is no position to show one at.
+fn hideCursor(local: terminal_mod.Terminal) void {
+    local.writeAll("\x1b[?25l") catch {};
+}
+
 /// Whether two rectangles share at least one cell.
 ///
 /// Rectangles with no area share nothing, which matters because a pane that has not been given a
@@ -1374,4 +1499,123 @@ test "a pane is covered only by an overlapping float" {
         tiled,
         protocol.Rect{ .x = 0, .y = 0, .width = 0, .height = 0 },
     ));
+}
+
+test "the cursor is placed inside the focused pane" {
+    // The window's cursor is hidden when the session starts, so that painting a
+    // frame does not leave it flickering around the screen. Nothing puts it back
+    // unless the client does, and a cursor that is shown in the wrong pane is
+    // worse than none: it points at a place the user's typing does not go.
+    //
+    // The arithmetic is the part worth pinning down. A pane's terminal reports the
+    // cursor in its own coordinates, with its own origin at zero, while the window
+    // is addressed from one. Adding the pane's origin and one is the whole
+    // translation, and it is easy to be off by a row or a column.
+    const pane = protocol.Rect{ .x = 10, .y = 5, .width = 20, .height = 10 };
+    const position = .{ .x = 3, .y = 2 };
+
+    var buffer: [32]u8 = undefined;
+    const move = try std.fmt.bufPrint(
+        &buffer,
+        "\x1b[{d};{d}H\x1b[?25h",
+        .{ pane.y + position.y + 1, pane.x + position.x + 1 },
+    );
+    // Row 5 + 2 + 1 = 8, column 10 + 3 + 1 = 14.
+    try std.testing.expectEqualStrings("\x1b[8;14H\x1b[?25h", move);
+
+    // The origin of a pane at the top left is row 1, column 1, not row 0.
+    const origin = protocol.Rect{ .x = 0, .y = 0, .width = 20, .height = 10 };
+    const at_origin = try std.fmt.bufPrint(
+        &buffer,
+        "\x1b[{d};{d}H\x1b[?25h",
+        .{ origin.y + 0 + 1, origin.x + 0 + 1 },
+    );
+    try std.testing.expectEqualStrings("\x1b[1;1H\x1b[?25h", at_origin);
+}
+
+test "the cursor follows the float when one is raised" {
+    // `sendInput` and `drawCursor` both go through `focusedPane`, so the cursor
+    // cannot sit in a pane other than the one being typed into. What this pins
+    // down is the choice itself: a raised float wins over the tiled focus, because
+    // it is drawn on top and is what the user is looking at, and the tiled focus is
+    // used only when no float is raised.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // No panes at all, so nothing to point at.
+    try std.testing.expectEqual(@as(?*RemotePane, null), client.focusedPane());
+
+    // A tiled pane and a float, with both focuses set to different panes.
+    for ([_]struct { id: u64, floating: bool }{
+        .{ .id = 100, .floating = false },
+        .{ .id = 200, .floating = true },
+    }) |entry| {
+        var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
+        errdefer terminal.deinit();
+        var render = try terminal.createRenderState();
+        errdefer render.deinit();
+        const route = try gpa.create(PaneRoute);
+        route.* = .{ .client = &client, .pane = entry.id };
+        try client.panes.append(gpa, .{
+            .id = entry.id,
+            .terminal = terminal,
+            .render = render,
+            .floating = entry.floating,
+            .route = route,
+        });
+    }
+
+    client.focused = 100;
+    // With no float raised, the tiled focus is the target.
+    try std.testing.expectEqual(@as(?u64, 100), client.focusedPane().?.id);
+
+    // A raised float takes it, even though the tiled focus is unchanged.
+    client.focused_float = 200;
+    try std.testing.expectEqual(@as(?u64, 200), client.focusedPane().?.id);
+
+    // Hiding the floats clears the raised one, which returns the focus to the tile.
+    client.focused_float = 0;
+    try std.testing.expectEqual(@as(?u64, 100), client.focusedPane().?.id);
+
+    // A raised float the client has not been told about falls back rather than
+    // failing: the layout event that creates it is still in flight.
+    client.focused_float = 999;
+    try std.testing.expectEqual(@as(?u64, 100), client.focusedPane().?.id);
+}
+
+test "an incomplete frame is neither written nor marked clean" {
+    // The trap this guards against: clearing the dirty flags after a frame that was
+    // never completed. The rows the frame did not reach keep the previous frame's
+    // cells, and with their flags cleared nothing ever asks for them again, so the
+    // pane shows a half-updated screen until the program happens to overwrite it.
+    //
+    // A frame that stopped early has to be told apart from one that simply had
+    // nothing to do, which is why there are three outcomes rather than a bool.
+    const Case = struct { failed: bool, wrote: bool, expected: FrameOutcome };
+    for ([_]Case{
+        // A row failed to build, whatever else happened. Not writable.
+        .{ .failed = true, .wrote = true, .expected = .incomplete },
+        .{ .failed = true, .wrote = false, .expected = .incomplete },
+        // Nothing failed and something was painted: the ordinary keystroke.
+        .{ .failed = false, .wrote = true, .expected = .complete },
+        // Nothing failed and nothing was painted: an idle program. Writing this
+        // would cost a syscall per pane per frame for no change at all, and
+        // clearing the flags is correct because there was no work owed.
+        .{ .failed = false, .wrote = false, .expected = .nothing },
+    }) |case| {
+        var painter = .{ .failed = case.failed, .wrote = case.wrote };
+        try std.testing.expectEqual(case.expected, commitFrame(&painter));
+    }
 }
