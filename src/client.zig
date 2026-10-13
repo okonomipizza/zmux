@@ -543,6 +543,27 @@ pub const Client = struct {
             if (affected) pane.stale = true;
         }
 
+        // The other direction, which was missing: a float's border is drawn in cells that the tiles
+        // behind it also write to, because a tile's row blanking spans its whole interior and the
+        // float sits on top of part of it. Tiled panes are painted first, so a tile that repaints
+        // erases whatever of the float's frame it crosses, and the float has to put it back.
+        //
+        // Only when a tile under the float is actually being painted: a frame where nothing moves
+        // costs nothing, which is the case this optimisation exists for.
+        for (self.panes.items) |*pane| {
+            if (!pane.floating) continue;
+            if (pane.rect.width == 0 or pane.rect.height == 0) continue;
+            for (self.panes.items) |*other| {
+                if (other.floating) continue;
+                if (other.rect.width == 0 or other.rect.height == 0) continue;
+                if (!rectsIntersect(other.rect, pane.rect)) continue;
+                // `stale` is consumed by the tile's own paint, so it cannot be read here; what
+                // matters is whether the tile has anything to draw at all. Its render state says so,
+                // and the global flag covers a resize or a move.
+                if (other.stale or other.render.dirty() != .clean) pane.stale = true;
+            }
+        }
+
         self.covered.clearRetainingCapacity();
         self.covered.ensureUnusedCapacity(self.gpa, self.panes.items.len) catch return;
         for (self.panes.items) |*pane| {
@@ -762,8 +783,15 @@ pub const Client = struct {
         // or came out from under a float. Content never touches the border, because it is painted
         // inside the interior, so redrawing the frame on every keystroke would send two escape
         // sequences per row for cells that cannot have changed.
+        //
+        // The focused pane's frame is tinted. The focus is the server's, so a pane that loses it is
+        // marked stale by the layout event that says so and paints its frame plain next frame.
         if (repaint_all) {
-            if (!appendBorder(&pane.line, self.gpa, rect)) {
+            const active = if (self.focused_float != 0)
+                pane.id == self.focused_float
+            else
+                pane.id == self.focused;
+            if (!appendBorder(&pane.line, self.gpa, rect, active)) {
                 pane.stale = true;
                 return;
             }
@@ -782,13 +810,22 @@ pub const Client = struct {
         }
     }
 
-    /// Whether a float is currently over this pane, so that painting it would be wasted work.
+    /// Whether a float completely covers this pane, so that painting it would be wasted work.
+    ///
+    /// Completely, not merely overlapping. A float is centred and smaller than the window, so the
+    /// pane behind it is usually visible around the edges — and floating a pane makes the pane it
+    /// left behind *grow* into the space it gave up, which changes what is visible around the
+    /// float. Skipping on any overlap left that ring unpainted, so the window showed the float and
+    /// blankness where the tiled pane should have been.
+    ///
+    /// Only a pane that is entirely hidden can be skipped safely, which is the case this was
+    /// written for: a float as large as the pane behind it.
     fn isCovered(self: *Client, pane: *RemotePane) bool {
         for (self.panes.items) |*other| {
             if (!other.floating) continue;
             if (other.id == pane.id) continue;
             if (other.rect.width == 0 or other.rect.height == 0) continue;
-            if (rectsIntersect(other.rect, pane.rect)) return true;
+            if (covers(other.rect, pane.rect)) return true;
         }
         return false;
     }
@@ -1157,6 +1194,26 @@ pub const Client = struct {
             }
         }
 
+        // The focus is part of what a pane's frame looks like, so a pane that gains or loses it has
+        // to be repainted even though neither its cells nor its rectangle changed. Both panes are
+        // marked: the one losing the tint needs its frame redrawn plain, and the one gaining it
+        // needs the tint.
+        const focus_changed = self.focused != layout.focused or
+            self.focused_float != layout.focused_float;
+        if (focus_changed) {
+            for (self.panes.items) |*pane| {
+                const was = if (self.focused_float != 0)
+                    pane.id == self.focused_float
+                else
+                    pane.id == self.focused;
+                const now = if (layout.focused_float != 0)
+                    pane.id == layout.focused_float
+                else
+                    pane.id == layout.focused;
+                if (was != now) pane.stale = true;
+            }
+        }
+
         self.focused = layout.focused;
         self.focused_float = layout.focused_float;
         self.docking = layout.docking;
@@ -1325,11 +1382,22 @@ fn commitFrame(painter: anytype) FrameOutcome {
     return .complete;
 }
 
+/// The colour of the focused pane's border, a muted young green.
+///
+/// Deliberately desaturated rather than a pure green: the border frames text that has its own
+/// colours, and a bright edge competes with it. This reads as a tint on the frame rather than as
+/// content, which is what an indicator should do.
+const active_border: [3]u8 = .{ 124, 168, 108 };
+
 /// Append the frame drawn around a pane's rectangle to a frame buffer.
 ///
 /// Box-drawing characters rather than dashes, so that a border meeting another border looks
 /// joined instead of dotted. Written as whole rows with a cursor move each, because the alternative
 /// is a move per cell for no benefit: the border is at most a few hundred bytes.
+///
+/// An active pane's frame is tinted so that the focused pane is findable without reading the status
+/// line. Only the border is coloured; the program's own cells are untouched, so nothing the program
+/// draws is altered.
 ///
 /// A rectangle too small to hold a frame is left alone; `interior` returned it untouched, so
 /// drawing a border would eat the only cell the program has.
@@ -1337,10 +1405,21 @@ fn appendBorder(
     buffer: *std.ArrayList(u8),
     gpa: std.mem.Allocator,
     rect: protocol.Rect,
+    active: bool,
 ) bool {
     if (rect.width < 3 or rect.height < 3) return true;
 
     const horizontal = rect.width - 2;
+
+    // The colour is set once at the start and cleared at the end, so a border costs two escapes
+    // whatever its size.
+    if (active) {
+        buffer.print(gpa, "\x1b[38;2;{d};{d};{d}m", .{
+            active_border[0],
+            active_border[1],
+            active_border[2],
+        }) catch return false;
+    }
 
     // The edges are written straight into the frame buffer, which grows as needed, rather than
     // through a fixed scratch buffer. A fixed buffer would cap how wide a pane could be before its
@@ -1435,6 +1514,21 @@ fn rectsIntersect(a: protocol.Rect, b: protocol.Rect) bool {
     if (b.x + b.width <= a.x) return false;
     if (a.y + a.height <= b.y) return false;
     if (b.y + b.height <= a.y) return false;
+    return true;
+}
+
+/// Whether one rectangle hides another completely.
+///
+/// Every cell of `inner` has to be inside `outer`; an overlap that leaves part of the pane showing
+/// is not enough, because the part left showing still has to be drawn. This is the test for skipping
+/// a pane under a float, and the difference from `rectsIntersect` is the whole reason the pane
+/// behind a float was blank when only its edges were covered.
+fn covers(outer: protocol.Rect, inner: protocol.Rect) bool {
+    if (outer.width == 0 or outer.height == 0) return false;
+    if (inner.width == 0 or inner.height == 0) return false;
+    if (inner.x < outer.x or inner.y < outer.y) return false;
+    if (inner.x + inner.width > outer.x + outer.width) return false;
+    if (inner.y + inner.height > outer.y + outer.height) return false;
     return true;
 }
 
@@ -1806,7 +1900,7 @@ test "the border is drawn at any width, however wide the terminal" {
 
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(gpa);
-    try std.testing.expect(appendBorder(&line, gpa, wide));
+    try std.testing.expect(appendBorder(&line, gpa, wide, false));
 
     // A horizontal edge of 398 cells, three bytes each, is far past the old limit.
     try std.testing.expect(line.items.len > 1200);
@@ -1821,7 +1915,7 @@ test "the border is drawn at any width, however wide the terminal" {
     // over the only cell the program has.
     var tiny: std.ArrayList(u8) = .empty;
     defer tiny.deinit(gpa);
-    try std.testing.expect(appendBorder(&tiny, gpa, .{ .x = 0, .y = 0, .width = 2, .height = 2 }));
+    try std.testing.expect(appendBorder(&tiny, gpa, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, false));
     try std.testing.expectEqual(@as(usize, 0), tiny.items.len);
 }
 
@@ -1861,4 +1955,144 @@ test "a finished session detaches the client rather than leaving the window up" 
     try std.testing.expect(client.finished);
     try std.testing.expect(client.exited);
     try std.testing.expectEqual(@as(u8, 3), client.exit_status);
+}
+
+test "the active pane's border is tinted and the others are not" {
+    // The border is what says which pane has focus, so the tint has to distinguish them. Only the
+    // focused pane's frame is coloured: tinting both would say nothing.
+    const gpa = std.testing.allocator;
+    const rect = protocol.Rect{ .x = 0, .y = 0, .width = 10, .height = 4 };
+
+    var active: std.ArrayList(u8) = .empty;
+    defer active.deinit(gpa);
+    try std.testing.expect(appendBorder(&active, gpa, rect, true));
+    try std.testing.expect(std.mem.indexOf(u8, active.items, "\x1b[38;2;124;168;108m") != null);
+
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    try std.testing.expect(appendBorder(&plain, gpa, rect, false));
+    try std.testing.expect(std.mem.indexOf(u8, plain.items, "38;2;") == null);
+
+    // The colour is cleared at the end, so it cannot bleed into the pane's own cells or into a
+    // neighbouring pane. Both forms end with the reset.
+    try std.testing.expect(std.mem.endsWith(u8, active.items, "\x1b[0m"));
+    try std.testing.expect(std.mem.endsWith(u8, plain.items, "\x1b[0m"));
+
+    // The tint is set once however wide the pane is, so it does not grow the frame.
+    const wide = protocol.Rect{ .x = 0, .y = 0, .width = 200, .height = 4 };
+    var wide_active: std.ArrayList(u8) = .empty;
+    defer wide_active.deinit(gpa);
+    try std.testing.expect(appendBorder(&wide_active, gpa, wide, true));
+    var wide_plain: std.ArrayList(u8) = .empty;
+    defer wide_plain.deinit(gpa);
+    try std.testing.expect(appendBorder(&wide_plain, gpa, wide, false));
+    // One introducer plus one reset, whatever the width.
+    const difference = wide_active.items.len - wide_plain.items.len;
+    try std.testing.expectEqual(@as(usize, "\x1b[38;2;124;168;108m".len), difference);
+}
+
+test "a float only hides a pane it covers completely" {
+    // Skipping a pane that is merely overlapped leaves the visible part of it blank. A float is
+    // centred and smaller than the window, so the pane behind it is normally visible around the
+    // edges — and when a pane is floated, the pane it left behind grows into the space, which
+    // changes what shows around the float.
+    const pane = protocol.Rect{ .x = 0, .y = 0, .width = 80, .height = 24 };
+
+    // A float smaller than the pane, sitting inside it: the pane shows around it, so it must be
+    // painted.
+    try std.testing.expect(!covers(
+        protocol.Rect{ .x = 10, .y = 4, .width = 60, .height = 16 },
+        pane,
+    ));
+    // A float that covers the pane entirely: nothing of the pane shows, so painting it is wasted.
+    try std.testing.expect(covers(
+        protocol.Rect{ .x = 0, .y = 0, .width = 80, .height = 24 },
+        pane,
+    ));
+    try std.testing.expect(covers(
+        protocol.Rect{ .x = 0, .y = 0, .width = 90, .height = 30 },
+        pane,
+    ));
+    // A float that covers all but one column leaves that column to draw.
+    try std.testing.expect(!covers(
+        protocol.Rect{ .x = 0, .y = 0, .width = 79, .height = 24 },
+        pane,
+    ));
+    // Zero-sized rectangles hide nothing and are hidden by nothing.
+    try std.testing.expect(!covers(
+        protocol.Rect{ .x = 0, .y = 0, .width = 0, .height = 0 },
+        pane,
+    ));
+    try std.testing.expect(!covers(
+        pane,
+        protocol.Rect{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    ));
+}
+
+test "a pane is skipped only when a float covers all of it" {
+    // `isCovered` is the decision that skips painting, and it has to use complete coverage rather
+    // than overlap. Overlap was the bug: the pane behind a centred float was skipped, so the part
+    // of it visible around the float stayed blank.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // Three panes: two tiled and one float over the first of them.
+    for ([_]struct { id: u64, floating: bool, rect: protocol.Rect }{
+        .{
+            .id = 1,
+            .floating = false,
+            .rect = .{ .x = 0, .y = 0, .width = 40, .height = 20 },
+        },
+        .{
+            .id = 2,
+            .floating = false,
+            .rect = .{ .x = 40, .y = 0, .width = 40, .height = 20 },
+        },
+        .{
+            .id = 3,
+            .floating = true,
+            .rect = .{ .x = 10, .y = 5, .width = 20, .height = 10 },
+        },
+    }) |entry| {
+        var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
+        errdefer terminal.deinit();
+        var render = try terminal.createRenderState();
+        errdefer render.deinit();
+        const route = try gpa.create(PaneRoute);
+        route.* = .{ .client = &client, .pane = entry.id };
+        try client.panes.append(gpa, .{
+            .id = entry.id,
+            .terminal = terminal,
+            .render = render,
+            .floating = entry.floating,
+            .rect = entry.rect,
+            .route = route,
+        });
+    }
+
+    // Pane 1 is overlapped by the float but not covered, so it must still be painted: the frame
+    // around the float is exactly what was missing.
+    try std.testing.expect(!client.isCovered(client.findPane(1).?));
+    // Pane 2 does not touch the float at all.
+    try std.testing.expect(!client.isCovered(client.findPane(2).?));
+
+    // A float the size of the pane behind it covers it completely, so it can be skipped.
+    client.findPane(3).?.rect = .{ .x = 0, .y = 0, .width = 40, .height = 20 };
+    try std.testing.expect(client.isCovered(client.findPane(1).?));
+
+    // A float one column narrower leaves that column to draw, so the pane is not skippable.
+    client.findPane(3).?.rect = .{ .x = 0, .y = 0, .width = 39, .height = 20 };
+    try std.testing.expect(!client.isCovered(client.findPane(1).?));
 }

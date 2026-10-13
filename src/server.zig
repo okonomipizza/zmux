@@ -1428,7 +1428,24 @@ pub const Server = struct {
     /// no second rendering path and no snapshot API to keep in step with
     /// libghostty-vt.
     /// Send a client the current screen of every pane in a session.
+    /// Send a client the current screen of every pane in a session.
+    ///
+    /// The whole screen is cleared once, before any pane is drawn. It used to be cleared inside the
+    /// per-pane function, which meant the second pane's clear wiped the first pane's screen: with
+    /// two panes only the last one drawn was visible and the rest of the window was blank. Every
+    /// path that re-sends a session's screens was affected, which is floating a pane, docking one,
+    /// toggling the floats and resizing.
     fn sendSessionScreens(self: *Server, session: *Session, client: usize) !void {
+        if (session.panes.items.len == 0) return;
+
+        // Cleared and homed once, so that whatever the client was showing is replaced rather than
+        // partially overwritten by panes that do not cover the whole window.
+        try self.sendEvent(client, .{ .output = .{
+            .name = session.name,
+            .pane = session.panes.items[0].id,
+            .data = "\x1b[2J",
+        } });
+
         for (session.panes.items, 0..) |_, pane_index| {
             try self.sendPaneScreen(client, session, pane_index);
         }
@@ -1452,9 +1469,8 @@ pub const Server = struct {
         var screen: std.ArrayList(u8) = .empty;
         defer screen.deinit(self.gpa);
 
-        // Clear and home first, so any previous contents on the client are replaced
-        // rather than partially overwritten.
-        try screen.appendSlice(self.gpa, "\x1b[2J\x1b[H");
+        // No clear here: the caller clears the screen once for the whole session. Clearing per pane
+        // would erase the panes already drawn, since each one repaints only its own rectangle.
 
         var render = pane.terminal.createRenderState() catch return;
         defer render.deinit();
