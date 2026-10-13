@@ -1179,10 +1179,24 @@ pub const Server = struct {
         const session = &self.sessions.items[index];
         const pane_index = session.focusedPane() orelse return;
 
+        // Closing the last pane closes the session, which is what a program exiting in it already
+        // does. A session with no panes has nothing to draw and nothing to attach to, and leaving
+        // one behind left the client attached to an empty window with a status line over it.
+        if (session.panes.items.len <= 1) {
+            try self.killSession(index);
+            return;
+        }
+
         try self.closePane(index, pane_index);
 
         try session.relayout();
         try self.sendLayout(session);
+
+        // The space the pane gave up is drawn over by the panes that grew into it, and what was
+        // underneath is not something this side tracks, so every pane's screen is re-sent.
+        for (session.watchers.items) |client| {
+            try self.sendSessionScreens(session, client);
+        }
     }
 
     /// Remove one pane by index, killing its child and forgetting it everywhere.

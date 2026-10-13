@@ -376,6 +376,16 @@ rotates the arrangement, `w` lists the sessions and switches to one, and `x` rea
 the focused pane's history. A bare `ctrl-b` twice still detaches, and a key the prefix
 does not use does nothing at all.
 
+Closing the last pane discards the session, which is what a program exiting in it already
+did. It used to remove the pane and leave the session behind, so the client stayed attached
+to an empty window with a status line over it, and its state had no name: attached to
+something with no panes, neither running a session nor detached from one. The two ways of
+emptying a session now do the same thing.
+
+Closing a pane also re-sends the remaining screens, which the exiting path already did and
+this one did not. The space a closed pane gave up is drawn over by the panes that grew into
+it, and what was underneath is not something the server tracks.
+
 That last part was not always so. An unused key after the prefix used to detach, on the
 reasoning that a typo should not leave the client in a state where the next byte is eaten.
 Nothing is eaten: the prefix is consumed by the handler whether or not the key after it is

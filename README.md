@@ -89,8 +89,9 @@ Each pane is its own program on its own pty, so a split gives two shells side by
 side. A pane is drawn with a border around it, and the program is given the area
 inside that border rather than the whole rectangle, so its own wrapping agrees with
 what you see. A pane whose program exits is closed and its space given to a
-neighbour; the last pane keeps its final screen, because a session with nothing to
-draw could not be told apart from a broken one.
+neighbour, and so is one closed with `ctrl-b q`. When it is the last pane the
+session goes with it: a session with nothing to draw has nothing to attach to, so
+the client is told it ended and returns to the terminal zmux was started from.
 
 A floating pane is drawn above the layout, centred, and can be put back. Parking it
 does not touch its pty, so the program inside carries on without noticing, and the
