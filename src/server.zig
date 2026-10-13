@@ -149,13 +149,21 @@ const Pane = struct {
 
     /// The size this pane's pty and terminal should have, from its rectangle.
     ///
+    /// One row and one column are given up on each side to the frame the client draws around the
+    /// pane. The program is never told about the frame: it is handed a terminal the size of the
+    /// area *inside* the border, so its wrapping and its cursor addressing agree with what the
+    /// user sees. A program given the full rectangle would have its last column overwritten by the
+    /// border, which costs a character of every full-width line.
+    ///
     /// A pane with no cells has no size to give its pty, and libghostty-vt rejects a
     /// zero-sized terminal, so this reports null and the caller leaves the pane alone.
     /// That happens when a window is too small to divide, and the pane's program
     /// keeping its old size is better than being resized to nothing.
     fn size(self: Pane) ?pty_mod.Size {
         if (self.rect.isEmpty()) return null;
-        return .{ .rows = self.rect.height, .cols = self.rect.width };
+        const interior = self.rect.interior();
+        if (interior.isEmpty()) return null;
+        return .{ .rows = interior.height, .cols = interior.width };
     }
 
     /// Write as much of what the program is owed as the pty will take.
@@ -285,6 +293,30 @@ const Session = struct {
             if (!pane.exited) return false;
         }
         return true;
+    }
+
+    /// Drop every mention of a pane that is being closed, except the pane list itself.
+    ///
+    /// The pane list is the caller's business, because removing from it is what frees the pty. What
+    /// lives here is the three pieces of focus state that can name a pane, each of which has been a
+    /// source of a dangling identifier: a float left in the list after its pane is gone makes the
+    /// toggle believe there is still something to show, and a focus pointing at a closed pane makes
+    /// the next keystroke go nowhere.
+    fn forgetPane(self: *Session, id: layout.PaneId) void {
+        for (self.floats.items, 0..) |float_id, position| {
+            if (float_id != id) continue;
+            // A float is in this list once, so the first match is the only one.
+            _ = self.floats.swapRemove(position);
+            break;
+        }
+
+        if (self.focused_float == id) {
+            self.focused_float = null;
+            // Nothing is raised any more, so the session is not in the hidden state either. Leaving
+            // it set would hide the floats that remain, for a reason the user can no longer see.
+            self.floats_hidden = false;
+        }
+        if (self.focus_before_float == id) self.focus_before_float = null;
     }
 };
 
@@ -1076,16 +1108,30 @@ pub const Server = struct {
         const session = &self.sessions.items[index];
         const pane_index = session.focusedPane() orelse return;
 
+        try self.closePane(index, pane_index);
+
+        try session.relayout();
+        try self.sendLayout(session);
+    }
+
+    /// Remove one pane by index, killing its child and forgetting it everywhere.
+    ///
+    /// A closed pane has to leave no trace in any of the three places that name it: the pane list,
+    /// the workspace tree and the float list. A pane dropped from the tree but left in `floats`
+    /// would still be counted as a float, so the toggle would believe there was something to show
+    /// and the layout would carry an identifier no pane answers to.
+    fn closePane(self: *Server, session_index: usize, pane_index: usize) !void {
+        const session = &self.sessions.items[session_index];
         const id = session.panes.items[pane_index].id;
+
+        session.forgetPane(id);
+
         var doomed = session.panes.swapRemove(pane_index);
         self.unregister(doomed.pty.master);
         _ = linux.kill(doomed.pty.child, linux.SIG.HUP);
         doomed.deinit(self.gpa);
 
         _ = session.tree.close(id) catch null;
-
-        try session.relayout();
-        try self.sendLayout(session);
     }
 
     /// Tell every watcher where the panes are and which one has focus.
@@ -1302,16 +1348,37 @@ pub const Server = struct {
         }
     }
 
-    /// Mark one pane's program as finished, keeping its screen.
+    /// Remove a pane whose program has finished, so that its space is reclaimed.
     ///
-    /// The pane is not removed: a program that has exited still has a last screen worth
-    /// looking at, and the user closes the pane when they are done with it.
+    /// A shell that exits is a pane the user is done with, and leaving it on screen means the
+    /// layout keeps a dead rectangle that has to be closed by hand. The pane's final output is
+    /// still forwarded first, so the last screen is not lost; what is lost is the pane itself.
+    ///
+    /// The last pane is kept as a tombstone. Closing it would leave the session with no panes at
+    /// all, and a client with nothing to draw cannot tell a finished session from a broken one. It
+    /// is the pane that carries the exit status, and `q` closes it as usual.
     fn paneEnded(self: *Server, session_index: usize, pane_index: usize, status: u8) !void {
         const session = &self.sessions.items[session_index];
         if (pane_index >= session.panes.items.len) return;
-        const pane = &session.panes.items[pane_index];
-        if (pane.exited) return;
+        if (session.panes.items[pane_index].exited) return;
 
+        if (session.panes.items.len > 1) {
+            try self.closePane(session_index, pane_index);
+            try session.relayout();
+            try self.sendLayout(session);
+
+            // The space the pane gave up has to be repainted, and what was underneath it is not
+            // something the server tracks. Every pane's screen is re-sent, which is what the
+            // toggle does for the same reason.
+            for (session.watchers.items) |client| {
+                try self.sendSessionScreens(session, client);
+            }
+            return;
+        }
+
+        // The only pane. Its screen is kept and it is marked finished, so that a client can say so
+        // rather than waiting for output that will never come.
+        const pane = &session.panes.items[pane_index];
         pane.exited = true;
         pane.status = status;
 
@@ -1320,15 +1387,10 @@ pub const Server = struct {
         self.unregister(pane.pty.master);
 
         try self.sendLayout(session);
-
-        // A session whose every pane has finished is reported once, so that a client
-        // attached to it can say so rather than waiting for output that will never come.
-        if (session.allExited()) {
-            try self.broadcast(session, .{ .exited = .{
-                .name = session.name,
-                .status = status,
-            } });
-        }
+        try self.broadcast(session, .{ .exited = .{
+            .name = session.name,
+            .status = status,
+        } });
     }
 
     /// Queue an event for one client.
@@ -2016,4 +2078,60 @@ test "a partial write keeps the bytes the program has not seen" {
     try queue.appendSlice(gpa, "xy");
     consumeFront(&queue, 0);
     try std.testing.expectEqualStrings("xy", queue.items);
+}
+
+test "closing a pane forgets it in the float list as well" {
+    // A pane closed while floating was dropped from the pane list and the tree but left in
+    // `floats`. The float list then named a pane that no longer existed, so the toggle believed
+    // there was still something to show, and the session stayed in the hidden state with nothing
+    // left to show.
+    //
+    // `forgetPane` is the whole of that bookkeeping and touches no pty, which is what makes it
+    // testable: closing a real pane frees its terminal and its reply route, and a fabricated pane
+    // has neither.
+    const gpa = std.testing.allocator;
+    var session = Session.init(gpa, try protocol.Name.init("f"));
+    defer {
+        session.panes.deinit(gpa);
+        session.floats.deinit(gpa);
+        session.watchers.deinit(gpa);
+        session.placements.deinit(gpa);
+        session.tree.deinit();
+    }
+
+    const a = session.tree.allocateId();
+    try session.tree.setRoot(a);
+    const b = session.tree.allocateId();
+    try session.tree.split(a, .horizontal, b);
+
+    const tiled = try std.testing.allocator.create(u8);
+    defer std.testing.allocator.destroy(tiled);
+    const floating = try std.testing.allocator.create(u8);
+    defer std.testing.allocator.destroy(floating);
+    try session.panes.append(gpa, .{ .id = a, .pty = .{ .master = -1, .child = 0 }, .terminal = undefined });
+    try session.panes.append(gpa, .{ .id = b, .pty = .{ .master = -1, .child = 0 }, .terminal = undefined });
+
+    // `b` is parked and raised; `a` is the pane behind it and the remembered return.
+    _ = try session.tree.detach(b, session.cols, session.rows);
+    try session.floats.append(gpa, b);
+    session.focused_float = b;
+    session.focus_before_float = a;
+    session.floats_hidden = false;
+
+    session.forgetPane(b);
+
+    // The float list no longer names the closed pane, and neither does the raised float.
+    try std.testing.expectEqual(@as(usize, 0), session.floats.items.len);
+    try std.testing.expect(session.focused_float == null);
+    // The remembered return is `a`, which is still open, so it is kept rather than cleared. Only a
+    // pointer at the pane that is going away is dropped.
+    try std.testing.expectEqual(@as(?layout.PaneId, a), session.focus_before_float);
+    // Nothing is raised, so the session must not claim its floats are hidden: that state is what
+    // makes the status line promise that a key will bring something back.
+    try std.testing.expect(!session.floats_hidden);
+
+    // Forgetting the remembered pane clears it, because it is the one that has gone.
+    session.forgetPane(a);
+    try std.testing.expect(session.focus_before_float == null);
+    try std.testing.expectEqual(@as(usize, 0), session.floats.items.len);
 }

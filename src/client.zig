@@ -397,7 +397,7 @@ pub const Client = struct {
         if (self.floats_hidden) {
             return std.fmt.bufPrint(
                 buffer,
-                " zmux | {s} | {d}x{d} | floats hidden, ctrl-a - shows them | {s}",
+                " zmux | {s} | {d}x{d} | floats hidden, ctrl-a f shows them | {s}",
                 .{
                     name,
                     self.area_cols,
@@ -409,7 +409,7 @@ pub const Client = struct {
 
         return std.fmt.bufPrint(
             buffer,
-            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close f float d dock - hide h/j/k/l focus | {s}",
+            " zmux | {s} | {d}x{d} | ctrl-a: s/v split q close F float f floats d dock h/j/k/l focus | {s}",
             .{
                 name,
                 self.area_cols,
@@ -488,11 +488,15 @@ pub const Client = struct {
         if (!pane.render.cursorVisible()) return hideCursor(local);
         const position = pane.render.cursorPosition() orelse return hideCursor(local);
 
+        // The cursor is reported in the program's own coordinates, whose origin is the interior's
+        // top left rather than the pane's. The frame is one cell, so the pane's origin alone would
+        // put the cursor in the border.
+        const interior = pane.rect.interior();
         var buffer: [32]u8 = undefined;
         const move = std.fmt.bufPrint(
             &buffer,
             "\x1b[{d};{d}H\x1b[?25h",
-            .{ pane.rect.y + position.y + 1, pane.rect.x + position.x + 1 },
+            .{ interior.y + position.y + 1, interior.x + position.x + 1 },
         ) catch return hideCursor(local);
         local.writeAll(move) catch {};
     }
@@ -581,6 +585,10 @@ pub const Client = struct {
         const local = self.local orelse return;
         const rect = pane.rect;
         if (rect.width == 0 or rect.height == 0) return;
+
+        // The program is painted inside the frame, never over it. Its terminal was sized to the
+        // interior, so this is the same rectangle the pty was told about.
+        const interior = rect.interior();
 
         // A pane under a float is not painted at all. Whatever it would write is invisible, and
         // writing it is what made typing in a float repaint the whole session. It is marked stale
@@ -723,7 +731,7 @@ pub const Client = struct {
 
         var painter = Painter{
             .pane = pane,
-            .rect = rect,
+            .rect = interior,
             .row_index = &row_index,
             .gpa = self.gpa,
             .repaint_all = repaint_all,
@@ -744,7 +752,22 @@ pub const Client = struct {
             pane.stale = true;
             return;
         }
-        if (outcome == .nothing) return;
+
+        // The border goes into the same buffer as the content, so a pane costs one write rather
+        // than one per row plus one for the frame. It is appended after the rows, which is what
+        // puts it around them rather than over them.
+        //
+        // It is redrawn only when the frame could have been disturbed, which is when the pane moved
+        // or came out from under a float. Content never touches the border, because it is painted
+        // inside the interior, so redrawing the frame on every keystroke would send two escape
+        // sequences per row for cells that cannot have changed.
+        if (repaint_all) {
+            if (!appendBorder(&pane.line, self.gpa, rect)) {
+                pane.stale = true;
+                return;
+            }
+        }
+        if (pane.line.items.len == 0) return;
 
         if (local.writeAll(pane.line.items)) |_| {
             // The flags are cleared only once the frame is out and whole.
@@ -909,8 +932,15 @@ pub const Client = struct {
                 try self.sendRequest(.{ .close = .{ .name = self.watching } });
                 return false;
             },
-            // `f` parks the focused pane above the layout, `d` puts the raised float back.
+            // `f` shows and hides the floats, and `F` parks the focused pane above the layout.
+            // The toggle is on the easier key because it is the one used repeatedly while
+            // working, and floating is a move made once. The client does not track which state the
+            // server is in, so one key asks for the change and the server decides the direction.
             'f' => {
+                try self.sendRequest(.{ .toggle_floats = .{ .name = self.watching } });
+                return false;
+            },
+            'F' => {
                 try self.sendRequest(.{ .float = .{ .name = self.watching } });
                 return false;
             },
@@ -921,12 +951,6 @@ pub const Client = struct {
                     .name = self.watching,
                     .target = 0,
                 } });
-                return false;
-            },
-            // `-` hides the floats or brings them back, depending on the state the server is in. One
-            // key for both directions because the client does not track which state that is.
-            '-' => {
-                try self.sendRequest(.{ .toggle_floats = .{ .name = self.watching } });
                 return false;
             },
             // h/j/k/l move focus. They all map onto the tree's own order for now, which
@@ -1113,13 +1137,19 @@ pub const Client = struct {
             // The terminal is resized to match, so that the client's idea of the pane's
             // shape agrees with the server's. Skipping this would leave a pane's screen
             // wrapped for a width it no longer has.
-            if (placement.rect.width > 0 and placement.rect.height > 0) {
-                pane.terminal.resize(
-                    placement.rect.width,
-                    placement.rect.height,
-                    0,
-                    0,
-                ) catch {};
+            //
+            // Two things matter here. The size is the *interior*, because that is what the server
+            // gives the pty and what the cells are painted into; using the full rectangle would
+            // wrap this side's text one column away from the program's. And it is only done when
+            // the size actually changed, because a resize reflows the screen and marks rows dirty:
+            // doing it on every layout event repainted panes whose program had done nothing, since
+            // a layout event arrives for the whole session whenever any one pane changes.
+            if (resizeTarget(placement.rect)) |target| {
+                if (pane.terminal.cols() != target.width or
+                    pane.terminal.rows() != target.height)
+                {
+                    pane.terminal.resize(target.width, target.height, 0, 0) catch {};
+                }
             }
         }
 
@@ -1289,6 +1319,84 @@ fn commitFrame(painter: anytype) FrameOutcome {
     if (painter.failed) return .incomplete;
     if (!painter.wrote) return .nothing;
     return .complete;
+}
+
+/// Append the frame drawn around a pane's rectangle to a frame buffer.
+///
+/// Box-drawing characters rather than dashes, so that a border meeting another border looks
+/// joined instead of dotted. Written as whole rows with a cursor move each, because the alternative
+/// is a move per cell for no benefit: the border is at most a few hundred bytes.
+///
+/// A rectangle too small to hold a frame is left alone; `interior` returned it untouched, so
+/// drawing a border would eat the only cell the program has.
+fn appendBorder(
+    buffer: *std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    rect: protocol.Rect,
+) bool {
+    if (rect.width < 3 or rect.height < 3) return true;
+
+    const horizontal = rect.width - 2;
+    // A horizontal edge is three bytes per cell in UTF-8, plus the cursor move that introduces it.
+    // A fixed writer that overflows reports it rather than truncating, so this is sized from the
+    // rectangle instead of guessed: a wide pane on a wide terminal must not lose its border.
+    const edge_bytes = 32 + @as(usize, horizontal) * 3;
+    var scratch: [512]u8 = undefined;
+    if (edge_bytes > scratch.len) return true;
+
+    // The top edge, with corners.
+    {
+        var writer = std.Io.Writer.fixed(&scratch);
+        writer.print("\x1b[{d};{d}H\u{250c}", .{ rect.y + 1, rect.x + 1 }) catch return false;
+        appendRepeated(&writer, "\u{2500}", horizontal) catch return false;
+        writer.writeAll("\u{2510}") catch return false;
+        buffer.appendSlice(gpa, writer.buffered()) catch return false;
+    }
+
+    // The middle rows: a vertical marker at each side.
+    var row: u16 = 1;
+    while (row < rect.height - 1) : (row += 1) {
+        var writer = std.Io.Writer.fixed(&scratch);
+        writer.print("\x1b[{d};{d}H\u{2502}\x1b[{d};{d}H\u{2502}", .{
+            rect.y + row + 1,
+            rect.x + 1,
+            rect.y + row + 1,
+            rect.x + rect.width,
+        }) catch return false;
+        buffer.appendSlice(gpa, writer.buffered()) catch return false;
+    }
+
+    // The bottom edge.
+    {
+        var writer = std.Io.Writer.fixed(&scratch);
+        writer.print("\x1b[{d};{d}H\u{2514}", .{ rect.y + rect.height, rect.x + 1 }) catch return false;
+        appendRepeated(&writer, "\u{2500}", horizontal) catch return false;
+        writer.writeAll("\u{2518}") catch return false;
+        buffer.appendSlice(gpa, writer.buffered()) catch return false;
+    }
+
+    // A colour cannot bleed into the neighbouring pane.
+    buffer.appendSlice(gpa, "\x1b[0m") catch return false;
+    return true;
+}
+
+/// Write `count` copies of a string, which is always a single box-drawing character here.
+fn appendRepeated(writer: *std.Io.Writer, text: []const u8, count: u16) !void {
+    var written: u16 = 0;
+    while (written < count) : (written += 1) try writer.writeAll(text);
+}
+
+/// The size a pane's terminal should have for a given rectangle, or null when it cannot have one.
+///
+/// Null for a rectangle with no area, and for one too small to hold a frame and any content: the
+/// interior would be empty and libghostty-vt rejects a zero-sized terminal. Returning null rather
+/// than a zero size is what lets the caller leave the pane at the size it already has, which is
+/// better than resizing it to nothing.
+fn resizeTarget(rect: protocol.Rect) ?protocol.Rect {
+    if (rect.width == 0 or rect.height == 0) return null;
+    const interior = rect.interior();
+    if (interior.width == 0 or interior.height == 0) return null;
+    return interior;
 }
 
 /// Hide the window's cursor.
@@ -1618,4 +1726,31 @@ test "an incomplete frame is neither written nor marked clean" {
         var painter = .{ .failed = case.failed, .wrote = case.wrote };
         try std.testing.expectEqual(case.expected, commitFrame(&painter));
     }
+}
+
+test "the resize target is the interior, and absent when there is no room" {
+    // The size a pane's terminal is given is the interior, not the rectangle: the server sizes the
+    // pty the same way, so the two agree about where the text wraps. Sending the full rectangle
+    // would wrap this side's text one column away from the program's.
+    const target = resizeTarget(.{ .x = 10, .y = 5, .width = 20, .height = 10 }).?;
+    try std.testing.expectEqual(@as(u16, 11), target.x);
+    try std.testing.expectEqual(@as(u16, 6), target.y);
+    try std.testing.expectEqual(@as(u16, 18), target.width);
+    try std.testing.expectEqual(@as(u16, 8), target.height);
+
+    // Nothing to resize to, so the caller leaves the pane alone rather than making it zero-sized.
+    // A zero-sized terminal is rejected by libghostty-vt, and a pane keeping its old size is better
+    // than one that cannot exist.
+    try std.testing.expectEqual(@as(?protocol.Rect, null), resizeTarget(.{
+        .x = 0,
+        .y = 0,
+        .width = 0,
+        .height = 0,
+    }));
+
+    // A pane too small to hold a frame keeps all of its cells and simply has no border, so two by
+    // ten is a perfectly good terminal size rather than a refusal.
+    const narrow = resizeTarget(.{ .x = 0, .y = 0, .width = 2, .height = 10 }).?;
+    try std.testing.expectEqual(@as(u16, 2), narrow.width);
+    try std.testing.expectEqual(@as(u16, 10), narrow.height);
 }

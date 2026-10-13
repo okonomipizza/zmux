@@ -19,6 +19,7 @@
 //! tree.
 
 const std = @import("std");
+const protocol = @import("protocol.zig");
 
 /// A stable handle for one pane.
 pub const PaneId = u64;
@@ -42,6 +43,29 @@ pub const Rect = struct {
     pub fn eql(self: Rect, other: Rect) bool {
         return self.x == other.x and self.y == other.y and
             self.width == other.width and self.height == other.height;
+    }
+
+    /// The part of a pane its program is given, once the frame is taken off.
+    ///
+    /// Delegates to the same function the client uses, so that the rectangle the pty is sized to is
+    /// provably the rectangle the program's cells are drawn in. Two copies of this arithmetic would
+    /// drift, and the symptom would be text wrapping one column away from where the border is.
+    pub fn interior(self: Rect) Rect {
+        // Named rather than called on the literal, because Zig reads `Struct{...}.method()`
+        // as a block followed by a statement.
+        const wire: protocol.Rect = .{
+            .x = self.x,
+            .y = self.y,
+            .width = self.width,
+            .height = self.height,
+        };
+        const result = wire.interior();
+        return .{
+            .x = result.x,
+            .y = result.y,
+            .width = result.width,
+            .height = result.height,
+        };
     }
 };
 
@@ -1153,4 +1177,40 @@ test "splitting the longest side of a pane that is not the whole window" {
     const other = tree.allocateId();
     const axis = try tree.splitLongest(tall, other, 120, 30);
     try std.testing.expectEqual(Axis.vertical, axis);
+}
+
+test "a pane's interior is inset by the frame on every side" {
+    // The rectangle the pty is sized to and the rectangle the client paints into have to be the
+    // same one. An off-by-one here is a program wrapping one column away from where the border is,
+    // or a last row that the border has eaten.
+    const rect = Rect{ .x = 10, .y = 5, .width = 20, .height = 10 };
+    const inner = rect.interior();
+    try std.testing.expectEqual(@as(u16, 11), inner.x);
+    try std.testing.expectEqual(@as(u16, 6), inner.y);
+    try std.testing.expectEqual(@as(u16, 18), inner.width);
+    try std.testing.expectEqual(@as(u16, 8), inner.height);
+
+    // The interior is strictly inside the pane, and the border is the ring around it.
+    try std.testing.expect(inner.x > rect.x and inner.y > rect.y);
+    try std.testing.expect(inner.x + inner.width < rect.x + rect.width);
+    try std.testing.expect(inner.y + inner.height < rect.y + rect.height);
+}
+
+test "a pane too small for a frame keeps all of its cells" {
+    // A one- or two-cell pane has no room for a border and content both. Insisting on the border
+    // would leave a zero-sized terminal, which libghostty-vt rejects, so the pane is left whole and
+    // simply has no frame.
+    for ([_]Rect{
+        .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+        .{ .x = 0, .y = 0, .width = 2, .height = 10 },
+        .{ .x = 0, .y = 0, .width = 10, .height = 2 },
+        .{ .x = 0, .y = 0, .width = 1, .height = 1 },
+    }) |tiny| {
+        try std.testing.expect(tiny.interior().eql(tiny));
+    }
+
+    // Three by three is the smallest that fits a frame and one cell inside it.
+    const smallest = Rect{ .x = 0, .y = 0, .width = 3, .height = 3 };
+    try std.testing.expectEqual(@as(u16, 1), smallest.interior().width);
+    try std.testing.expectEqual(@as(u16, 1), smallest.interior().height);
 }

@@ -48,15 +48,19 @@ Inside an attached session the prefix key is `ctrl-a`:
 | `ctrl-a s` | split the focused pane side by side |
 | `ctrl-a v` | split it into stacked halves |
 | `ctrl-a q` | close the focused pane |
-| `ctrl-a f` | float the focused pane above the layout |
+| `ctrl-a F` | float the focused pane above the layout |
 | `ctrl-a d` | dock a floating pane back into the layout |
-| `ctrl-a -` | hide the floating panes, or show them again |
+| `ctrl-a f` | hide the floating panes, or show them again |
 | `ctrl-a h` / `k` | move focus to the previous pane |
 | `ctrl-a l` / `j` | move focus to the next pane |
 | `ctrl-a ctrl-a` | detach, leaving every pane running |
 
 Each pane is its own program on its own pty, so a split gives two shells side by
-side. A pane whose program exits keeps its last screen until the pane is closed.
+side. A pane is drawn with a border around it, and the program is given the area
+inside that border rather than the whole rectangle, so its own wrapping agrees with
+what you see. A pane whose program exits is closed and its space given to a
+neighbour; the last pane keeps its final screen, because a session with nothing to
+draw could not be told apart from a broken one.
 
 A floating pane is drawn above the layout, centred, and can be put back. Parking it
 does not touch its pty, so the program inside carries on without noticing, and the
@@ -64,7 +68,7 @@ space it leaves is given to a neighbouring pane that grows into it. Docking asks
 which pane to split: the layout freezes, each tiled pane shows a number, and the
 number you press is divided along its longer side. Escape cancels.
 
-`ctrl-a -` puts the floating panes away and brings them back. A hidden float keeps
+`ctrl-a f` puts the floating panes away and brings them back. A hidden float keeps
 running and keeps its screen; it is simply not drawn, and it cannot take focus, so
 nothing is ever typed into a pane you cannot see. Showing them again returns focus
 to the pane you were working in before the float appeared.

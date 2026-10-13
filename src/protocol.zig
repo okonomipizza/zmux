@@ -162,6 +162,25 @@ pub const Rect = struct {
     y: u16,
     width: u16,
     height: u16,
+
+    /// The part of a pane its program is given, once the frame is taken off.
+    ///
+    /// The frame is one cell thick on every side, so the interior starts one in and is two narrower
+    /// and two shorter. It lives here, on the type both sides use, because the server sizes the pty
+    /// by it and the client draws the program's cells inside it; one implementation is what keeps
+    /// them from disagreeing, and disagreement is a pane whose text wraps in the wrong place.
+    ///
+    /// A rectangle too small to hold a frame and any content is returned untouched, so that a tiny
+    /// pane gets no border rather than a zero-sized terminal that libghostty-vt rejects.
+    pub fn interior(self: Rect) Rect {
+        if (self.width < 3 or self.height < 3) return self;
+        return .{
+            .x = self.x + 1,
+            .y = self.y + 1,
+            .width = self.width - 2,
+            .height = self.height - 2,
+        };
+    }
 };
 
 /// One session, as it appears in a listing.

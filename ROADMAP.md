@@ -370,9 +370,9 @@ keystroke already in flight when focus moves must reach the pane the user was ty
 into, and focus is the server's idea, read later.
 
 Key bindings are vim-flavoured behind the existing `ctrl-a` prefix: `s` splits side by
-side, `v` stacks, `q` closes the focused pane, and `h`/`j`/`k`/`l` move focus. A bare
-`ctrl-a` twice still detaches, and a prefix followed by an unused key detaches rather
-than being swallowed.
+side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
+and `h`/`j`/`k`/`l` move focus. A bare `ctrl-a` twice still detaches, and a prefix
+followed by an unused key detaches rather than being swallowed.
 
 Verified: an attached client at 80x24 shows the first pane's text on row 1 and the status
 line reading `1 pane(s)`. Sending `ctrl-a s` produces `2 pane(s)`, and the client's output
@@ -449,7 +449,7 @@ dock back into, and the tree would be empty while a float still needed somewhere
 
 ### Hiding a float without closing it
 
-`ctrl-a -` puts the floating panes away and brings them back. One key for both directions,
+`ctrl-a f` puts the floating panes away and brings them back. One key for both directions,
 because there are only two states and a pair of keys would leave the user working out which
 one they are in.
 
@@ -475,6 +475,41 @@ rules consistent rather than merely both present.
 One consequence worth noting: a raised float now takes input in preference to the tiled pane.
 Before this, input went to the tiled focus whatever was drawn on top, so a floated pane could
 be seen but not typed into.
+
+### Borders, and who owns the cells they take
+
+A pane is drawn with a box around it, and the program inside is given the area *within* that
+box rather than the whole rectangle. The two have to agree: the server sizes the pty by the
+interior and the client paints the program's cells into it, and an off-by-one is a shell whose
+text wraps one column away from where the border is.
+
+That arithmetic therefore exists once, on `protocol.Rect`, which both sides already share.
+`layout.Rect` delegates to it rather than repeating it. A second copy would be the kind of
+duplication that looks harmless until one of them is corrected.
+
+A rectangle smaller than three by three is left whole and gets no border, because a frame plus
+one cell of content does not fit in less. Insisting would hand libghostty-vt a zero-sized
+terminal, which it rejects.
+
+The border is redrawn when the pane moves or comes out from under a float, not when its program
+writes. Content is painted inside the interior and can never reach the border, so redrawing the
+frame per keystroke would send two escape sequences per row for cells that cannot have changed.
+Getting this wrong is not a correctness bug but it nearly triples the cost of typing, which is
+how it was noticed.
+
+### A pane whose program exits
+
+A pane whose shell exits is now closed and its space given to a neighbour. It used to be kept
+with its final screen, which meant a dead rectangle the user had to close by hand after every
+`exit`. The last pane is still kept, because a session with no panes at all cannot be told apart
+from a broken one, and it is the pane that carries the exit status.
+
+Closing a pane has to forget it in three places, not one: the pane list, the workspace tree and
+the float list. A float removed from the pane list but left in `floats` was the bug here — the
+toggle then believed there was still something to show, and the session stayed in the hidden
+state with nothing left to reveal. That bookkeeping now lives in `Session.forgetPane`, which
+touches no pty and is therefore testable; closing a real pane frees a terminal and a reply route,
+which a fabricated pane does not own.
 
 ### A flaky test, and what it was
 
