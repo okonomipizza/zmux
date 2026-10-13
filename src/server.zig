@@ -23,6 +23,7 @@ const linux = std.os.linux;
 const vt = @import("vt.zig");
 const pty_mod = @import("pty.zig");
 const socket = @import("socket.zig");
+const layout = @import("layout.zig");
 const protocol = @import("protocol.zig");
 
 pub const Error = error{
@@ -40,19 +41,18 @@ pub const Error = error{
     PtyFailed,
 };
 
-/// The handle a session's terminal uses to find its way back here.
+/// The handle a pane's terminal uses to find its way back here.
 ///
-/// libghostty-vt's `write_pty` callback carries one opaque pointer, so it points
-/// at this rather than at the session itself. A session is addressed by its name
-/// rather than by its index because `sessions` is a list that reorders when a
-/// session is removed, and a reply that arrived for the wrong session would be
-/// written to the wrong program.
+/// libghostty-vt's `write_pty` callback carries one opaque pointer, and the terminal
+/// outlives any address inside the pane list: `panes` is an `ArrayList` that
+/// reallocates when a split appends to it, so a pointer to the pane, or to a field of
+/// it, would dangle the moment another pane was created. The route therefore
+/// identifies the pane by session name and identifier and looks the buffer up on each
+/// call, which is a linear scan over a handful of panes and cannot go stale.
 const ReplyRoute = struct {
     server: *Server,
-    name: protocol.Name,
-    /// The buffer replies accumulate in. Owned by the session.
-    buffer: *std.ArrayList(u8),
-    gpa: std.mem.Allocator,
+    session: protocol.Name,
+    pane: layout.PaneId,
 };
 
 /// Which client a decoded message belongs to.
@@ -94,34 +94,135 @@ const Client = struct {
     }
 };
 
-/// One session: a pty, the screen it is drawing, and who is watching.
-const Session = struct {
-    name: protocol.Name,
+/// One program running on its own pty, with the screen it is drawing.
+///
+/// A pane is the unit of a session: it owns exactly one child process and one parsed
+/// terminal. Two clients viewing the same session share these, rather than each
+/// parsing the byte stream for itself.
+const Pane = struct {
+    id: layout.PaneId,
     pty: pty_mod.Pty,
     terminal: vt.Terminal,
-    /// Clients attached to this session, as indices into `Server.clients`.
-    watchers: std.ArrayList(usize) = .empty,
-    /// The current screen size, which is what the pty and terminal agree on.
-    rows: u16,
-    cols: u16,
     /// Bytes the terminal wants sent to the pty, from the write_pty callback.
     reply: std.ArrayList(u8) = .empty,
-    /// The opaque handle the terminal holds; points at `route`.
-    route: ReplyRoute = undefined,
-    /// Reused pty read buffer, so a busy session does not allocate per wakeup.
+    /// The handle the terminal holds; heap-allocated and owned by this pane.
+    ///
+    /// It is a separate allocation rather than a field because `setWritePty` stores the
+    /// pointer, and `panes` is an `ArrayList` that reallocates when the next split
+    /// appends. A pointer to a field would be left dangling by that move, which is the
+    /// same failure that a returned-by-value session caused in Phase 1: it looks correct
+    /// until a program sends a second query.
+    route: *ReplyRoute = undefined,
+    /// Reused pty read buffer, so a busy pane does not allocate per wakeup.
     read_buffer: []u8 = &.{},
-    /// Set once the child has been reaped. The screen is kept so a client that
-    /// attaches afterwards still sees the final output.
+    /// Where this pane sits, recomputed on every layout.
+    rect: layout.Rect = .{},
+    /// Set once the child has been reaped. The screen is kept so that a client
+    /// attaching later still sees the final output.
     exited: bool = false,
     /// The exit status, once known.
     status: u8 = 0,
 
-    fn deinit(self: *Session, gpa: std.mem.Allocator) void {
-        self.watchers.deinit(gpa);
+    fn deinit(self: *Pane, gpa: std.mem.Allocator) void {
+        gpa.destroy(self.route);
         self.reply.deinit(gpa);
         gpa.free(self.read_buffer);
         self.terminal.deinit();
         self.pty.deinit();
+    }
+
+    /// The size this pane's pty and terminal should have, from its rectangle.
+    ///
+    /// A pane with no cells has no size to give its pty, and libghostty-vt rejects a
+    /// zero-sized terminal, so this reports null and the caller leaves the pane alone.
+    /// That happens when a window is too small to divide, and the pane's program
+    /// keeping its old size is better than being resized to nothing.
+    fn size(self: Pane) ?pty_mod.Size {
+        if (self.rect.isEmpty()) return null;
+        return .{ .rows = self.rect.height, .cols = self.rect.width };
+    }
+
+    /// Forward whatever the pane's terminal wants written back to its program.
+    fn flushReply(self: *Pane) void {
+        if (self.reply.items.len == 0) return;
+        _ = self.pty.write(self.reply.items) catch {};
+        self.reply.clearRetainingCapacity();
+    }
+};
+
+/// One session: a tree of panes, and who is watching.
+const Session = struct {
+    name: protocol.Name,
+    /// The panes, in creation order. The tree decides where each goes, so this list
+    /// is only for ownership; positions live in `Pane.rect`.
+    panes: std.ArrayList(Pane) = .empty,
+    /// Which pane is where. Kept in step with `panes` on every split and close.
+    tree: layout.Tree,
+    /// Clients attached to this session, as indices into `Server.clients`.
+    watchers: std.ArrayList(usize) = .empty,
+    /// The area the panes share, which is what the client gave this session. Zero until
+    /// a client attaches and says how much room there is.
+    rows: u16 = 0,
+    cols: u16 = 0,
+    /// Scratch space for a layout walk, reused so that a resize does not allocate.
+    placements: std.ArrayList(layout.Placement) = .empty,
+
+    fn init(gpa: std.mem.Allocator, name: protocol.Name) Session {
+        return .{
+            .name = name,
+            .tree = layout.Tree.init(gpa),
+        };
+    }
+
+    fn deinit(self: *Session, gpa: std.mem.Allocator) void {
+        for (self.panes.items) |*pane| pane.deinit(gpa);
+        self.panes.deinit(gpa);
+        self.tree.deinit();
+        self.watchers.deinit(gpa);
+        self.placements.deinit(gpa);
+    }
+
+    /// Find a pane by identifier.
+    fn findPane(self: *Session, id: layout.PaneId) ?usize {
+        for (self.panes.items, 0..) |pane, index| {
+            if (pane.id == id) return index;
+        }
+        return null;
+    }
+
+    /// The pane holding focus, if any.
+    fn focusedPane(self: *Session) ?usize {
+        const id = self.tree.focused orelse return null;
+        return self.findPane(id);
+    }
+
+    /// Recompute every pane's rectangle and apply the sizes to their ptys.
+    ///
+    /// This is the one place geometry reaches a pty. Doing it anywhere else would mean
+    /// two places could disagree about how wide a pane is, and the program inside it
+    /// would see a size that the client is not drawing.
+    fn relayout(self: *Session) !void {
+        try self.tree.layout(&self.placements, self.cols, self.rows);
+
+        for (self.placements.items) |placement| {
+            const index = self.findPane(placement.id) orelse continue;
+            const pane = &self.panes.items[index];
+            const changed = !pane.rect.eql(placement.rect);
+            pane.rect = placement.rect;
+            if (!changed) continue;
+
+            const size = pane.size() orelse continue;
+            pane.pty.setWindowSize(size) catch {};
+            pane.terminal.resize(size.cols, size.rows, 0, 0) catch {};
+        }
+    }
+
+    /// Whether every pane's child has exited.
+    fn allExited(self: *Session) bool {
+        for (self.panes.items) |pane| {
+            if (!pane.exited) return false;
+        }
+        return true;
     }
 };
 
@@ -215,23 +316,68 @@ pub const Server = struct {
         if (self.findSession(request.name) != null) return Error.SessionExists;
         if (request.rows == 0 or request.cols == 0) return Error.SpawnFailed;
 
-        // `execve` wants null-terminated strings, so the vector is rebuilt into
-        // fixed buffers. The count is bounded rather than allocated, because
-        // this runs on a socket read and a peer could otherwise ask for an
-        // arbitrarily large vector.
+        var session = Session.init(self.gpa, try protocol.Name.init(request.name));
+        session.rows = request.rows;
+        session.cols = request.cols;
+        try session.watchers.ensureTotalCapacity(self.gpa, 4);
+
+        try self.sessions.append(self.gpa, session);
+        const index = self.sessions.items.len - 1;
+
+        // The session is in the list before its first pane is made, because the pane
+        // stores the session's name and the terminal's reply path points back at a
+        // session that has a stable home.
+        const stored = &self.sessions.items[index];
+        _ = self.addPane(
+            stored,
+            request.argv,
+            .horizontal,
+            fullArea(request.rows, request.cols),
+        ) catch |err| {
+            var doomed = self.sessions.swapRemove(index);
+            doomed.deinit(self.gpa);
+            return err;
+        };
+
+        // The pane's rectangle is computed here rather than inside `addPane`, because geometry
+        // is the tree's business: `addPane` puts a leaf in the tree, and this turns the tree into
+        // rectangles. Without it the first pane would keep the zero rectangle it was created
+        // with, and the client would have nowhere to draw it.
+        try stored.relayout();
+
+        return index;
+    }
+
+    /// Start a program in a new pane belonging to `session`.
+    ///
+    /// The pane is created at the given size, which for a first pane is the whole area
+    /// and for a split is a guess that `relayout` immediately corrects. Sizing it twice
+    /// is cheaper than the alternative, which is starting a program at a size it will
+    /// never be drawn at and letting it print a screenful of misplaced output before
+    /// the first resize reaches it.
+    fn addPane(
+        self: *Server,
+        session: *Session,
+        argv: []const []const u8,
+        axis: layout.Axis,
+        size: pty_mod.Size,
+    ) !layout.PaneId {
+        // `execve` wants null-terminated strings, so the vector is rebuilt into fixed
+        // buffers. The count is bounded rather than allocated, because this runs on a
+        // socket read and a peer could otherwise ask for an arbitrarily large vector.
         const max_arguments = 64;
         var argument_buffers: [max_arguments][std.fs.max_path_bytes]u8 = undefined;
-        var argv: [max_arguments]?[*:0]const u8 = undefined;
+        var vector: [max_arguments]?[*:0]const u8 = undefined;
         var count: usize = 0;
 
-        if (request.argv.len == 0) {
+        if (argv.len == 0) {
             const shell = self.environ.getPosix("SHELL") orelse "/bin/sh";
-            argv[count] = (try std.fmt.bufPrintZ(&argument_buffers[count], "{s}", .{shell})).ptr;
+            vector[count] = (try std.fmt.bufPrintZ(&argument_buffers[count], "{s}", .{shell})).ptr;
             count += 1;
         } else {
-            for (request.argv) |argument| {
+            for (argv) |argument| {
                 if (count >= max_arguments - 1) break;
-                argv[count] = (try std.fmt.bufPrintZ(
+                vector[count] = (try std.fmt.bufPrintZ(
                     &argument_buffers[count],
                     "{s}",
                     .{argument},
@@ -239,14 +385,12 @@ pub const Server = struct {
                 count += 1;
             }
         }
-        argv[count] = null;
+        vector[count] = null;
 
         const envp: [*:null]const ?[*:0]const u8 = @ptrCast(std.c.environ);
 
-        const pty = pty_mod.Pty.spawn(@ptrCast(&argv), envp, .{
-            .rows = request.rows,
-            .cols = request.cols,
-        }) catch return Error.SpawnFailed;
+        const pty = pty_mod.Pty.spawn(@ptrCast(&vector), envp, size) catch
+            return Error.SpawnFailed;
         errdefer {
             var p = pty;
             p.deinit();
@@ -254,8 +398,8 @@ pub const Server = struct {
         pty.setNonBlocking();
 
         const terminal = vt.Terminal.init(.{
-            .cols = request.cols,
-            .rows = request.rows,
+            .cols = size.cols,
+            .rows = size.rows,
         }) catch return Error.TerminalFailed;
         errdefer {
             var t = terminal;
@@ -265,36 +409,76 @@ pub const Server = struct {
         const read_buffer = try self.gpa.alloc(u8, 64 * 1024);
         errdefer self.gpa.free(read_buffer);
 
-        var session: Session = .{
-            .name = try protocol.Name.init(request.name),
+        const id = session.tree.allocateId();
+
+        // The route is its own allocation so that its address survives the pane list
+        // growing, and it names the pane rather than pointing at it so that it also
+        // survives the pane list reordering. Both are needed: `setWritePty` keeps the
+        // pointer, and a reply that finds the wrong pane writes into the wrong program.
+        const route = try self.gpa.create(ReplyRoute);
+        route.* = .{
+            .server = self,
+            .session = session.name,
+            .pane = id,
+        };
+
+        try session.panes.append(self.gpa, .{
+            .id = id,
             .pty = pty,
             .terminal = terminal,
-            .rows = request.rows,
-            .cols = request.cols,
             .read_buffer = read_buffer,
+            .route = route,
+        });
+        // From here the pane owns the pty, the terminal, the buffer and the route, so
+        // every later failure releases them by popping the pane rather than through an
+        // errdefer. An errdefer would fire a second time on the paths that already clean
+        // up by hand, which is how a double free happens.
+        const pane_index = session.panes.items.len - 1;
+
+        // The reply path is wired before any byte is parsed: a program that probes the
+        // terminal at startup blocks until it is answered.
+        const pane = &session.panes.items[pane_index];
+        pane.terminal.setWritePty(@ptrCast(route), onWritePty);
+
+        self.register(pane.pty.master, linux.EPOLL.IN) catch |err| {
+            self.abandonPane(session);
+            return err;
         };
-        try session.watchers.ensureTotalCapacity(self.gpa, 4);
 
-        try self.sessions.append(self.gpa, session);
-        const index = self.sessions.items.len - 1;
+        // The tree gains the leaf only once the pane exists, so a failure above cannot
+        // leave the tree naming a pane that was never created.
+        if (session.tree.isEmpty()) {
+            session.tree.setRoot(id) catch |err| {
+                self.abandonPane(session);
+                return err;
+            };
+        } else {
+            const target = session.tree.focused orelse id;
+            session.tree.split(target, axis, id) catch |err| switch (err) {
+                error.NoSuchPane => session.tree.setRoot(id) catch |root_err| {
+                    self.abandonPane(session);
+                    return root_err;
+                },
+                else => {
+                    self.abandonPane(session);
+                    return err;
+                },
+            };
+        }
 
-        // The reply path is wired now that the session has a home in the list,
-        // and before any byte is parsed: a program that probes the terminal at
-        // startup blocks until it gets an answer.
-        const stored = &self.sessions.items[index];
-        stored.route = .{
-            .server = self,
-            .name = stored.name,
-            .buffer = &stored.reply,
-            .gpa = self.gpa,
-        };
-        stored.terminal.setWritePty(
-            @ptrCast(&stored.route),
-            onWritePty,
-        );
+        return id;
+    }
 
-        try self.register(stored.pty.master, linux.EPOLL.IN);
-        return index;
+    /// Release the pane most recently appended to `session`.
+    ///
+    /// Used when a pane was built and then something after it failed. It is explicit
+    /// rather than an `errdefer` because the pane owns its pty, terminal, read buffer and
+    /// reply route from the moment it is in the list, and an errdefer would free those a
+    /// second time on the paths that already clean up here.
+    fn abandonPane(self: *Server, session: *Session) void {
+        var doomed = session.panes.pop() orelse return;
+        self.unregister(doomed.pty.master);
+        doomed.deinit(self.gpa);
     }
 
     pub fn findSession(self: *Server, name: []const u8) ?usize {
@@ -321,8 +505,12 @@ pub const Server = struct {
                     try self.acceptClients();
                 } else if (self.clientIndexByFd(fd)) |index| {
                     try self.serviceClient(index);
-                } else if (self.sessionIndexByFd(fd)) |index| {
-                    try self.serviceSession(index);
+                } else if (self.paneByFd(fd)) |which| {
+                    // The session may have been removed by an earlier event in this same
+                    // batch, so the indices are re-checked rather than trusted.
+                    if (which.session < self.sessions.items.len) {
+                        try self.servicePane(which.session, which.pane);
+                    }
                 }
             }
 
@@ -351,29 +539,45 @@ pub const Server = struct {
         return null;
     }
 
-    fn sessionIndexByFd(self: *Server, fd: i32) ?usize {
-        for (self.sessions.items, 0..) |session, index| {
-            if (session.pty.master == fd) return index;
+    /// Which session and pane a pty master belongs to.
+    ///
+    /// Both are returned because a session now owns several ptys, and the caller has to
+    /// know which one became readable.
+    fn paneByFd(self: *Server, fd: i32) ?struct { session: usize, pane: usize } {
+        for (self.sessions.items, 0..) |session, session_index| {
+            for (session.panes.items, 0..) |pane, pane_index| {
+                if (pane.pty.master == fd) {
+                    return .{ .session = session_index, .pane = pane_index };
+                }
+            }
         }
         return null;
     }
 
     /// Read and act on everything one client has sent.
+    /// Read and act on everything one client has sent.
+    ///
+    /// The reply is flushed on every path out, including the ones that end the connection. A
+    /// client that sent one request and then hung up still deserves the answer, and a reply
+    /// left in the queue is a reply that was built and then thrown away. That was a real bug
+    /// here: the read that follows a request commonly reports the peer's close, and returning
+    /// straight from it discarded the listing that had just been computed.
     fn serviceClient(self: *Server, index: usize) !void {
         if (self.clients.items[index].gone) return;
 
         var buffer: [16 * 1024]u8 = undefined;
         while (true) {
             const read = self.clients.items[index].connection.read(&buffer) catch {
+                self.flushClient(index) catch {};
                 self.dropClient(index);
                 return;
             };
             if (read == 0) break;
 
-            // The message handler is told which client it is serving, because
-            // an attach has to know where to send the screen and a detach has to
-            // know whose name to clear. The struct is named rather than a bare
-            // literal so that the sink's parameter type is inferable.
+            // The message handler is told which client it is serving, because an attach has
+            // to know where to send the screen and a detach has to know whose name to clear.
+            // The struct is named rather than a bare literal so that the sink's parameter
+            // type is inferable.
             const context = MessageContext{ .server = self, .client = index };
             try self.clients.items[index].frame.feed(
                 self.gpa,
@@ -410,14 +614,16 @@ pub const Server = struct {
                 for (self.sessions.items) |*session| {
                     try self.broadcast(session, .{ .exited = .{
                         .name = session.name,
-                        .status = session.status,
+                        .status = exitStatusOf(session),
                     } });
-                    // The pty is closed, which hangs up the child, so no
-                    // process is left behind with nothing to reach it.
-                    _ = linux.kill(session.pty.child, linux.SIG.HUP);
+                    for (session.panes.items) |pane| {
+                        // The child is signalled before the pty goes, so no process is
+                        // left behind with nothing to reach it.
+                        _ = linux.kill(pane.pty.child, linux.SIG.HUP);
+                    }
                 }
-                // Every session is gone, and with them the reason the server
-                // exists, so it stops and the socket is removed.
+                // Every session is gone, and with them the reason the server exists,
+                // so it stops and the socket is removed.
                 self.state = .stop;
             },
             .create => |create| {
@@ -429,8 +635,8 @@ pub const Server = struct {
                     .cols = create.cols,
                     .argv = arguments[0..count],
                 });
-                // The creating client attaches to what it just made, which is
-                // what makes `zmux run` in one step.
+                // The creating client attaches to what it just made, which is what makes
+                // `zmux run` one step.
                 try self.sendEvent(client, .{ .created = .{ .name = create.name } });
                 try self.attachClient(client, index, create.rows, create.cols);
             },
@@ -454,34 +660,139 @@ pub const Server = struct {
             .input => |input| {
                 const index = self.findSession(input.name.slice()) orelse return;
                 const session = &self.sessions.items[index];
-                if (session.exited) return;
-                _ = session.pty.write(input.data) catch {};
+                // The pane named by the request, not the focused one: a keystroke in
+                // flight when focus moved belongs to the pane it was typed into.
+                const pane_index = session.findPane(input.pane) orelse return;
+                const pane = &session.panes.items[pane_index];
+                if (pane.exited) return;
+                _ = pane.pty.write(input.data) catch {};
             },
             .resize => |resize| {
                 const index = self.findSession(resize.name.slice()) orelse return;
                 try self.resizeSession(index, resize.rows, resize.cols);
+            },
+            .split => |split| {
+                const index = self.findSession(split.name.slice()) orelse
+                    return Error.UnknownSession;
+                try self.splitSession(index, split.axis, split.program);
+            },
+            .close => |close| {
+                const index = self.findSession(close.name.slice()) orelse
+                    return Error.UnknownSession;
+                try self.closeFocusedPane(index);
+            },
+            .focus => |focus| {
+                const index = self.findSession(focus.name.slice()) orelse
+                    return Error.UnknownSession;
+                const session = &self.sessions.items[index];
+                if (focus.backwards) {
+                    _ = session.tree.focusPrevious();
+                } else {
+                    _ = session.tree.focusNext();
+                }
+                try self.sendLayout(session);
             },
         }
     }
 
     fn sendListing(self: *Server, client: usize) !void {
         for (self.sessions.items) |*session| {
+            // The listing shows the session's area and the pane count, since a session
+            // is no longer one program with one size.
+            const first_pane: i32 = if (session.panes.items.len > 0)
+                session.panes.items[0].pty.child
+            else
+                0;
             try self.sendEvent(client, .{ .session = .{
                 .name = session.name,
                 .rows = session.rows,
                 .cols = session.cols,
                 .clients = @intCast(session.watchers.items.len),
-                .pid = session.pty.child,
-                .running = !session.exited,
+                .pid = first_pane,
+                .running = !session.allExited(),
             } });
         }
         try self.sendEvent(client, .list_end);
     }
 
+    /// Split the focused pane, starting `program` in the new half.
+    ///
+    /// The new pane is created before the tree is told about it, so that a failure to
+    /// start the program leaves the layout as it was rather than a tree naming a pane
+    /// that does not exist.
+    fn splitSession(self: *Server, index: usize, axis: u8, program: []const u8) !void {
+        const session = &self.sessions.items[index];
+
+        var arguments: [64][]const u8 = undefined;
+        const count = protocol.splitProgram(program, &arguments);
+
+        const direction: layout.Axis = if (axis == 1) .vertical else .horizontal;
+
+        // The new pane starts at the whole area and is corrected by the relayout
+        // below. Starting it at a guess at the split's size would give the program a
+        // screenful of output at the wrong width before the first resize arrives.
+        _ = try self.addPane(
+            session,
+            arguments[0..count],
+            direction,
+            fullArea(session.rows, session.cols),
+        );
+
+        try session.relayout();
+        try self.sendLayout(session);
+    }
+
+    /// Close the focused pane, giving its space to its sibling's subtree.
+    fn closeFocusedPane(self: *Server, index: usize) !void {
+        const session = &self.sessions.items[index];
+        const pane_index = session.focusedPane() orelse return;
+
+        const id = session.panes.items[pane_index].id;
+        var doomed = session.panes.swapRemove(pane_index);
+        self.unregister(doomed.pty.master);
+        _ = linux.kill(doomed.pty.child, linux.SIG.HUP);
+        doomed.deinit(self.gpa);
+
+        _ = session.tree.close(id) catch null;
+
+        try session.relayout();
+        try self.sendLayout(session);
+    }
+
+    /// Tell every watcher where the panes are and which one has focus.
+    fn sendLayout(self: *Server, session: *Session) !void {
+        // The layout event borrows the placements list, so it is encoded and queued
+        // before `relayout` runs again and rewrites it.
+        var placements: [protocol.Decoder.max_panes]protocol.PanePlacement = undefined;
+        var count: usize = 0;
+        for (session.panes.items) |pane| {
+            if (count == placements.len) break;
+            placements[count] = .{
+                .id = pane.id,
+                .rect = .{
+                    .x = pane.rect.x,
+                    .y = pane.rect.y,
+                    .width = pane.rect.width,
+                    .height = pane.rect.height,
+                },
+                .exited = pane.exited,
+            };
+            count += 1;
+        }
+
+        try self.broadcast(session, .{ .layout = .{
+            .name = session.name,
+            .area_rows = session.rows,
+            .area_cols = session.cols,
+            .focused = session.tree.focused orelse 0,
+            .panes = placements[0..count],
+        } });
+    }
+
     fn attachClient(self: *Server, client: usize, index: usize, rows: u16, cols: u16) !void {
         const session = &self.sessions.items[index];
 
-        // The pty is sized to this client, which is the compromise for several
+        // The session's area is sized to this client, which is the compromise for several
         // clients sharing a session: the newest one to attach wins.
         try self.resizeSession(index, rows, cols);
 
@@ -497,9 +808,10 @@ pub const Server = struct {
             .cols = session.cols,
         } });
 
-        // The screen as it stands, so a reattaching client sees the current
-        // state rather than only what happens next.
-        try self.sendScreen(client, index);
+        // The layout and then every pane's screen, so a reattaching client sees the
+        // current arrangement rather than only what happens next.
+        try self.sendLayout(session);
+        try self.sendSessionScreens(session, client);
     }
 
     fn removeWatcher(self: *Server, session_index: usize, client: usize) bool {
@@ -518,7 +830,7 @@ pub const Server = struct {
         var session = &self.sessions.items[index];
         try self.broadcast(session, .{ .exited = .{
             .name = session.name,
-            .status = session.status,
+            .status = exitStatusOf(session),
         } });
 
         for (session.watchers.items) |client| {
@@ -526,100 +838,116 @@ pub const Server = struct {
         }
         session.watchers.clearRetainingCapacity();
 
-        self.unregister(session.pty.master);
-        // The child is signalled before the pty goes, so it does not linger.
-        _ = linux.kill(session.pty.child, linux.SIG.HUP);
+        // Each pane's child is signalled before its pty goes, so none of them lingers with
+        // nothing left to reach it.
+        for (session.panes.items) |pane| {
+            self.unregister(pane.pty.master);
+            _ = linux.kill(pane.pty.child, linux.SIG.HUP);
+        }
         session.deinit(self.gpa);
         _ = self.sessions.swapRemove(index);
     }
 
     fn resizeSession(self: *Server, index: usize, rows: u16, cols: u16) !void {
-        var session = &self.sessions.items[index];
+        const session = &self.sessions.items[index];
         if (rows == 0 or cols == 0) return;
         if (session.rows == rows and session.cols == cols) return;
 
-        session.pty.setWindowSize(.{ .rows = rows, .cols = cols }) catch {};
-        session.terminal.resize(cols, rows, 0, 0) catch {};
         session.rows = rows;
         session.cols = cols;
 
-        // The screen reflowed, so every watcher is told the new size and
-        // re-sent the screen; a client that only saw the following output would
-        // be drawing at the wrong width.
+        // `relayout` divides the new area and applies each pane's size to its pty, which
+        // is what makes the programs inside reflow. It only touches panes whose rectangle
+        // actually changed, so a resize that leaves a pane alone does not send it a
+        // spurious SIGWINCH.
+        try session.relayout();
+
+        try self.sendLayout(session);
+
+        // The area changed, so every watcher is told the new size and re-sent each pane's
+        // screen. A client that only saw the following output would still be drawing the
+        // old geometry.
         for (session.watchers.items) |client| {
             try self.sendEvent(client, .{ .attached = .{
                 .name = session.name,
                 .rows = rows,
                 .cols = cols,
             } });
-            try self.sendScreen(client, index);
+            try self.sendSessionScreens(session, client);
         }
     }
 
-    /// Read the pty and forward whatever arrived.
-    fn serviceSession(self: *Server, index: usize) !void {
-        var session = &self.sessions.items[index];
+    /// Read one pane's pty and forward whatever arrived to every watcher.
+    fn servicePane(self: *Server, session_index: usize, pane_index: usize) !void {
+        const session = &self.sessions.items[session_index];
+        if (pane_index >= session.panes.items.len) return;
+        const pane = &session.panes.items[pane_index];
 
-        const read = session.pty.read(session.read_buffer) catch |err| switch (err) {
+        const read = pane.pty.read(pane.read_buffer) catch |err| switch (err) {
             pty_mod.Error.Closed => {
-                // The slave closed, so the child is gone even if the exit status
-                // has not been collected yet.
-                try self.sessionEnded(index, session.status);
+                // The slave closed, so the child is gone even if the exit status has not
+                // been collected yet. A pane whose child has exited keeps its screen, so
+                // this is not the same as closing it.
+                try self.paneEnded(session_index, pane_index, pane.status);
                 return;
             },
             else => return err,
         };
         if (read == 0) return;
 
-        session.terminal.write(session.read_buffer[0..read]);
+        pane.terminal.write(pane.read_buffer[0..read]);
 
-        // Replies the parser produced go back to the program before any output
-        // is forwarded, because a program waiting on one is not producing more.
-        if (session.reply.items.len > 0) {
-            _ = session.pty.write(session.reply.items) catch {};
-            session.reply.clearRetainingCapacity();
-        }
+        // Replies the parser produced go back to the program before any output is
+        // forwarded, because a program waiting on one is not producing more.
+        pane.flushReply();
 
-        // The bytes are forwarded unchanged. The client has its own terminal and
-        // parses them itself, which is what lets the two sides disagree about
-        // the screen without the server having to reconcile them.
+        // The bytes are forwarded unchanged, tagged with the pane. The client has its
+        // own terminal per pane and parses them itself, which is what lets the two sides
+        // disagree about the screen without the server having to reconcile them.
         try self.broadcast(session, .{ .output = .{
             .name = session.name,
-            .data = session.read_buffer[0..read],
+            .pane = pane.id,
+            .data = pane.read_buffer[0..read],
         } });
     }
 
     fn reapChildren(self: *Server) void {
-        var index: usize = 0;
-        while (index < self.sessions.items.len) : (index += 1) {
-            const session = &self.sessions.items[index];
-            if (session.exited) continue;
-            const status = session.pty.reap() orelse continue;
-            // A signalled child is reported the way a shell would: 128 plus the
-            // signal number. The clamp is on the sum rather than on the signal,
-            // because `@min(signal, 127)` narrows to `u7` and 128 does not fit in
-            // it.
-            const code: u8 = if (status.signaled)
-                @intCast(@min(@as(u32, 128) + status.signal, 255))
-            else
-                status.code;
-            self.sessionEnded(index, code) catch {};
+        for (self.sessions.items, 0..) |*session, session_index| {
+            for (session.panes.items, 0..) |*pane, pane_index| {
+                if (pane.exited) continue;
+                const status = pane.pty.reap() orelse continue;
+                self.paneEnded(session_index, pane_index, exitCode(status)) catch {};
+            }
         }
     }
 
-    fn sessionEnded(self: *Server, index: usize, status: u8) !void {
-        const session = &self.sessions.items[index];
-        if (session.exited) return;
-        session.exited = true;
-        session.status = status;
-        // The pty stays open so a client that attaches later still sees the
-        // final screen, but its readability is no longer of interest.
-        self.unregister(session.pty.master);
+    /// Mark one pane's program as finished, keeping its screen.
+    ///
+    /// The pane is not removed: a program that has exited still has a last screen worth
+    /// looking at, and the user closes the pane when they are done with it.
+    fn paneEnded(self: *Server, session_index: usize, pane_index: usize, status: u8) !void {
+        const session = &self.sessions.items[session_index];
+        if (pane_index >= session.panes.items.len) return;
+        const pane = &session.panes.items[pane_index];
+        if (pane.exited) return;
 
-        try self.broadcast(session, .{ .exited = .{
-            .name = session.name,
-            .status = status,
-        } });
+        pane.exited = true;
+        pane.status = status;
+
+        // The pty stays open so that a client attaching later still sees the final
+        // screen, but its readability is no longer of interest.
+        self.unregister(pane.pty.master);
+
+        try self.sendLayout(session);
+
+        // A session whose every pane has finished is reported once, so that a client
+        // attached to it can say so rather than waiting for output that will never come.
+        if (session.allExited()) {
+            try self.broadcast(session, .{ .exited = .{
+                .name = session.name,
+                .status = status,
+            } });
+        }
     }
 
     /// Queue an event for one client.
@@ -645,17 +973,36 @@ pub const Server = struct {
     /// row. The client parses it with the terminal it already has, so there is
     /// no second rendering path and no snapshot API to keep in step with
     /// libghostty-vt.
-    fn sendScreen(self: *Server, client: usize, session_index: usize) !void {
-        var session = &self.sessions.items[session_index];
+    /// Send a client the current screen of every pane in a session.
+    fn sendSessionScreens(self: *Server, session: *Session, client: usize) !void {
+        for (session.panes.items, 0..) |_, pane_index| {
+            try self.sendPaneScreen(client, session, pane_index);
+        }
+    }
+
+    /// Send a client one pane's screen as a fresh VT byte stream.
+    ///
+    /// The stream is the sequences that would produce the pane's screen, not a snapshot
+    /// of it: the client already has a terminal, so re-emitting cursor moves and text
+    /// reuses the one libghostty-vt rendering path rather than adding a second that has
+    /// to track the library.
+    fn sendPaneScreen(
+        self: *Server,
+        client: usize,
+        session: *Session,
+        pane_index: usize,
+    ) !void {
+        if (pane_index >= session.panes.items.len) return;
+        const pane = &session.panes.items[pane_index];
 
         var screen: std.ArrayList(u8) = .empty;
         defer screen.deinit(self.gpa);
 
-        // Clear and home first, so any previous contents on the client are
-        // replaced rather than partially overwritten.
+        // Clear and home first, so any previous contents on the client are replaced
+        // rather than partially overwritten.
         try screen.appendSlice(self.gpa, "\x1b[2J\x1b[H");
 
-        var render = session.terminal.createRenderState() catch return;
+        var render = pane.terminal.createRenderState() catch return;
         defer render.deinit();
 
         var painter = ScreenPainter{ .buffer = &screen, .gpa = self.gpa };
@@ -665,6 +1012,7 @@ pub const Server = struct {
 
         try self.sendEvent(client, .{ .output = .{
             .name = session.name,
+            .pane = pane.id,
             .data = screen.items,
         } });
     }
@@ -835,6 +1183,33 @@ const CellCollector = struct {
 
 /// Receive the bytes the terminal wants sent to the program.
 ///
+/// A child's exit status as one byte, the way a shell reports it.
+///
+/// A signalled child is 128 plus the signal number. The clamp is on the sum rather
+/// than on the signal, because `@min(signal, 127)` narrows to `u7` and 128 does not
+/// fit in it.
+fn exitCode(status: pty_mod.ExitStatus) u8 {
+    if (status.signaled) return @intCast(@min(@as(u32, 128) + status.signal, 255));
+    return status.code;
+}
+
+/// The status to report for a session whose every pane has finished.
+///
+/// The last pane to exit is the one that explains why the session ended, so its status
+/// is the one worth reporting. A session with no panes left reports success.
+fn exitStatusOf(session: *Session) u8 {
+    var last: u8 = 0;
+    for (session.panes.items) |pane| {
+        if (pane.exited) last = pane.status;
+    }
+    return last;
+}
+
+/// The size of a whole session area, for the first pane in it.
+fn fullArea(rows: u16, cols: u16) pty_mod.Size {
+    return .{ .rows = rows, .cols = cols };
+}
+
 /// This runs inside `vt_write`, so it may only append to a buffer. Writing to
 /// the pty from here would reenter the parser.
 fn onWritePty(
@@ -844,14 +1219,18 @@ fn onWritePty(
     len: usize,
 ) callconv(.c) void {
     _ = terminal;
-    // The userdata is the `ReplyRoute` stored in the session, whose address is
-    // stable because the session lives in the server's list and the route is a
-    // field of it that is never moved while it is registered.
+    // The userdata is the `ReplyRoute` stored in the pane. It names the pane rather
+    // than pointing at it, because the pane list reallocates as panes are added and a
+    // pointer into it would not survive the next split.
     const route: *ReplyRoute = @ptrCast(@alignCast(userdata.?));
-    // A failed allocation would lose a reply and hang the program, but there is
-    // no way to report it from a C callback. The missing reply surfaces as a
-    // stalled program instead.
-    route.buffer.appendSlice(route.gpa, data[0..len]) catch {};
+    const session_index = route.server.findSession(route.session.slice()) orelse return;
+    const pane_index = route.server.sessions.items[session_index].findPane(route.pane) orelse return;
+
+    // A failed allocation would lose a reply and hang the program, but there is no way
+    // to report it from a C callback. The missing reply surfaces as a stalled program
+    // instead.
+    const pane = &route.server.sessions.items[session_index].panes.items[pane_index];
+    pane.reply.appendSlice(route.server.gpa, data[0..len]) catch {};
 }
 
 test "removing a client rewrites the indices of the one moved into its slot" {
@@ -871,12 +1250,13 @@ test "removing a client rewrites the indices of the one moved into its slot" {
     };
     defer {
         server.encoder.deinit();
-        // The sessions are fabricated, so their terminals were never created and
-        // only their lists need freeing. Their `watchers` and `reply` are the
-        // allocations.
+        // The sessions are fabricated, so no terminals or ptys were created; only the
+        // lists each one owns need freeing, plus the tree.
         for (server.sessions.items) |*session| {
             session.watchers.deinit(gpa);
-            session.reply.deinit(gpa);
+            session.placements.deinit(gpa);
+            session.panes.deinit(gpa);
+            session.tree.deinit();
         }
         server.sessions.deinit(gpa);
         server.clients.deinit(gpa);
@@ -885,14 +1265,9 @@ test "removing a client rewrites the indices of the one moved into its slot" {
     // Four clients, with three sessions watching various of them.
     for (0..4) |_| try server.clients.append(gpa, .{ .connection = .{ .fd = -1 } });
     for (0..3) |_| {
-        const session: Session = .{
-            .name = try protocol.Name.init("s"),
-            .pty = .{ .master = -1, .child = 0 },
-            .terminal = undefined,
-            .rows = 24,
-            .cols = 80,
-            .read_buffer = &.{},
-        };
+        var session = Session.init(gpa, try protocol.Name.init("s"));
+        session.rows = 24;
+        session.cols = 80;
         try server.sessions.append(gpa, session);
     }
 

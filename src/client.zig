@@ -40,29 +40,84 @@ pub const Mode = enum {
     query,
 };
 
+/// One remote pane, as the client sees it: its own terminal, its own renderer, and the
+/// rectangle the server says it occupies.
+///
+/// One terminal per pane rather than one per session, because each program has its own
+/// screen. The server sends each pane's bytes tagged with its identifier, so this side
+/// dispatches without having to parse anything to know where they belong.
+const RemotePane = struct {
+    id: u64,
+    terminal: vt.Terminal,
+    render: vt.RenderState,
+    renderer: terminal_mod.Renderer,
+    /// Where the server says this pane goes, in window cells.
+    rect: protocol.Rect = .{ .x = 0, .y = 0, .width = 0, .height = 0 },
+    /// Set when the server reports this pane's program has exited.
+    exited: bool = false,
+    /// Bytes this pane's terminal wants sent to its program, waiting for the socket.
+    reply: std.ArrayList(u8) = .empty,
+    /// The handle the terminal holds; heap-allocated and owned here.
+    ///
+    /// Separate from the pane because `setWritePty` keeps the pointer and the pane list
+    /// reorders when a pane is closed, which would leave the terminal pointing at a pane
+    /// that a `swapRemove` moved into its slot.
+    route: *PaneRoute = undefined,
+    /// Reused scratch for one row's text while painting.
+    line: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *RemotePane, gpa: std.mem.Allocator) void {
+        gpa.destroy(self.route);
+        self.reply.deinit(gpa);
+        self.line.deinit(gpa);
+        self.renderer.deinit();
+        self.render.deinit();
+        self.terminal.deinit();
+    }
+};
+
+/// What a pane's terminal callback needs to find its way back to the client.
+const PaneRoute = struct {
+    client: *Client,
+    pane: u64,
+};
+
+/// Bytes waiting for a pane the client has not been told about yet.
+const PendingOutput = struct {
+    pane: u64,
+    data: std.ArrayList(u8) = .empty,
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     connection: socket.Connection,
     mode: Mode,
-    /// The screen being drawn. Only a session client has one.
-    terminal: ?vt.Terminal = null,
-    render: ?vt.RenderState = null,
+    /// The panes the server says this session has.
+    panes: std.ArrayList(RemotePane) = .empty,
+    /// The pane the server says has focus, by identifier. Input is addressed to it.
+    focused: u64 = 0,
+    /// Set between the prefix key and the key that follows it.
+    prefix_armed: bool = false,
+    /// Output that arrived for panes this client has not been told about yet.
+    ///
+    /// Each entry is one pane and the bytes waiting for it. Replayed when the layout event
+    /// that creates the pane arrives; a pane that never appears leaves its bytes here until
+    /// the client exits, which is bounded by how much a program can print between a split
+    /// and its own layout event.
+    pending: std.ArrayList(PendingOutput) = .empty,
+    /// The area the panes share, which is the window minus the status row.
+    area_rows: u16 = 0,
+    area_cols: u16 = 0,
     /// The local terminal, when there is one.
     local: ?terminal_mod.Terminal = null,
-    renderer: ?terminal_mod.Renderer = null,
-    /// The one-row status line along the bottom of the window. Its row belongs to
-    /// zmux, so the session's terminal is one row shorter than the window.
+    /// The one-row status line along the bottom of the window. Its row belongs to zmux,
+    /// so the session's area is one row shorter than the window.
     status: ?terminal_mod.StatusLine = null,
     /// The session being watched.
     watching: protocol.Name = .{},
-    /// Set when the server reports that the session's program has ended, so the
-    /// status line can say so rather than claiming it is still live.
+    /// Set when the server reports that the session's program has ended, so the status
+    /// line can say so rather than claiming it is still live.
     exited: bool = false,
-    /// Replies the terminal generated while parsing, waiting for the socket.
-    reply: std.ArrayList(u8) = .empty,
-    /// The handle the terminal holds while it parses. Points at this client, so
-    /// the callback can find the reply buffer.
-    write_context: vt.WritePtyContext = undefined,
     frame: socket.FrameReader = .{},
     /// Bytes waiting to go to the server.
     outgoing: std.ArrayList(u8) = .empty,
@@ -71,8 +126,8 @@ pub const Client = struct {
     finished: bool = false,
     /// Set when the server rejected a request.
     ///
-    /// A query exits non-zero on this, because a script needs to tell "the
-    /// listing was empty" from "the session you named does not exist".
+    /// A query exits non-zero on this, because a script needs to tell "the listing was
+    /// empty" from "the session you named does not exist".
     failed: bool = false,
     /// The status the session's program exited with, when the server said so.
     exit_status: ?u8 = null,
@@ -110,14 +165,15 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        // The terminal points at this client for its reply callback, so it goes
-        // first, and the local terminal is restored last.
+        // The panes' terminals point at this client for their reply callbacks, so they go
+        // first; the local terminal is restored last, since the screen is written to it
+        // until then.
         self.frame.deinit(self.gpa);
         self.outgoing.deinit(self.gpa);
-        self.reply.deinit(self.gpa);
-        if (self.render) |*render| render.deinit();
-        if (self.terminal) |*terminal| terminal.deinit();
-        if (self.renderer) |*renderer| renderer.deinit();
+        for (self.panes.items) |*pane| pane.deinit(self.gpa);
+        self.panes.deinit(self.gpa);
+        for (self.pending.items) |*entry| entry.data.deinit(self.gpa);
+        self.pending.deinit(self.gpa);
         if (self.status) |*status| status.deinit(self.gpa);
         if (self.local) |*local| local.leave();
         self.encoder.deinit();
@@ -183,57 +239,29 @@ pub const Client = struct {
         errdefer local.leave();
         self.local = local;
 
-        // The client's terminal is the authority on size, and it is read after
-        // entering raw mode because that is when the size query is meaningful.
-        const probed = local.size() catch terminal_mod.vtSize{ .rows = rows, .cols = cols };
-        const window_size = terminal_mod.vtSize{
-            .rows = if (probed.rows == 0) rows else probed.rows,
-            .cols = if (probed.cols == 0) cols else probed.cols,
-        };
-        const initial_session = sessionSize(window_size);
-
-        var terminal = try vt.Terminal.init(.{
-            .cols = initial_session.cols,
-            .rows = initial_session.rows,
-        });
-        errdefer terminal.deinit();
-
-        var render = try terminal.createRenderState();
-        errdefer render.deinit();
-
-        var renderer = try terminal_mod.Renderer.init(self.gpa, initial_session.rows);
-        errdefer renderer.deinit();
-
         var status = terminal_mod.StatusLine.init();
         errdefer status.deinit(self.gpa);
-
-        self.terminal = terminal;
-        self.render = render;
-        self.renderer = renderer;
         self.status = status;
 
-        // The terminal's replies (cursor position reports and so on) belong to
-        // the program in the session, so they travel back over the socket. The
-        // context points at this client, whose address is stable because it is
-        // heap-allocated.
-        self.write_context = .{ .owner = @ptrCast(self) };
-        self.terminal.?.setWritePty(&self.write_context, onWritePty);
+        // The panes are not created here. The server decides how many there are and where
+        // they go, and sends a layout event saying so; this side makes a terminal per pane
+        // when that arrives. Creating one up front would mean guessing how many the
+        // session has.
 
-        // The window may be resized while attached, and the kernel signals this
-        // process rather than the program on the far side of the pty, so the new
-        // size is read here and sent on as a request. `SIGWINCH`'s default action
-        // is to be ignored, so a client that failed to claim it would simply
-        // never notice a resize.
+        // The window may be resized while attached, and the kernel signals this process
+        // rather than the programs on the far side of the pty, so the new size is read
+        // here and sent on as a request. `SIGWINCH`'s default action is to be ignored, so
+        // a client that failed to claim it would simply never notice a resize.
         var signals = try signal_mod.Source.init(&.{linux.SIG.WINCH});
         defer signals.deinit();
 
         const epfd = try createPoll(self.connection.fd, 0, signals.fd);
         defer _ = linux.close(epfd);
 
-        var window = window_size;
-        // `session` is mutable so that a resize can change it; the initial value
-        // was computed above to size the terminal.
-        var session = sessionSize(window);
+        var window = terminal_mod.vtSize{
+            .rows = if (rows == 0) 24 else rows,
+            .cols = if (cols == 0) 80 else cols,
+        };
         var buffer: [16 * 1024]u8 = undefined;
         while (!self.finished) {
             var events: [8]linux.epoll_event = undefined;
@@ -245,50 +273,39 @@ pub const Client = struct {
                 const fd = event.data.fd;
                 if (fd == signals.fd) {
                     if (try signals.drain() == 0) continue;
-                    // The signal itself carries no size, so the terminal is asked
-                    // for the new one. A failed query leaves the size alone rather
-                    // than resizing to zero.
+                    // The signal itself carries no size, so the terminal is asked for the
+                    // new one. A failed query leaves the size alone rather than resizing
+                    // to zero.
                     if (self.local) |local_terminal| {
                         if (local_terminal.size() catch null) |resized| {
                             if (resized.rows == 0 or resized.cols == 0) continue;
-                            // A window too short to hold both the status line and a
-                            // row of the program is not worth rearranging for; the
-                            // program keeps the size it had rather than being given
-                            // a zero-row terminal.
+                            // A window too short to hold both the status line and a row of
+                            // the programs is not worth rearranging for; they keep the size
+                            // they had rather than being given zero-row terminals.
                             if (resized.rows < 2) continue;
                             if (resized.rows == window.rows and resized.cols == window.cols) continue;
 
                             window = resized;
-                            session = sessionSize(window);
                             try self.sendRequest(.{ .resize = .{
                                 .name = self.watching,
-                                .rows = session.rows,
-                                .cols = session.cols,
+                                .rows = window.rows - 1,
+                                .cols = window.cols,
                             } });
 
-                            // The local screen is now the wrong shape, so it is
-                            // rebuilt at the new size. The renderer's dirty table is
-                            // resized with it, and everything is marked for repaint
-                            // because every row has moved.
-                            self.terminal.?.resize(
-                                session.cols,
-                                session.rows,
-                                0,
-                                0,
-                            ) catch {};
-                            self.renderer.?.resize(session.rows) catch {};
+                            // The server answers with a fresh layout, which resizes every
+                            // pane's terminal and repaints. Clearing first means the rows
+                            // the old arrangement occupied are not left behind.
                             try self.local.?.writeAll("\x1b[2J");
-                            self.draw(window, session);
                         }
                     }
                 } else if (fd == 0) {
-                    if (try self.handleLocalInput(session)) return;
+                    if (try self.handleLocalInput()) return;
                 } else {
                     const read = self.connection.read(&buffer) catch return;
                     if (read == 0) continue;
                     try self.frame.feed(self.gpa, buffer[0..read], self, Client.onMessage);
                     if (self.finished) break;
-                    self.draw(window, session);
+                    self.draw(window);
                 }
             }
         }
@@ -298,11 +315,11 @@ pub const Client = struct {
         if (self.finished) return;
     }
 
-    /// The size the session's terminal gets: the window minus the status row.
+    /// The size the session's area gets: the window minus the status row.
     ///
-    /// Clamped so that a window of one row still leaves the program a row to draw
-    /// in. A terminal with no rows is rejected by libghostty-vt, and a session with
-    /// no screen is worse than a status line that has to share.
+    /// Clamped so that a window of one row still leaves the programs a row to draw in. A
+    /// terminal with no rows is rejected by libghostty-vt, and the status line giving up
+    /// its row is better than the programs having nowhere to draw.
     fn sessionSize(window: terminal_mod.vtSize) terminal_mod.vtSize {
         return .{
             .rows = if (window.rows > 1) window.rows - 1 else 1,
@@ -312,17 +329,22 @@ pub const Client = struct {
 
     /// Compose the text of the status line.
     ///
-    /// Kept to plain fields with no colour, so that it stays legible on whatever
-    /// palette the user has, and truncated by the caller if the window is narrow.
-    fn statusText(self: *Client, buffer: []u8, session: terminal_mod.vtSize) []const u8 {
+    /// Kept to plain fields with no colour, so that it stays legible on whatever palette
+    /// the user has. Truncation is the caller's job, since it knows the window width.
+    fn statusText(self: *Client, buffer: []u8) []const u8 {
         const name = if (self.watching.len > 0) self.watching.slice() else "-";
         const state = if (self.exited) "exited" else "running";
-        return std.fmt.bufPrint(buffer, " zmux | {s} | {d}x{d} | {s} | ctrl-a detach", .{
-            name,
-            session.cols,
-            session.rows,
-            state,
-        }) catch buffer[0..0];
+        return std.fmt.bufPrint(
+            buffer,
+            " zmux | {s} | {d}x{d} | {d} pane(s) | {s} | ctrl-a: s/v split, q close, h/j/k/l focus",
+            .{
+                name,
+                self.area_cols,
+                self.area_rows,
+                self.panes.items.len,
+                state,
+            },
+        ) catch buffer[0..0];
     }
 
     /// Repaint the screen and the status line from the last state the server sent.
@@ -330,47 +352,124 @@ pub const Client = struct {
     /// `window` and `session` are carried rather than read back from `self`,
     /// because the status row is the window's last row while the screen is the
     /// session's, and the two differ by exactly that row.
-    fn draw(self: *Client, window: terminal_mod.vtSize, session: terminal_mod.vtSize) void {
-        const terminal = &(self.terminal orelse return);
-        const render = &(self.render orelse return);
-        const renderer = &(self.renderer orelse return);
+    /// Repaint every pane and then the status line.
+    ///
+    /// Each pane is drawn into its own rectangle, which the server computed. The panes
+    /// tile the session's area, so nothing overlaps and no clearing is needed between
+    /// them; the status line is drawn last because it owns the one row below the area.
+    fn draw(self: *Client, window: terminal_mod.vtSize) void {
         const local = self.local orelse return;
 
-        if (self.reply.items.len > 0) {
-            const payload = self.encoder.writeRequest(.{ .input = .{
-                .name = self.watching,
-                .data = self.reply.items,
-            } }) catch {
-                self.reply.clearRetainingCapacity();
-                return;
-            };
-            socket.encode(&self.outgoing, self.gpa, payload) catch {};
-            self.reply.clearRetainingCapacity();
-            self.flush() catch {};
+        // Replies the panes' terminals produced while parsing go back to the programs
+        // they belong to, before anything is painted.
+        self.flushPaneReplies();
+
+        for (self.panes.items) |*pane| {
+            self.drawPane(pane);
         }
 
-        render.update(terminal.*) catch return;
-        renderer.render(local, render.*) catch {};
-
-        // The status line goes last, so that nothing the screen painter does can
-        // overwrite it. It owns the final row of the window.
         if (self.status) |*status| {
             var text_buffer: [256]u8 = undefined;
-            const text = self.statusText(&text_buffer, session);
-            status.render(
-                self.gpa,
-                local,
-                window.rows - 1,
-                text,
-                window.cols,
-            ) catch {};
+            const text = self.statusText(&text_buffer);
+            status.render(self.gpa, local, window.rows - 1, text, window.cols) catch {};
         }
+    }
+
+    /// Paint one pane's screen inside its rectangle.
+    ///
+    /// The pane's terminal is exactly the size of the rectangle the server gave it, so
+    /// painting is a matter of moving the cursor to the rectangle's origin and writing the
+    /// rows in order. The rectangle may have moved since the last frame, in which case
+    /// every row is painted whether or not the library thinks it changed.
+    fn drawPane(self: *Client, pane: *RemotePane) void {
+        const local = self.local orelse return;
+        const rect = pane.rect;
+        if (rect.width == 0 or rect.height == 0) return;
+
+        pane.render.update(pane.terminal) catch return;
+
+        var row_index: u16 = 0;
+        const Painter = struct {
+            local: terminal_mod.Terminal,
+            pane: *RemotePane,
+            rect: protocol.Rect,
+            row_index: *u16,
+            gpa: std.mem.Allocator,
+
+            fn visit(painter: *@This(), row: *vt.RowIterator) bool {
+                defer painter.row_index.* += 1;
+                if (painter.row_index.* >= painter.rect.height) return false;
+
+                // Move to this row's first column inside the pane's rectangle, erase the
+                // row, and write the cells. Erasing matters because a row that got shorter
+                // would otherwise keep the tail of the previous frame.
+                var buffer: [32]u8 = undefined;
+                const move = std.fmt.bufPrint(
+                    &buffer,
+                    "\x1b[{d};{d}H\x1b[K",
+                    .{ painter.rect.y + painter.row_index.* + 1, painter.rect.x + 1 },
+                ) catch return false;
+                painter.local.writeAll(move) catch return false;
+
+                painter.pane.line.clearRetainingCapacity();
+                _ = row.forEachCell(painter, collect) catch return false;
+
+                // Clipped to the rectangle so that a wide row cannot run into the pane
+                // beside it, which would corrupt the neighbour's screen. A pane's terminal
+                // is made exactly as wide as the rectangle, so this only bites when the two
+                // disagree, which is the case worth defending against.
+                const text = if (painter.pane.line.items.len > painter.rect.width)
+                    painter.pane.line.items[0..painter.rect.width]
+                else
+                    painter.pane.line.items;
+                painter.local.writeAll(text) catch return false;
+                return true;
+            }
+
+            fn collect(painter: *@This(), cell: *vt.CellIterator) void {
+                var codepoints: [8]u32 = undefined;
+                var utf8: [32]u8 = undefined;
+                const bytes = cell.graphemesUtf8(&codepoints, &utf8);
+                if (bytes.len == 0) {
+                    painter.pane.line.append(painter.gpa, ' ') catch {};
+                    return;
+                }
+                painter.pane.line.appendSlice(painter.gpa, bytes) catch {};
+            }
+        };
+
+        var painter = Painter{
+            .local = local,
+            .pane = pane,
+            .rect = rect,
+            .row_index = &row_index,
+            .gpa = self.gpa,
+        };
+        pane.render.forEachRow(&painter, Painter.visit) catch {};
+    }
+
+    /// Send every pane's accumulated terminal replies to the program that provoked them.
+    fn flushPaneReplies(self: *Client) void {
+        for (self.panes.items) |*pane| {
+            if (pane.reply.items.len == 0) continue;
+            const payload = self.encoder.writeRequest(.{ .input = .{
+                .name = self.watching,
+                .pane = pane.id,
+                .data = pane.reply.items,
+            } }) catch {
+                pane.reply.clearRetainingCapacity();
+                continue;
+            };
+            socket.encode(&self.outgoing, self.gpa, payload) catch {};
+            pane.reply.clearRetainingCapacity();
+        }
+        self.flush() catch {};
     }
 
     /// Handle a keystroke from the local terminal.
     ///
     /// Returns true when the user asked to detach.
-    fn handleLocalInput(self: *Client, size: terminal_mod.vtSize) !bool {
+    fn handleLocalInput(self: *Client) !bool {
         var buffer: [256]u8 = undefined;
         const read = std.posix.read(0, &buffer) catch |err| switch (err) {
             error.WouldBlock => return false,
@@ -382,46 +481,126 @@ pub const Client = struct {
         defer payload.deinit(self.gpa);
 
         for (buffer[0..read]) |byte| {
-            if (try self.handleByte(byte, &payload, size)) return true;
+            if (try self.handleByte(byte, &payload)) return true;
         }
 
-        // Everything typed is accumulated into one request rather than one per
-        // byte, so that pasting a long line does not become a burst of messages.
-        if (payload.items.len > 0 and self.watching.len > 0) {
-            try self.sendRequest(.{ .input = .{
-                .name = self.watching,
-                .data = payload.items,
-            } });
-        }
+        // Everything typed is accumulated into one request rather than one per byte, so
+        // that pasting a long line does not become a burst of messages.
+        try self.sendInput(payload.items);
         return false;
     }
 
+    /// Handle one keystroke, returning true when the client should detach.
+    ///
+    /// Ctrl-a is the prefix. On its own it detaches, as it did before panes existed; followed
+    /// by one of the command keys it acts on the layout instead. The prefix is armed by the
+    /// first byte and consumed by the second, so a prefix followed by a key the layout does
+    /// not use falls back to detaching rather than being swallowed.
     fn handleByte(
         self: *Client,
         byte: u8,
         payload: *std.ArrayList(u8),
-        size: terminal_mod.vtSize,
     ) !bool {
-        // Ctrl-a is the prefix, as in tmux. It detaches rather than forwarding.
-        if (byte == 0x01) {
-            if (self.watching.len > 0) {
-                try self.sendRequest(.{ .detach = .{ .name = self.watching } });
-            }
-            return true;
+        if (self.prefix_armed) {
+            self.prefix_armed = false;
+            return self.handleCommand(byte);
         }
 
-        // Everything else is forwarded raw. The program's own terminal decides
-        // what the bytes mean: re-encoding them here would discard whatever the
-        // key encoder in the server-side screen and the program itself have
-        // already agreed on.
+        if (byte == 0x01) {
+            // The prefix takes effect on the next byte; a prefix that is never followed
+            // by anything means the user pressed ctrl-a and stopped, which detaches so
+            // that a bare ctrl-a keeps working.
+            self.prefix_armed = true;
+            return false;
+        }
+
+        // Everything else is forwarded raw. The program's own terminal decides what the
+        // bytes mean: re-encoding them here would discard whatever the program and its own
+        // terminal have already agreed on.
         try payload.append(self.gpa, byte);
-        _ = size;
         return false;
+    }
+
+    /// Act on the key that followed the prefix.
+    ///
+    /// Returns true when the client should detach.
+    fn handleCommand(self: *Client, byte: u8) !bool {
+        switch (byte) {
+            // `s` splits the focused pane side by side, and a second `s` stacks.
+            's' => {
+                try self.sendRequest(.{ .split = .{
+                    .name = self.watching,
+                    .axis = 0,
+                    .program = &.{},
+                } });
+                return false;
+            },
+            'v' => {
+                try self.sendRequest(.{ .split = .{
+                    .name = self.watching,
+                    .axis = 1,
+                    .program = &.{},
+                } });
+                return false;
+            },
+            'q' => {
+                try self.sendRequest(.{ .close = .{ .name = self.watching } });
+                return false;
+            },
+            // h/j/k/l move focus. They all map onto the tree's own order for now, which
+            // walks left to right and wraps; a direction-aware move needs the geometry the
+            // server already has and can come later.
+            'h', 'k' => {
+                try self.sendRequest(.{ .focus = .{
+                    .name = self.watching,
+                    .backwards = true,
+                } });
+                return false;
+            },
+            'l', 'j' => {
+                try self.sendRequest(.{ .focus = .{
+                    .name = self.watching,
+                    .backwards = false,
+                } });
+                return false;
+            },
+            // The prefix twice detaches, which is how a user who is used to ctrl-a ctrl-a
+            // gets out.
+            0x01 => {
+                if (self.watching.len > 0) {
+                    try self.sendRequest(.{ .detach = .{ .name = self.watching } });
+                }
+                return true;
+            },
+            else => {
+                // An unused key after the prefix detaches, so that ctrl-a followed by a
+                // typo does not leave the client sitting in a state where the next byte is
+                // eaten.
+                if (self.watching.len > 0) {
+                    try self.sendRequest(.{ .detach = .{ .name = self.watching } });
+                }
+                return true;
+            },
+        }
+    }
+
+    /// Send keystrokes to the focused pane.
+    fn sendInput(self: *Client, data: []const u8) !void {
+        if (data.len == 0) return;
+        if (self.watching.len == 0 or self.focused == 0) return;
+        try self.sendRequest(.{ .input = .{
+            .name = self.watching,
+            .pane = self.focused,
+            .data = data,
+        } });
     }
 
     /// Handle one decoded event.
     fn onMessage(self: *Client, payload: []const u8) anyerror!void {
         var decoder = protocol.Decoder.init(payload);
+        // A frame that does not decode is ignored rather than fatal. The server and this
+        // client are the same version, so a malformed frame would mean one of them is wrong
+        // about the protocol, which is not something this side can repair by exiting.
         const event = decoder.event() catch return;
         try self.handleEvent(event);
     }
@@ -429,10 +608,23 @@ pub const Client = struct {
     fn handleEvent(self: *Client, event: protocol.Event) !void {
         switch (event) {
             .output => |output| {
-                // The bytes go straight into the parser. What is drawn is
-                // decided by `draw`, once everything the kernel had has been
-                // consumed.
-                if (self.terminal) |terminal| terminal.write(output.data);
+                // The bytes go straight into the parser of the pane they name. What is drawn
+                // is decided by `draw`, once everything the kernel had has been consumed.
+                //
+                // Output for a pane this client does not have yet is held rather than
+                // dropped. The server sends a pane's screen when a client attaches, and those
+                // events are ordered layout-then-output; but a split's output can reach a
+                // client whose layout event is still behind it in the same batch, and
+                // discarding those bytes would leave the new pane blank until its program
+                // happened to redraw.
+                const pane = self.findPane(output.pane) orelse {
+                    try self.holdOutput(output.pane, output.data);
+                    return;
+                };
+                pane.terminal.write(output.data);
+            },
+            .layout => |layout| {
+                try self.applyLayout(layout);
             },
             .session => |info| {
                 try self.printSession(info);
@@ -450,17 +642,19 @@ pub const Client = struct {
             .created => {},
             .exited => |exited| {
                 self.exit_status = exited.status;
-                // Recorded before finishing, so that the status line shows the
-                // session as ended rather than still live.
+                // Recorded before finishing, so that the status line shows the session as
+                // ended rather than still live.
                 self.exited = true;
                 if (self.local != null) {
+                    // Not fatal: the panes keep their final screens until the client is
+                    // told to leave. Saying so and staying attached is more useful than
+                    // tearing the screen down the moment the last program exits.
                     try self.err.print("\nzmux: session {s} exited with status {d}\n", .{
                         exited.name.slice(),
                         exited.status,
                     });
                     try self.err.flush();
                 }
-                self.finished = true;
             },
             .failure => |failure| {
                 try self.err.print("zmux: {s}\n", .{failure.message});
@@ -468,6 +662,148 @@ pub const Client = struct {
                 self.failed = true;
                 self.finished = true;
             },
+        }
+    }
+
+    /// Make the local panes match the layout the server just described.
+    ///
+    /// A layout event is the whole arrangement, not a delta, so this reconciles rather than
+    /// applies: panes the server no longer lists are torn down, panes it has added get a
+    /// terminal, and the rest have their rectangles and sizes updated in place. Rebuilding
+    /// every pane on each layout would throw away their screens and make a split flash.
+    fn applyLayout(self: *Client, layout: protocol.Layout) !void {
+        // Panes that vanished. Iterated backwards because removing reorders the list.
+        var index: usize = 0;
+        while (index < self.panes.items.len) {
+            const id = self.panes.items[index].id;
+            var still_there = false;
+            for (layout.panes) |placement| {
+                if (placement.id == id) {
+                    still_there = true;
+                    break;
+                }
+            }
+            if (still_there) {
+                index += 1;
+                continue;
+            }
+            var removed = self.panes.swapRemove(index);
+            removed.deinit(self.gpa);
+        }
+
+        for (layout.panes) |placement| {
+            const pane = self.findPane(placement.id) orelse blk: {
+                // A pane the server has that this client does not. Its terminal is made at
+                // the size the rectangle says, because that is the size its program was
+                // given.
+                break :blk try self.addPane(placement);
+            };
+            pane.rect = placement.rect;
+            pane.exited = placement.exited;
+            // The terminal is resized to match, so that the client's idea of the pane's
+            // shape agrees with the server's. Skipping this would leave a pane's screen
+            // wrapped for a width it no longer has.
+            if (placement.rect.width > 0 and placement.rect.height > 0) {
+                pane.terminal.resize(
+                    placement.rect.width,
+                    placement.rect.height,
+                    0,
+                    0,
+                ) catch {};
+                pane.renderer.resize(placement.rect.height) catch {};
+            }
+        }
+
+        self.focused = layout.focused;
+        self.area_rows = layout.area_rows;
+        self.area_cols = layout.area_cols;
+
+        // The session is finished when it has panes and every one of them has exited. A
+        // session with no panes at all is not finished: it is one whose last pane was closed
+        // and whose client has not been told to leave yet.
+        self.exited = self.panes.items.len > 0;
+        for (self.panes.items) |pane| {
+            if (!pane.exited) {
+                self.exited = false;
+                break;
+            }
+        }
+
+        // Any output that arrived ahead of this layout is fed to the panes it was waiting
+        // for, now that they exist.
+        self.replayPending();
+    }
+
+    /// Make a local pane to mirror one the server has.
+    fn addPane(self: *Client, placement: protocol.PanePlacement) !*RemotePane {
+        const cols = if (placement.rect.width == 0) 1 else placement.rect.width;
+        const rows = if (placement.rect.height == 0) 1 else placement.rect.height;
+
+        var terminal = try vt.Terminal.init(.{ .cols = cols, .rows = rows });
+        errdefer terminal.deinit();
+
+        var render = try terminal.createRenderState();
+        errdefer render.deinit();
+
+        var renderer = try terminal_mod.Renderer.init(self.gpa, rows);
+        errdefer renderer.deinit();
+
+        const route = try self.gpa.create(PaneRoute);
+        errdefer self.gpa.destroy(route);
+        route.* = .{ .client = self, .pane = placement.id };
+
+        try self.panes.append(self.gpa, .{
+            .id = placement.id,
+            .terminal = terminal,
+            .render = render,
+            .renderer = renderer,
+            .rect = placement.rect,
+            .exited = placement.exited,
+            .route = route,
+        });
+
+        const pane = &self.panes.items[self.panes.items.len - 1];
+        // Replies this pane's terminal generates belong to the program in that pane, so the
+        // callback has to know which one it is.
+        pane.terminal.setWritePty(@ptrCast(route), onPaneWritePty);
+        return pane;
+    }
+
+    fn findPane(self: *Client, id: u64) ?*RemotePane {
+        for (self.panes.items) |*pane| {
+            if (pane.id == id) return pane;
+        }
+        return null;
+    }
+
+    /// Hold bytes that arrived for a pane the layout has not described yet.
+    fn holdOutput(self: *Client, pane: u64, data: []const u8) !void {
+        for (self.pending.items) |*entry| {
+            if (entry.pane == pane) {
+                try entry.data.appendSlice(self.gpa, data);
+                return;
+            }
+        }
+        var entry = PendingOutput{ .pane = pane };
+        try entry.data.appendSlice(self.gpa, data);
+        try self.pending.append(self.gpa, entry);
+    }
+
+    /// Feed held bytes to the panes they were waiting for, and forget them.
+    ///
+    /// Called after a layout has been applied, so that a pane whose bytes arrived before it
+    /// was created catches up in the order they were produced.
+    fn replayPending(self: *Client) void {
+        var index: usize = 0;
+        while (index < self.pending.items.len) {
+            const entry = &self.pending.items[index];
+            const pane = self.findPane(entry.pane) orelse {
+                index += 1;
+                continue;
+            };
+            pane.terminal.write(entry.data.items);
+            var done = self.pending.swapRemove(index);
+            done.data.deinit(self.gpa);
         }
     }
 
@@ -484,19 +820,24 @@ pub const Client = struct {
     }
 
     /// Receive bytes the client's terminal wants sent to the program.
-    fn onWritePty(
+    /// Receive bytes one pane's terminal wants sent to that pane's program.
+    ///
+    /// This runs inside `vt_write`, so it may only append to a buffer. Writing to the
+    /// socket from here would reenter the parser, and the reply would be built out of the
+    /// state the parser is halfway through changing.
+    fn onPaneWritePty(
         terminal: vt.c.GhosttyTerminal,
         userdata: ?*anyopaque,
         data: [*c]const u8,
         len: usize,
     ) callconv(.c) void {
         _ = terminal;
-        // `userdata` is the context stored in the client. The owner is the
-        // client itself, which is heap-allocated so this address stays valid for
-        // as long as the terminal holds it.
-        const context: *vt.WritePtyContext = @ptrCast(@alignCast(userdata.?));
-        const self: *Client = @ptrCast(@alignCast(context.owner));
-        self.reply.appendSlice(self.gpa, data[0..len]) catch {};
+        // The userdata is this pane's route, which is its own allocation so that its
+        // address survives the pane list reordering.
+        const route: *PaneRoute = @ptrCast(@alignCast(userdata.?));
+        const client = route.client;
+        const pane = client.findPane(route.pane) orelse return;
+        pane.reply.appendSlice(client.gpa, data[0..len]) catch {};
     }
 };
 

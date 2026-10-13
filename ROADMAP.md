@@ -295,7 +295,7 @@ so an option whose value name matches a positional's shifts the positional's slo
 `--name`.
 
 
-## Phase 4 — multiple panes
+## Phase 4 — multiple panes (done)
 
 - Workspace binary tree with `ratio`-based splits
 - Layout computation from the tree
@@ -305,6 +305,56 @@ so an option whose value name matches a positional's shifts the positional's slo
 
 Judgement: several programs run side by side, each responding to input, with
 resizing that reflows correctly.
+
+### What was built
+
+A session is now a list of panes plus the tree that says where they go. Each pane owns
+one pty and one parsed terminal, so two panes are two programs and two screens. The
+server divides the session's area into rectangles and tells the client where they are;
+the client keeps one terminal per pane and paints each into its rectangle.
+
+The split between the two sides is deliberate. The server owns the tree, so it computes
+the geometry and sizes each pane's pty from its rectangle — one place where a width is
+decided, which is what keeps a program from being told a size the client is not drawing.
+The client owns nothing but the pixels: it parses each pane's bytes into its own
+terminal and positions the rows.
+
+Geometry is computed on every layout and never stored, so a resize is one walk of the
+tree rather than a migration of stored coordinates that could disagree with it.
+
+Input carries the pane it is meant for rather than relying on which pane is focused. A
+keystroke already in flight when focus moves must reach the pane the user was typing
+into, and focus is the server's idea, read later.
+
+Key bindings are vim-flavoured behind the existing `ctrl-a` prefix: `s` splits side by
+side, `v` stacks, `q` closes the focused pane, and `h`/`j`/`k`/`l` move focus. A bare
+`ctrl-a` twice still detaches, and a prefix followed by an unused key detaches rather
+than being swallowed.
+
+Verified: an attached client at 80x24 shows the first pane's text on row 1 and the status
+line reading `1 pane(s)`. Sending `ctrl-a s` produces `2 pane(s)`, and the client's output
+contains cursor moves at columns 1 and 41 — the two halves of the window — so both panes
+are painting. Detach, resize (`winch 39 100` from a program that traps `WINCH`), `kill` and
+`kill-all` all still behave. `zig build test` passes 73 tests, including 16 for the tree
+and 14 for the protocol. Checked with both a `zig build` and a `nix build` binary.
+
+### Two bugs this phase found
+
+**A reply was computed and then thrown away.** The server flushes a client's queue at the
+end of `serviceClient`, but the read that *follows* a request commonly reports the peer's
+close — a client that has sent one request and is waiting for the answer still shows up
+that way. That path returned early, discarding the listing it had just built. The symptom
+was `zmux ls` printing nothing while the server's own log said it had sent the listing,
+and the fix is to flush on the way out of every path, including the ones that end the
+connection.
+
+**The first pane had no rectangle.** `addPane` puts a leaf in the tree, but a rectangle is
+what the tree produces, and `createSession` never asked for one. The layout event therefore
+carried a zero-width, zero-height pane, and the client skipped it because there was nowhere
+to draw. The pane's screen was being parsed and sent correctly the whole time; only its
+geometry was missing. `createSession` now calls `relayout` after adding the first pane.
+This one is worth remembering because it is invisible in the code that looks responsible:
+the drawing, the sizing and the protocol were all right.
 
 ## Phase 5 — floating panes
 

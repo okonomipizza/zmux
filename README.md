@@ -17,7 +17,7 @@ and the TUI. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and
 
 ## Status
 
-Phases 0, 0.5, 1, 2 and 3 of the roadmap are complete. Escape sequence handling
+Phases 0, 0.5, 1, 2, 3 and 4 of the roadmap are complete. Escape sequence handling
 comes from libghostty-vt, the command line is parsed with
 [zig-clap](https://github.com/Hejsil/zig-clap), and there is a server that owns
 the sessions.
@@ -39,6 +39,20 @@ zmux kill build
 zmux kill-all
 ```
 
+Inside an attached session the prefix key is `ctrl-a`:
+
+| key | action |
+| --- | --- |
+| `ctrl-a s` | split the focused pane side by side |
+| `ctrl-a v` | split it into stacked halves |
+| `ctrl-a q` | close the focused pane |
+| `ctrl-a h` / `k` | move focus to the previous pane |
+| `ctrl-a l` / `j` | move focus to the next pane |
+| `ctrl-a ctrl-a` | detach, leaving every pane running |
+
+Each pane is its own program on its own pty, so a split gives two shells side by
+side. A pane whose program exits keeps its last screen until the pane is closed.
+
 A session's pty and screen live in the server, so detaching costs the session
 nothing: the program keeps running while nothing is watching, and reattaching
 redraws the screen as it stands. A server is started on first use and keeps
@@ -59,9 +73,9 @@ is useful for inspecting what zmux makes of a byte stream:
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-Not yet built: panes and splits, floating panes, copy mode, and configuration.
-`zmux detach` outside an attached client reports that, because the prefix key is
-how a client detaches. See [ROADMAP.md](ROADMAP.md).
+Not yet built: floating panes, copy mode, and configuration. `zmux detach` outside
+an attached client reports that, because the prefix key is how a client detaches.
+See [ROADMAP.md](ROADMAP.md).
 
 ## Development
 
@@ -120,11 +134,12 @@ src/pty.zig         pty allocation, child spawning, raw fd I/O
 src/terminal.zig    the local terminal: raw mode, the screen renderer, and the
                     status line
 src/session.zig     the single-pane event loop from phase 1
+src/layout.zig      the pane tree: splits, ratios, and rectangle computation
 src/socket.zig      unix sockets and length-prefixed message framing
 src/protocol.zig    the client/server message set and its encoding
 src/runtime.zig     where the socket lives, and starting a server on demand
 src/server.zig      the session registry and its epoll loop
-src/client.zig      attach, detach, and rendering what the server sends
+src/client.zig      attach, detach, one terminal per pane, and painting the layout
 src/signal.zig      signals delivered as a descriptor, for SIGWINCH
 tools/drive.zig     test driver that plays keystrokes into a program
 flake.nix           dev shell, package, and formatter

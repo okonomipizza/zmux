@@ -186,24 +186,26 @@ pub const Event = union(enum) {
     },
     /// The session's panes and their geometry, sent whenever the layout changes.
     ///
-    /// This is the whole layout rather than a delta, because the client's job is to
-    /// draw the current arrangement and a delta would let it drift from the server's
-    /// tree with no way to notice. The list is empty when the session has no panes
-    /// left.
-    layout: struct {
-        name: Name,
-        /// The rectangle all the panes share, which is the area the client has for
-        /// the session. Panes are positioned inside it.
-        area_rows: u16,
-        area_cols: u16,
-        /// The pane holding focus, or zero when there is none.
-        focused: u64,
-        panes: []const PanePlacement,
-    },
+    /// This is the whole layout rather than a delta, because the client's job is to draw
+    /// the current arrangement and a delta would let it drift from the server's tree with
+    /// no way to notice. The list is empty when the session has no panes left.
+    layout: Layout,
     /// A request was rejected, or a listing is empty.
     failure: struct {
         message: []const u8,
     },
+};
+
+/// The whole arrangement of a session's panes.
+pub const Layout = struct {
+    name: Name,
+    /// The rectangle all the panes share, which is the area the client has for the
+    /// session. Panes are positioned inside it.
+    area_rows: u16,
+    area_cols: u16,
+    /// The pane holding focus, or zero when there is none.
+    focused: u64,
+    panes: []const PanePlacement,
 };
 
 /// One pane's identity and position within a session.
@@ -597,40 +599,42 @@ pub const Decoder = struct {
                 .pane = try self.u64le(),
                 .data = try self.blob(),
             } },
-            Tag.layout => Event{ .layout = blk: {
-                const session_name = try self.name();
-                const area_rows = try self.u16le();
-                const area_cols = try self.u16le();
-                const focused = try self.u64le();
-                const count = try self.u16le();
+            Tag.layout => Event{
+                .layout = blk: {
+                    const session_name = try self.name();
+                    const area_rows = try self.u16le();
+                    const area_cols = try self.u16le();
+                    const focused = try self.u64le();
+                    const count = try self.u16le();
 
-                // The placements are decoded field by field into the caller's
-                // buffer. Reinterpreting the message bytes as `[]PanePlacement`
-                // would be faster and wrong: the wire format is packed, the struct
-                // has alignment and padding, and a peer could hand over bytes that
-                // happen to parse as a different length than they occupy.
-                if (count > self.placements.len) return Error.BadLength;
-                var index: usize = 0;
-                while (index < count) : (index += 1) {
-                    self.placements[index] = .{
-                        .id = try self.u64le(),
-                        .rect = .{
-                            .x = try self.u16le(),
-                            .y = try self.u16le(),
-                            .width = try self.u16le(),
-                            .height = try self.u16le(),
-                        },
-                        .exited = (try self.u8le()) != 0,
+                    // The placements are decoded field by field into the caller's
+                    // buffer. Reinterpreting the message bytes as `[]PanePlacement`
+                    // would be faster and wrong: the wire format is packed, the struct
+                    // has alignment and padding, and a peer could hand over bytes that
+                    // happen to parse as a different length than they occupy.
+                    if (count > self.placements.len) return Error.BadLength;
+                    var index: usize = 0;
+                    while (index < count) : (index += 1) {
+                        self.placements[index] = .{
+                            .id = try self.u64le(),
+                            .rect = .{
+                                .x = try self.u16le(),
+                                .y = try self.u16le(),
+                                .width = try self.u16le(),
+                                .height = try self.u16le(),
+                            },
+                            .exited = (try self.u8le()) != 0,
+                        };
+                    }
+                    break :blk .{
+                        .name = session_name,
+                        .area_rows = area_rows,
+                        .area_cols = area_cols,
+                        .focused = focused,
+                        .panes = self.placements[0..index],
                     };
-                }
-                break :blk .{
-                    .name = session_name,
-                    .area_rows = area_rows,
-                    .area_cols = area_cols,
-                    .focused = focused,
-                    .panes = self.placements[0..index],
-                };
-            } },
+                },
+            },
             Tag.failure => Event{ .failure = .{ .message = try self.blob() } },
             else => Error.UnknownTag,
         };
