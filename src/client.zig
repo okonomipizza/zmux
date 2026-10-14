@@ -390,7 +390,20 @@ pub const Client = struct {
                     var rounds: usize = 0;
                     var drew = false;
                     while (rounds < 32) : (rounds += 1) {
-                        const read = self.connection.read(&buffer) catch return;
+                        // A server that goes away without saying so has to be reported. This used to
+                        // return silently: the terminal was restored and the user was left at their
+                        // shell with the window they had been working in simply gone, and nothing
+                        // anywhere to say whether it had crashed or been killed. A `kill` or
+                        // `kill-all` sends an event first, so reaching here means the server died.
+                        const read = self.connection.read(&buffer) catch |err| {
+                            try self.err.print(
+                                "\nzmux: lost the server ({s}); the session is gone\n",
+                                .{@errorName(err)},
+                            );
+                            try self.err.flush();
+                            self.finished = true;
+                            return;
+                        };
                         try self.frame.feed(self.gpa, buffer[0..read], self, Client.onMessage);
                         if (self.finished) break;
                         drew = true;
@@ -1575,10 +1588,18 @@ pub const Client = struct {
                     // kept a finished session; now that it discards one, staying would leave the
                     // client showing a dead window whose only content is this message. Detaching
                     // restores the terminal zmux was started from, with the status above it.
-                    try self.err.print("\nzmux: session {s} exited with status {d}\n", .{
-                        exited.name.slice(),
-                        exited.status,
-                    });
+                    // A killed session did not exit, so there is no status to report. Printing one
+                    // would tell the user their program had finished at the moment they destroyed it.
+                    if (exited.killed) {
+                        try self.err.print("\nzmux: session {s} was killed\n", .{
+                            exited.name.slice(),
+                        });
+                    } else {
+                        try self.err.print("\nzmux: session {s} exited with status {d}\n", .{
+                            exited.name.slice(),
+                            exited.status,
+                        });
+                    }
                     try self.err.flush();
                 }
                 self.finished = true;
@@ -2460,6 +2481,7 @@ test "a finished session detaches the client rather than leaving the window up" 
     try client.handleEvent(.{ .exited = .{
         .name = try protocol.Name.init("s"),
         .status = 3,
+        .killed = false,
     } });
     try std.testing.expect(client.finished);
     try std.testing.expect(client.exited);

@@ -728,11 +728,31 @@ today.
 
 ## Phase 6 — hardening
 
-- A client disconnecting mid-write must not take down the session
-- A pane whose child exits keeps its final screen until closed
-- Server restart behaviour: sessions are lost, but the client reports it clearly
-- Bound per-session memory; large scrollback is the main consumer
-- Recover from `EINTR` and partial writes on the socket
+Done:
+
+- `EINTR` is retried on the socket's read, write and accept. It was reported as
+  `SyscallFailed`, and the write path drops the client on any failure, so a signal
+  arriving mid-write ended a connection that was perfectly healthy. The retry cannot
+  spin: the descriptors are non-blocking, so a second call returns `EAGAIN`.
+- A `kill` or `kill-all` now says the session was *killed* rather than reporting an exit
+  status. `killSession` broadcast `exitStatusOf`, which is zero when no pane has exited,
+  so destroying a session with programs still running told the user their program had
+  finished successfully. The event carries an explicit flag, because no status value could
+  mean "not an exit": 255 is reachable from `exit(255)` and from signal 127.
+- A client whose server goes away reports it instead of returning silently. It used to
+  restore the terminal and leave the user at their shell with the window simply gone.
+
+Still open:
+
+- Bound per-session memory; large scrollback is the main consumer. The configuration sets a
+  32 MiB byte limit per pane, which is a deliberate ceiling rather than a measured one.
+- Server restart behaviour: sessions are lost, but the client reports it clearly. The report
+  is now clearer, but nothing survives a restart.
+- **Unverified:** a server that dies while a client is attached, rather than one that is
+  killed by `kill-all`. The message is written and reachable, but driving it needs the
+  server's own pid, and `zmux ls` reports the *pane's* pid. Killing that is an ordinary
+  program exit, which is what three attempts at the probe did before this was noticed —
+  each one looked like confirmation that the fix was needed.
 
 ## Open questions
 

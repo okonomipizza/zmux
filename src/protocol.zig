@@ -250,7 +250,14 @@ pub const Event = union(enum) {
     exited: struct {
         name: Name,
         /// The exit status, or 128 + signal when the program was signalled.
+        ///
+        /// Meaningless when `killed` is set, because then no program exited: the session was
+        /// destroyed by `kill` or `kill-all` while its programs were still running. Reporting the
+        /// status anyway told the user a program they had just destroyed had exited successfully,
+        /// which is the one thing a destructive command must not do.
         status: u8,
+        /// Whether the session was destroyed rather than ending on its own.
+        killed: bool,
     },
     /// Output from one pane's program, exactly as it left the pty.
     ///
@@ -551,6 +558,7 @@ pub const Encoder = struct {
                 try self.begin(Tag.exited);
                 try self.name(&exited.name);
                 try self.u8le(exited.status);
+                try self.u8le(if (exited.killed) 1 else 0);
             },
             .output => |output| {
                 // The pane identifier precedes the payload so that a client can
@@ -753,6 +761,7 @@ pub const Decoder = struct {
             Tag.exited => Event{ .exited = .{
                 .name = try self.name(),
                 .status = try self.u8le(),
+                .killed = (try self.u8le()) != 0,
             } },
             Tag.output => Event{ .output = .{
                 .name = try self.name(),
@@ -1369,4 +1378,53 @@ test "a layout move survives a round trip" {
             else => return error.WrongRequest,
         }
     }
+}
+
+test "a killed session and an exited one are told apart on the wire" {
+    // A session destroyed by `kill` or `kill-all` has no exit status to report: nothing exited. The
+    // client has to be able to tell the two apart, because printing a status for a session the user
+    // just destroyed says the program finished, which is the opposite of what happened.
+    //
+    // A sentinel status would not do: 255 is a real status, from `exit(255)` or a signal numbered 127,
+    // so there is no value left over to mean "not an exit". The flag is explicit for that reason.
+    const gpa = std.testing.allocator;
+
+    var encoder = Encoder.init(gpa);
+    defer encoder.deinit();
+
+    const name = try Name.init("build");
+
+    const killed_frame = try encoder.writeEvent(.{ .exited = .{
+        .name = name,
+        .status = 0,
+        .killed = true,
+    } });
+    var killed_decoder = Decoder.init(killed_frame);
+    const killed = try killed_decoder.event();
+    try std.testing.expect(killed.exited.killed);
+    try std.testing.expectEqualStrings("build", killed.exited.name.slice());
+
+    const exited_frame = try encoder.writeEvent(.{
+        .exited = .{
+            .name = name,
+            // The same status, so that only the flag distinguishes them.
+            .status = 0,
+            .killed = false,
+        },
+    });
+    var exited_decoder = Decoder.init(exited_frame);
+    const exited = try exited_decoder.event();
+    try std.testing.expect(!exited.exited.killed);
+    try std.testing.expectEqualStrings("build", exited.exited.name.slice());
+
+    // A signal's status round-trips too: 128 + 9 is what a killed child reports.
+    const signalled_frame = try encoder.writeEvent(.{ .exited = .{
+        .name = name,
+        .status = 137,
+        .killed = false,
+    } });
+    var signalled_decoder = Decoder.init(signalled_frame);
+    const signalled = try signalled_decoder.event();
+    try std.testing.expect(!signalled.exited.killed);
+    try std.testing.expectEqual(@as(u8, 137), signalled.exited.status);
 }

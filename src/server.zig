@@ -798,10 +798,16 @@ pub const Server = struct {
             .list => try self.sendListing(client),
             .kill_all => {
                 for (self.sessions.items) |*session| {
-                    try self.broadcast(session, .{ .exited = .{
-                        .name = session.name,
-                        .status = exitStatusOf(session),
-                    } });
+                    try self.broadcast(session, .{
+                        .exited = .{
+                            .name = session.name,
+                            .status = exitStatusOf(session),
+                            // Every one of these sessions is being destroyed with its programs still
+                            // running. Reporting the status would say they had finished, which is the
+                            // opposite of what the user just asked for.
+                            .killed = true,
+                        },
+                    });
                     for (session.panes.items) |pane| {
                         // The child is signalled before the pty goes, so no process is
                         // left behind with nothing to reach it.
@@ -851,7 +857,7 @@ pub const Server = struct {
             .kill => |kill| {
                 const index = self.findSession(kill.name.slice()) orelse
                     return Error.UnknownSession;
-                try self.killSession(index);
+                try self.killSession(index, true);
             },
             .switch_session => |move| {
                 // Letting go of the old session first is what makes this safe. A client that
@@ -1214,7 +1220,7 @@ pub const Server = struct {
         const tiled_after = if (closing_is_tiled and tiled_now > 0) tiled_now - 1 else tiled_now;
 
         if (tiled_after < 1) {
-            try self.killSession(index);
+            try self.killSession(index, true);
             return;
         }
 
@@ -1358,11 +1364,18 @@ pub const Server = struct {
     }
 
     /// End a session, telling its watchers and releasing its resources.
-    fn killSession(self: *Server, index: usize) !void {
+    /// Discard a session, telling its watchers why it went away.
+    ///
+    /// `killed` says whether the session was destroyed while its programs were still running, as
+    /// opposed to ending because the last program finished. The two look the same to a client
+    /// otherwise, and reporting an exit status for a session that nothing exited from told the user
+    /// the program had finished successfully at the moment they destroyed it.
+    fn killSession(self: *Server, index: usize, killed: bool) !void {
         var session = &self.sessions.items[index];
         try self.broadcast(session, .{ .exited = .{
             .name = session.name,
             .status = exitStatusOf(session),
+            .killed = killed,
         } });
 
         for (session.watchers.items) |client| {
@@ -1544,7 +1557,7 @@ pub const Server = struct {
         pane.exited = true;
         pane.status = status;
 
-        try self.killSession(session_index);
+        try self.killSession(session_index, false);
     }
 
     /// Queue an event for one client.

@@ -126,15 +126,20 @@ pub const Listener = struct {
     /// Returns null when the connection queue is empty, which is the normal
     /// outcome of a level-triggered epoll wakeup for more than one connection.
     pub fn accept(self: Listener) Error!?i32 {
-        const accepted = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC);
-        switch (linux.errno(accepted)) {
-            .SUCCESS => {
-                const fd: i32 = @intCast(accepted);
-                makeNonBlocking(fd);
-                return fd;
-            },
-            .AGAIN => return null,
-            else => return Error.SyscallFailed,
+        while (true) {
+            const accepted = linux.accept4(self.fd, null, null, linux.SOCK.CLOEXEC);
+            switch (linux.errno(accepted)) {
+                .SUCCESS => {
+                    const fd: i32 = @intCast(accepted);
+                    makeNonBlocking(fd);
+                    return fd;
+                },
+                .AGAIN => return null,
+                // Retried rather than reported, like the read and the write: a signal that arrived
+                // before the call did anything is not a reason to stop accepting connections.
+                .INTR => continue,
+                else => return Error.SyscallFailed,
+            }
         }
     }
 };
@@ -175,15 +180,24 @@ pub const Connection = struct {
     /// peer has gone. A zero-length read is how a stream socket reports end of
     /// file, but so is `ECONNRESET` after a peer that did not shut down
     /// cleanly; both are reported as closure.
+    ///
+    /// `EINTR` is retried rather than reported. It means a signal arrived before
+    /// the call did anything, so there is nothing to report and the call is
+    /// simply made again; treating it as failure would discard a healthy
+    /// connection because something unrelated interrupted it. The retry cannot
+    /// spin: the descriptor is non-blocking, so a second call returns `EAGAIN`
+    /// rather than waiting for a signal that has already been handled.
     pub fn read(self: Connection, buffer: []u8) Error!usize {
-        const result = linux.read(self.fd, buffer.ptr, buffer.len);
-        return switch (linux.errno(result)) {
-            .SUCCESS => if (result == 0) Error.Closed else result,
-            .AGAIN => 0,
-            .CONNRESET, .PIPE => Error.Closed,
-            .INTR => 0,
-            else => Error.SyscallFailed,
-        };
+        while (true) {
+            const result = linux.read(self.fd, buffer.ptr, buffer.len);
+            switch (linux.errno(result)) {
+                .SUCCESS => return if (result == 0) Error.Closed else result,
+                .AGAIN => return 0,
+                .CONNRESET, .PIPE => return Error.Closed,
+                .INTR => continue,
+                else => return Error.SyscallFailed,
+            }
+        }
     }
 
     /// Write as much of `bytes` as the kernel accepts.
@@ -191,15 +205,23 @@ pub const Connection = struct {
     /// A short write is possible and is reported to the caller rather than
     /// looped over, because the loop belongs with the queue that owns the
     /// unwritten tail.
+    ///
+    /// `EINTR` is retried for the same reason as in `read`, and it matters more
+    /// here: the caller treats any failure as the peer having gone and drops the
+    /// client, so reporting an interruption would end a connection that is
+    /// perfectly healthy.
     pub fn write(self: Connection, bytes: []const u8) Error!usize {
-        const written = linux.write(self.fd, bytes.ptr, bytes.len);
-        return switch (linux.errno(written)) {
-            .SUCCESS => written,
-            // A broken pipe on a socket is a hangup, not a signal.
-            .AGAIN => 0,
-            .CONNRESET, .PIPE => Error.Closed,
-            else => Error.SyscallFailed,
-        };
+        while (true) {
+            const written = linux.write(self.fd, bytes.ptr, bytes.len);
+            switch (linux.errno(written)) {
+                .SUCCESS => return written,
+                // A broken pipe on a socket is a hangup, not a signal.
+                .AGAIN => return 0,
+                .CONNRESET, .PIPE => return Error.Closed,
+                .INTR => continue,
+                else => return Error.SyscallFailed,
+            }
+        }
     }
 };
 
