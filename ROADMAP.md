@@ -792,8 +792,8 @@ What is still not written down is a bound on the total across a server rather th
 per pane. With the default lowered it is not needed yet: ten panes at a full history
 is about 14 MiB. It would be the shape a memory bound needs if the per-pane ceiling
 were ever raised again.
-- Server restart behaviour: sessions are lost, but the client reports it clearly. The report
-  is now clearer, but nothing survives a restart.
+- Server restart behaviour: settled as "nothing survives", which is what tmux does and
+  what the pinned library makes possible. See the open questions below for the detail.
 - **Unverified at the time, now verified:** a server that dies while a client is attached,
   rather than one killed by `kill-all`. The client prints `zmux: lost the server (Closed);
   the session is gone` and exits without inventing an exit status. Reaching it took three
@@ -805,10 +805,29 @@ were ever raised again.
 
 These are not yet decided. None of them block the remaining work.
 
-**Session persistence across a server restart.** libghostty-vt's headers
-describe a snapshot API, but the pinned build does not export those symbols, so
-serialising terminal state is not available today. Sessions are therefore lost
-when the server exits, and a client reports that the connection went away.
+**Session persistence across a server restart.** Settled as "nothing survives",
+which is what tmux does. Two things were checked rather than assumed.
+
+The pinned libghostty-vt exports no way to take a terminal's state out of it: the
+whole `ghostty_terminal_*` surface is `new`, `free`, `get`, `set`, `resize`,
+`reset`, `scroll_viewport`, `get_multi`, `grid_ref`, the `continuation_*` family
+for resuming a VT stream, and `vt_write`. There is no snapshot or serialise call,
+and the header's mention of snapshots is about a selection, not a screen. So
+saving a screen and restoring it is not something this dependency can do.
+
+The other thing is that tmux does not do it either. Killing a real tmux server
+leaves `tmux ls` reporting "no server running", and a `sleep 3000` running inside a
+pane is dead afterwards: tmux kills its programs with the server, exactly as zmux
+does. Persistence there is a plugin, not a property of the multiplexer.
+
+That settles the question in favour of doing nothing, and it is worth saying why
+doing nothing is the better answer rather than merely the easier one. The
+alternative available today is to remember the session name, the pane arrangement
+and each pane's working directory, and to start fresh shells in the same shape.
+What comes back looks like the session and is not: the editor's buffer, the build
+in progress and the scrollback are all gone, while the layout says otherwise. A
+restored-looking empty pane is a worse thing to hand a user than a clear message
+that the session ended, because the second one is true.
 
 **Several clients of different sizes.** Attaching resizes the session to the
 newest client's terminal, so two clients of different sizes fight over it. The

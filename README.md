@@ -156,6 +156,13 @@ nothing: the program keeps running while nothing is watching, and reattaching
 redraws the screen as it stands. A server is started on first use and keeps
 running until `kill-all`.
 
+Detaching is not the same as the server dying. If the server itself exits, every
+program in every session goes with it and nothing comes back: the panes, the
+scrollback and the programs' own state are gone, and a client that was attached
+says so and returns to the terminal zmux was started from. The library zmux draws
+with cannot export a screen, so there is nothing to save and restore. tmux behaves
+the same way.
+
 A key the prefix does not use does nothing at all. It used to detach, which meant
 a mistyped key ended the client and lost the session with it; tmux ignores the
 key, and the prefix is spent either way, so the next keystroke is an ordinary one
