@@ -220,6 +220,27 @@ which is how interactive programs are checked without a human at the keyboard:
 ./zig-out/bin/drive -- ./zig-out/bin/zmux attach test-session
 ```
 
+## Install
+
+With a flake, by attribute path:
+
+```nix
+inputs.zmux.url = "github:okonomipizza/zmux";
+
+home.packages = [ inputs.zmux.packages.${pkgs.system}.zmux ];
+```
+
+Or as an overlay, which makes `pkgs.zmux` exist like any other package:
+
+```nix
+nixpkgs.overlays = [ inputs.zmux.overlays.default ];
+
+home.packages = [ pkgs.zmux ];
+```
+
+The overlay carries the Zig overlay it needs along with it, so it is the only
+one to add.
+
 ## Build with Nix
 
 ```sh

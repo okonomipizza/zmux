@@ -34,8 +34,12 @@
     zigVersion = "0.16.0";
 
     forAllSystems = f: lib.mapAttrs (system: pkgs: f pkgs) pkgsFor;
-  in {
-    packages = forAllSystems (pkgs: let
+
+    # The package, as a function of a package set, so that `packages` and `overlays` describe the same
+    # build rather than two copies of it. An overlay is how most home-manager users prefer to install
+    # something -- it makes `pkgs.zmux` exist rather than requiring an attribute path into a flake --
+    # and having it call the same derivation is what keeps the two from drifting.
+    mkZmux = pkgs: let
       # Headers live in the `dev` output and the shared object in `out`, so the
       # build is pointed at the two separately.
       ghosttyVt = pkgs.libghostty-vt;
@@ -78,10 +82,8 @@
           runHook postBuild
         '';
       };
-    in {
-      default = self.packages.${pkgs.stdenv.hostPlatform.system}.zmux;
-
-      zmux = pkgs.stdenv.mkDerivation (finalAttrs: {
+    in
+      pkgs.stdenv.mkDerivation (finalAttrs: {
         pname = "zmux";
         version = "0.1.0";
         src = self;
@@ -137,7 +139,24 @@
           platforms = lib.platforms.linux;
         };
       });
+  in {
+    packages = forAllSystems (pkgs: {
+      default = self.packages.${pkgs.stdenv.hostPlatform.system}.zmux;
+      zmux = mkZmux pkgs;
     });
+
+    # `pkgs.zmux` for anyone who prefers an overlay, which is the usual way to
+    # install into home-manager: the attribute path into a flake is one more
+    # thing to know, and an overlay makes zmux look like any other package.
+    #
+    # The zig overlay is applied inside `mkZmux` rather than assumed here.
+    # `overlays.default` receives the consumer's `final`, and a nixpkgs without
+    # our zig overlay does not have `zigpkgs` at all -- so the first version of
+    # this produced `error: attribute 'zigpkgs' missing` for exactly the users
+    # the overlay is for.
+    overlays.default = final: prev: {
+      zmux = mkZmux (prev.extend zig.overlays.default);
+    };
 
     devShells = forAllSystems (pkgs: let
       ghosttyVt = pkgs.libghostty-vt;
