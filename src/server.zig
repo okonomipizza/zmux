@@ -262,7 +262,26 @@ const Session = struct {
     }
 
     /// The pane holding focus, if any.
+    /// The pane the user is working in, which is the raised float when one is up.
+    ///
+    /// A float is drawn on top and takes the keystrokes, so it is what the user is looking at and
+    /// what a command about "the pane" means. The tree's own focus is the tiled pane underneath, and
+    /// reading that would act on the pane behind the float instead of the float, which is not what
+    /// the key appears to do. The client makes the same choice when it routes input, and the two have
+    /// to agree or a command would act on one pane while the typing goes to another.
     fn focusedPane(self: *Session) ?usize {
+        if (self.focused_float) |id| {
+            if (self.findPane(id)) |index| return index;
+        }
+        return self.tiledFocus();
+    }
+
+    /// The pane the layout itself has focus on, ignoring any raised float.
+    ///
+    /// Used by the commands that are about the layout: floating a pane acts on the arrangement, and
+    /// the pane it means is the tiled one the user came from, not the float they are already looking
+    /// at. Floating a float is not a thing, so the raised float is not what this asks for.
+    fn tiledFocus(self: *Session) ?usize {
         const id = self.tree.focused orelse return null;
         return self.findPane(id);
     }
@@ -999,7 +1018,10 @@ pub const Server = struct {
     /// neighbour, so the remaining panes grow rather than leaving a hole.
     fn floatFocusedPane(self: *Server, index: usize) !void {
         const session = &self.sessions.items[index];
-        const pane_index = session.focusedPane() orelse return;
+        // The tiled focus, not the raised float: floating a pane is about the arrangement, and a
+        // float is already above it. Asking for the pane the user is working in would name the
+        // float and make the key do nothing whenever one is up.
+        const pane_index = session.tiledFocus() orelse return;
         const id = session.panes.items[pane_index].id;
 
         // The last tiled pane cannot be parked: a session with no layout has nothing to dock back
@@ -1179,10 +1201,19 @@ pub const Server = struct {
         const session = &self.sessions.items[index];
         const pane_index = session.focusedPane() orelse return;
 
-        // Closing the last pane closes the session, which is what a program exiting in it already
-        // does. A session with no panes has nothing to draw and nothing to attach to, and leaving
-        // one behind left the client attached to an empty window with a status line over it.
-        if (session.panes.items.len <= 1) {
+        // Closing the last tiled pane closes the session, which is what a program exiting in it
+        // already does. A session with no layout has nothing to draw: there is no rectangle to give
+        // a surviving float, since the layout is what produces rectangles.
+        //
+        // What is counted is the tiled panes that would be left *after* this one goes, not the tiled
+        // panes there are. Closing a float while one tile remains leaves that tile, and counting the
+        // tiles that exist rather than the ones that survive ended the session on the float instead.
+        const closing_id = session.panes.items[pane_index].id;
+        const closing_is_tiled = session.tree.contains(closing_id);
+        const tiled_now = session.tree.count();
+        const tiled_after = if (closing_is_tiled and tiled_now > 0) tiled_now - 1 else tiled_now;
+
+        if (tiled_after < 1) {
             try self.killSession(index);
             return;
         }
@@ -1456,15 +1487,21 @@ pub const Server = struct {
     /// layout keeps a dead rectangle that has to be closed by hand. The pane's final output is
     /// still forwarded first, so the last screen is not lost; what is lost is the pane itself.
     ///
-    /// The last pane is kept as a tombstone. Closing it would leave the session with no panes at
-    /// all, and a client with nothing to draw cannot tell a finished session from a broken one. It
-    /// is the pane that carries the exit status, and `q` closes it as usual.
+    /// What decides whether the session survives is how many *tiled* panes would be left, not how
+    /// many panes. A float is not in the tree, so a session whose last tiled pane exits has no
+    /// layout to give any pane a rectangle, and the window would come out blank. That is the state
+    /// `floatFocusedPane` refuses to create and `closeFocusedPane` now refuses as well; this is the
+    /// third place the same question is asked, so it is asked the same way.
     fn paneEnded(self: *Server, session_index: usize, pane_index: usize, status: u8) !void {
         const session = &self.sessions.items[session_index];
         if (pane_index >= session.panes.items.len) return;
         if (session.panes.items[pane_index].exited) return;
 
-        if (session.panes.items.len > 1) {
+        const tiled_before = session.tree.count();
+        const is_tiled = session.tree.contains(session.panes.items[pane_index].id);
+        const tiled_after = if (is_tiled and tiled_before > 0) tiled_before - 1 else tiled_before;
+
+        if (tiled_after >= 1) {
             try self.closePane(session_index, pane_index);
             try session.relayout();
             try self.sendLayout(session);
@@ -1478,10 +1515,12 @@ pub const Server = struct {
             return;
         }
 
-        // The only pane. Its program has finished, so the session has nothing left to run and is
-        // discarded: the window the user was working in goes away rather than being left as a dead
-        // rectangle that has to be closed by hand. The status is recorded first, because the exit
-        // event that `killSession` broadcasts carries the code the program actually returned.
+        // No tiled pane would be left, so the session has nothing to lay out and is discarded: the
+        // window the user was working in goes away rather than being left blank. The status is
+        // recorded first, because the exit event that `killSession` broadcasts carries it.
+        //
+        // A float whose program is still running goes with the session. There is no way to keep it:
+        // it has nothing to float above, and no rectangle, since the layout is what gives one.
         const pane = &session.panes.items[pane_index];
         pane.exited = true;
         pane.status = status;
@@ -2521,4 +2560,62 @@ test "a row whose cells could not all be written is abandoned, not sent short" {
     const before = dropped.items.len;
     refusing.collect(undefined);
     try std.testing.expectEqual(before, dropped.items.len);
+}
+
+test "a command about the focused pane means the raised float" {
+    // The float is drawn on top and takes the keystrokes, so it is what the user is looking at: a
+    // command about "the pane" has to act on it. Reading the tree's focus instead closed the tiled
+    // pane behind the float, which is not what the key appears to do, and the client routes input the
+    // other way, so the two disagreed about which pane was focused.
+    //
+    // The layout commands ask a different question and get a different answer: floating a pane is
+    // about the arrangement, and a float is already above it.
+    const gpa = std.testing.allocator;
+    var session = Session.init(gpa, try protocol.Name.init("s"));
+    defer {
+        session.panes.deinit(gpa);
+        session.floats.deinit(gpa);
+        session.watchers.deinit(gpa);
+        session.placements.deinit(gpa);
+        session.tree.deinit();
+    }
+
+    const tiled = session.tree.allocateId();
+    try session.tree.setRoot(tiled);
+    const parked = session.tree.allocateId();
+    try session.tree.split(tiled, .horizontal, parked);
+    try session.panes.append(gpa, .{
+        .id = tiled,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+    try session.panes.append(gpa, .{
+        .id = parked,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+
+    // The float is parked out of the tree and raised.
+    _ = try session.tree.detach(parked, session.cols, session.rows);
+    try session.floats.append(gpa, parked);
+    session.focused_float = parked;
+    // The tree's own focus is the pane left behind, which is a different pane.
+    try std.testing.expectEqual(@as(?layout.PaneId, tiled), session.tree.focused);
+
+    // The pane the user is working in is the float, and that is what a command acts on.
+    const focused = session.focusedPane().?;
+    try std.testing.expectEqual(parked, session.panes.items[focused].id);
+
+    // The layout commands ask for the tiled focus, which is the pane behind it.
+    const layout_focused = session.tiledFocus().?;
+    try std.testing.expectEqual(tiled, session.panes.items[layout_focused].id);
+
+    // Hiding the floats returns both answers to the same pane.
+    session.focused_float = null;
+    try std.testing.expectEqual(tiled, session.panes.items[session.focusedPane().?].id);
+    try std.testing.expectEqual(tiled, session.panes.items[session.tiledFocus().?].id);
+
+    // A raised float the client has not been told about falls back rather than failing.
+    session.focused_float = 9999;
+    try std.testing.expectEqual(tiled, session.panes.items[session.focusedPane().?].id);
 }
