@@ -389,10 +389,10 @@ into, and focus is the server's idea, read later.
 
 Key bindings are vim-flavoured behind the existing `ctrl-b` prefix: `\` splits side by
 side, `-` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
-`h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, `o`
-rotates the arrangement, `w` lists the sessions and switches to one, and `x` reads
-the focused pane's history. A bare `ctrl-b` twice still detaches, and a key the prefix
-does not use does nothing at all.
+`h`/`j`/`k`/`l` move focus, `m` numbers the panes to jump to one, `<`/`>` move the
+focused pane past its neighbour, `o` rotates the arrangement, `w` lists the sessions and
+switches to one, and `x` reads the focused pane's history. A bare `ctrl-b` twice still
+detaches, and a key the prefix does not use does nothing at all.
 
 The split keys were `s` and `v` until they were moved to `\` and `-`, which are the
 characters the splits are drawn with: a backslash leans the way the panes are laid out
@@ -411,6 +411,23 @@ float refuses the move outright, because a float has no rectangle in the layout 
 neighbour to reach. The swap and rotate keys keep the tree order they always had, which
 is a different question — "which pane comes next in the arrangement" rather than "which
 pane is over there" — and the README no longer claims the two orders are the same.
+
+Directions alone still cannot name every pane. With one pane above and two below, the
+pane below right shares no row with the pane above, so `l` from the top finds nothing
+and reaching it takes two moves; a diagonal is not a direction a key can point in without
+becoming ambiguous about which of several panes it meant. `ctrl-b m` numbers the tiled
+panes and jumps to the one whose number is pressed, which needs no geometry and so
+reaches any pane in one keystroke.
+
+The numbering reuses what dock-select already had: the labels, the inverse-video drawing
+in the middle of each pane's top row, and `labeledPane` on the client. What is new is
+that the label carries a second meaning, so the mode is a separate flag on both sides
+rather than a reuse of `docking` — docking also freezes the layout and hides the floats,
+and a plain focus move must not do either. The client is told which mode it is in, since
+a digit is a dock request in one and a focus request in the other, and those are not
+interchangeable. The two modes are kept from standing at once: asking for one drops the
+other, and raising a float or acting on a choice drops both, so a number cannot be left
+on screen for a question the user has moved on from.
 
 Closing the last pane discards the session, which is what a program exiting in it already
 did. It used to remove the pane and leave the session behind, so the client stayed attached

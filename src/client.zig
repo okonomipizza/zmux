@@ -143,6 +143,11 @@ pub const Client = struct {
     focused_float: u64 = 0,
     /// Set while the server is labelling the tiled panes for a dock target.
     docking: bool = false,
+    /// Set while the server is labelling the tiled panes so one can be picked to focus.
+    ///
+    /// Separate from `docking` even though both draw the same numbers, because a digit means a
+    /// different request in each and the mode is the only thing that says which.
+    focusing: bool = false,
     /// The sessions the server last listed, while the switch menu is open.
     ///
     /// Gathered from the `session` events that answer a `list` request, and held here rather than
@@ -479,6 +484,16 @@ pub const Client = struct {
             ) catch buffer[0..0];
         }
 
+        // The instruction has to name the keys the user can actually press, so it says what the
+        // digits do rather than only that the panes are numbered.
+        if (self.focusing) {
+            return std.fmt.bufPrint(
+                buffer,
+                " zmux | focus which pane? press 1-9, esc to cancel",
+                .{},
+            ) catch buffer[0..0];
+        }
+
         // Hidden floats are not in the layout, so the status line is the only place that says they
         // still exist. Without this a user would think they had been closed.
         if (self.floats_hidden) {
@@ -548,8 +563,10 @@ pub const Client = struct {
             if (pane.exited) self.drawExitedPane(pane);
         }
 
-        // While a dock target is being chosen, each tiled pane shows its number.
-        if (self.docking) {
+        // While a pane is being chosen -- to dock a float into, or to move focus to -- each tiled
+        // pane shows its number. Both modes draw the same way and differ only in what a digit then
+        // asks the server for.
+        if (self.docking or self.focusing) {
             for (self.panes.items) |*pane| {
                 if (pane.floating or pane.label == 0) continue;
                 self.drawPaneLabel(pane);
@@ -1105,6 +1122,40 @@ pub const Client = struct {
             return false;
         }
 
+        // While a pane is being picked to focus, a digit moves there. The same reading of the labels
+        // as docking, and the same consumption of the keystroke, but the request is the one that
+        // moves focus rather than the one that docks a float.
+        if (self.focusing) {
+            if (byte >= '1' and byte <= '9') {
+                const target = self.labeledPane(byte - '0');
+                if (target) |id| {
+                    // One keystroke is the whole choice, so the number is not held for an Enter.
+                    //
+                    // The mode is deliberately not cleared here, unlike docking. A refusal -- a pane
+                    // closed between the layout arriving and the digit being pressed -- sends no
+                    // layout event, so clearing locally would take the numbers off screen while the
+                    // server still believes the mode is on, and the next digit would be typed at a
+                    // menu the user can no longer see. Waiting for the layout event keeps the two
+                    // agreeing whatever the server decides.
+                    try self.sendRequest(.{ .focus_target = .{
+                        .name = self.watching,
+                        .pane = id,
+                    } });
+                }
+                return false;
+            }
+            // Escape leaves the choice without moving anything. The server is told so that it can
+            // stop numbering, since the labels are its idea and not the client's, and the flag is
+            // left for the layout event it answers with -- see the note above on why this side does
+            // not clear it early.
+            if (byte == 0x1B) {
+                try self.sendRequest(.{ .dock_cancel = .{ .name = self.watching } });
+                return false;
+            }
+            // Anything else is ignored rather than forwarded, for the same reason as docking.
+            return false;
+        }
+
         // While the history is being read, the movement keys move the viewport and everything else
         // is consumed. Nothing is forwarded: a program receiving a `j` the user meant as a scroll
         // would act on it, and the whole point of the mode is that the program is left alone.
@@ -1322,6 +1373,7 @@ pub const Client = struct {
         self.focused = 0;
         self.focused_float = 0;
         self.docking = false;
+        self.focusing = false;
         self.floats_hidden = false;
         self.exited = false;
     }
@@ -1379,6 +1431,8 @@ pub const Client = struct {
             'w'
         else if (byte == keybinds.scroll)
             'x'
+        else if (byte == keybinds.pane_select)
+            'm'
         else
             byte;
 
@@ -1477,6 +1531,14 @@ pub const Client = struct {
             // keeps running; the viewport is what moves.
             'x' => {
                 self.enterScroll();
+                return false;
+            },
+            // `m` numbers every tiled pane so one can be picked by name. It exists because the
+            // direction keys cannot always reach the pane the user means: in a layout of one pane
+            // above two, the pane below right shares no row with the pane above, so no single
+            // direction key points at it. Choosing from the numbers needs no geometry at all.
+            'm' => {
+                try self.sendRequest(.{ .focus_select = .{ .name = self.watching } });
                 return false;
             },
             // The prefix twice detaches, which is how a user who is used to pressing it twice gets
@@ -1726,6 +1788,7 @@ pub const Client = struct {
         self.focused = layout.focused;
         self.focused_float = layout.focused_float;
         self.docking = layout.docking;
+        self.focusing = layout.focusing;
         self.floats_hidden = layout.floats_hidden;
         self.area_rows = layout.area_rows;
         self.area_cols = layout.area_cols;

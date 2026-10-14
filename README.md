@@ -86,6 +86,7 @@ Inside an attached session the prefix key is `ctrl-b`:
 | `ctrl-b d` | dock a floating pane back into the layout |
 | `ctrl-b f` | hide the floating panes, or show them again |
 | `ctrl-b h` / `j` / `k` / `l` | move focus one pane left, down, up or right |
+| `ctrl-b m` | number the panes, then press a number to jump to it |
 | `ctrl-b <` / `>` | move the focused pane past its neighbour |
 | `ctrl-b o` | rotate every pane one place along |
 | `ctrl-b w` | list the sessions and switch to one |
@@ -99,6 +100,19 @@ reached by both of them, and the nearest pane that way wins. A direction with
 nothing in it moves nothing: in a row of three panes side by side, `j` and `k` do
 not move, and `l` in the rightmost pane stays where it is. Nothing wraps around
 to the other side, which would contradict the direction the key names.
+
+That leaves panes a direction key cannot name. With one pane above and two
+below, the pane below right shares no row with the one above, so no direction
+points at it and it takes two moves to reach. `ctrl-b m` is for those cases:
+every tiled pane is numbered in the middle of its top row, and pressing the
+number goes straight there. It needs no geometry at all, so it reaches any pane
+from any pane in one keystroke. Escape cancels without moving.
+
+The numbers follow the layout's own order, which is left to right and top to
+bottom, so the top-left pane is always 1. Only the digits 1 to 9 are read, so a
+session with more panes than that can be reached by number only for the first
+nine. `ctrl-b m` numbers the tiled panes and leaves any floating pane alone: a
+float is not in the layout and has no number to press.
 
 `ctrl-b x` opens the focused pane's scrollback for reading. `j` and `k` move a
 line at a time, `J` and `K` ten, `ctrl-d` and `ctrl-u` half a screen, `ctrl-f`

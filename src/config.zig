@@ -29,6 +29,7 @@ pub const Keybinds = struct {
     rotate: u8 = 'o',
     sessions: u8 = 'w',
     scroll: u8 = 'x',
+    pane_select: u8 = 'm',
 };
 
 /// Where the border and the status line get their colours.
@@ -108,6 +109,7 @@ pub const entries = [_]Entry{
     .{ .name = "keybind.rotate", .key = 'o' },
     .{ .name = "keybind.sessions", .key = 'w' },
     .{ .name = "keybind.scroll", .key = 'x' },
+    .{ .name = "keybind.pane_select", .key = 'm' },
     .{ .name = "border.active.fg", .colour = .{ .r = 0x7c, .g = 0xa8, .b = 0x6c } },
     .{ .name = "border.inactive.fg", .colour = null },
     .{ .name = "status.bg", .colour = .{ .r = 0x2e, .g = 0x34, .b = 0x40 } },

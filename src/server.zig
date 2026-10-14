@@ -237,6 +237,13 @@ const Session = struct {
     /// While this is set the layout is frozen: tiled panes carry labels and the floats are not
     /// drawn, so the labels are readable.
     docking: bool = false,
+    /// Set while the user is choosing a tiled pane to move focus to.
+    ///
+    /// The panes are numbered exactly as `docking` numbers them, but nothing else changes: the
+    /// floats stay on screen and the layout is not frozen, because the user is choosing where to
+    /// look rather than rearranging anything. Kept apart from `docking` so that entering one mode
+    /// cannot pick up the other's side effects.
+    focusing: bool = false,
     /// Clients attached to this session, as indices into `Server.clients`.
     watchers: std.ArrayList(usize) = .empty,
     /// The area the panes share, which is what the client gave this session. Zero until
@@ -268,6 +275,24 @@ const Session = struct {
             if (pane.id == id) return index;
         }
         return null;
+    }
+
+    /// Resolve a pane the user named by number, or null when it cannot be moved to.
+    ///
+    /// The number arrives as an identifier rather than a position, because the labels and the
+    /// identifier they stand for were assigned together by `sendLayout` and the client only echoes
+    /// one back. What has to be checked is that it still names a pane this session can focus: zero is
+    /// what the client sends when its number matched nothing, a float was never numbered, and an
+    /// identifier from an earlier layout can name a pane that has since been closed. Focusing either
+    /// of the last two would leave the tree pointing at a pane it does not own.
+    ///
+    /// A refusal is not an error the user needs told apart from the others: all three mean "that
+    /// number is not a pane right now", and the mode stays open so another can be tried.
+    fn acceptFocusTarget(self: *Session, pane: u64) ?layout.PaneId {
+        if (pane == 0) return null;
+        const id: layout.PaneId = @intCast(pane);
+        if (!self.tree.contains(id)) return null;
+        return id;
     }
 
     /// The pane the user is working in, which is the raised float when one is up.
@@ -941,6 +966,31 @@ pub const Server = struct {
                 // neighbour to swap with and no place in the rotation; it stays where it is.
                 try self.moveInLayout(index, move.kind);
             },
+            .focus_select => |select| {
+                const index = self.findSession(select.name.slice()) orelse
+                    return Error.UnknownSession;
+                const session = &self.sessions.items[index];
+                // Only the tiled panes can be numbered, so a session with no layout has nothing to
+                // offer and the mode would be one the user cannot leave by choosing.
+                if (session.tree.isEmpty()) return;
+                // Docking is already numbering the panes for a different question. Letting both
+                // stand would leave the client unable to tell what a digit means, so the newer
+                // request wins and docking is dropped rather than left half-on.
+                session.docking = false;
+                session.focusing = true;
+                try self.sendLayout(session);
+            },
+            .focus_target => |target| {
+                const index = self.findSession(target.name.slice()) orelse
+                    return Error.UnknownSession;
+                const session = &self.sessions.items[index];
+                // A refusal leaves the mode open so the user can pick again, which is why the flag is
+                // only cleared once a pane has actually been accepted.
+                const id = session.acceptFocusTarget(target.pane) orelse return;
+                session.tree.focused = id;
+                session.focusing = false;
+                try self.sendLayout(session);
+            },
             .float => |float| {
                 const index = self.findSession(float.name.slice()) orelse
                     return Error.UnknownSession;
@@ -956,6 +1006,7 @@ pub const Server = struct {
                     return Error.UnknownSession;
                 const session = &self.sessions.items[index];
                 session.docking = false;
+                session.focusing = false;
                 try self.sendLayout(session);
             },
             .toggle_floats => |toggle| {
@@ -1075,6 +1126,9 @@ pub const Server = struct {
 
         session.focused_float = id;
         session.docking = false;
+        // Raising a float is a different question from picking a pane by number, and a mode left
+        // open would put a number on every pane for a choice the user has moved on from.
+        session.focusing = false;
 
         // The tiled panes changed shape, so their ptys are resized too.
         try session.relayout();
@@ -1124,6 +1178,8 @@ pub const Server = struct {
         }
         session.focused_float = null;
         session.docking = false;
+        // The choice has been acted on, so the numbering goes away with it.
+        session.focusing = false;
 
         _ = session.tree.splitLongest(
             target_id,
@@ -1276,6 +1332,9 @@ pub const Server = struct {
     /// z-order and a float is drawn above the layout. While a dock target is being chosen the
     /// floats are left out entirely: the choice is about the layout underneath them, and a float
     /// covering it would hide the labels the user is reading.
+    ///
+    /// Numbering a pane to move focus to leaves the floats alone, because the user still wants to
+    /// see the window as it is; only the labels are added.
     fn sendLayout(self: *Server, session: *Session) !void {
         var placements: [protocol.Decoder.max_panes]protocol.PanePlacement = undefined;
         var count: usize = 0;
@@ -1289,6 +1348,11 @@ pub const Server = struct {
         // This is not a place to widen the type and drop the guard, because the rest of zmux cannot
         // describe pane 257 either -- the number of placements this event carries is bounded by
         // `protocol.Decoder.max_panes`.
+        //
+        // The client only accepts 1-9, so a larger session numbers its panes past what a keystroke
+        // can name. Drawing no number past nine would be tidier than drawing one that cannot be
+        // typed, but it would also make the numbering skip, and a gap reads as a missing pane.
+        const numbering = session.docking or session.focusing;
         var label: u8 = 0;
 
         for (session.panes.items) |pane| {
@@ -1305,14 +1369,15 @@ pub const Server = struct {
                 },
                 .exited = pane.exited,
                 .floating = false,
-                .label = if (session.docking) label else 0,
+                .label = if (numbering) label else 0,
             };
             count += 1;
         }
 
         // Hidden floats are left out of the list entirely, so the client needs no rule for what to do
-        // with a pane it must not paint. The same applies during dock selection, where the labels on
-        // the layout underneath have to be readable.
+        // with a pane it must not paint. Docking leaves them out for a second reason: the labels on
+        // the layout underneath have to be readable, and a float covering one would hide it. Selecting
+        // a pane to focus has no such reason, so it keeps the floats on screen.
         if (!session.docking and !session.floats_hidden) {
             for (session.floats.items) |float_id| {
                 if (count == placements.len) break;
@@ -1341,6 +1406,7 @@ pub const Server = struct {
             .focused = session.tree.focused orelse 0,
             .focused_float = session.focused_float orelse 0,
             .docking = session.docking,
+            .focusing = session.focusing,
             .floats_hidden = session.floats_hidden,
             .panes = placements[0..count],
         } });
@@ -2759,4 +2825,54 @@ test "a float is told apart from a tiled pane by the float list, not the tree" {
         .terminal = undefined,
     });
     try std.testing.expect(session.findPane(parked) != null);
+}
+
+test "a pane picked by number is a tiled one, and the mode closes on it" {
+    // The number the user typed is resolved by the client from the labels the server sent, and the
+    // server then has to decide whether that identifier is still a pane it can move to. A float is
+    // numbered by nothing, and an identifier from a previous layout can name a pane that has since
+    // been closed -- moving focus to either would leave the tree pointing at a pane it does not own.
+    const gpa = std.testing.allocator;
+    var session = Session.init(gpa, try protocol.Name.init("s"));
+    defer {
+        session.panes.deinit(gpa);
+        session.floats.deinit(gpa);
+        session.watchers.deinit(gpa);
+        session.placements.deinit(gpa);
+        session.tree.deinit();
+    }
+
+    const tiled = session.tree.allocateId();
+    try session.tree.setRoot(tiled);
+    const parked = session.tree.allocateId();
+    try session.tree.split(tiled, .horizontal, parked);
+    // The pane list has to hold both, or "parked" would be indistinguishable from "never existed".
+    // It is the tree that decides which of them is tiled, so the two lists disagreeing is the case
+    // worth testing against.
+    try session.panes.append(gpa, .{
+        .id = tiled,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+    try session.panes.append(gpa, .{
+        .id = parked,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+    _ = try session.tree.detach(parked, session.cols, session.rows);
+
+    // A live tiled pane is accepted, and the identifier comes back unchanged so the caller can
+    // focus exactly the pane the user named.
+    try std.testing.expectEqual(@as(?layout.PaneId, tiled), session.acceptFocusTarget(tiled));
+
+    // A parked pane is refused: it is still in the pane list and still has a pty, so this is the
+    // case the tree membership check exists for rather than something `findPane` would catch.
+    try std.testing.expect(session.findPane(parked) != null);
+    try std.testing.expectEqual(@as(?layout.PaneId, null), session.acceptFocusTarget(parked));
+
+    // Zero is what the client sends when its number matched no label.
+    try std.testing.expectEqual(@as(?layout.PaneId, null), session.acceptFocusTarget(0));
+
+    // And an identifier that never existed, which is what a stale label resolves to.
+    try std.testing.expectEqual(@as(?layout.PaneId, null), session.acceptFocusTarget(9999));
 }
