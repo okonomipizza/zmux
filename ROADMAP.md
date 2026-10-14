@@ -331,6 +331,24 @@ session" for a session `ls` plainly listed, because the name it sent had been
 overwritten by a stale argument. Names are copied into local storage before
 anything else touches the iterator.
 
+### A trap that was not a bug, and cost time anyway
+
+`execve` takes `[*:null]` — a pointer to an array whose last element is null — and Zig
+will happily let a slice be cast to one. Casting `[N][*:0]const u8` to `[*:null]` has no
+null at the end, so the kernel reads past the array into whatever follows and the call
+fails with `ENOENT`, which `childExec` reports as exit 127. It looks exactly like a
+missing program.
+
+This was carried for a while as a suspected defect in the child's controlling terminal,
+because probing it with `stty` failed with the same 127 that `tty` did not. There was no
+defect: the probe was passing a slice cast, and `tty` was passing a `[_:null]` literal.
+The product and the test driver both build a proper null-terminated vector, so nothing
+was ever wrong. It is written down because the symptom points at the pty, and the next
+person to see exit 127 should check the vector before the terminal.
+
+A regression test would be better than a note, but the failure needs a bad vector, and
+the type that prevents one is the same type that makes it unrepresentable here.
+
 A second trap in the same area, which cost time while diagnosing rather than in
 the product: clap numbers positionals by declaration order across *all* parameters,
 so an option whose value name matches a positional's shifts the positional's slot.
