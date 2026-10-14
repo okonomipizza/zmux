@@ -513,6 +513,9 @@ pub const Client = struct {
         for (self.panes.items) |*pane| {
             if (!pane.floating) continue;
             self.drawPane(pane);
+            // After the pane, because the mark is written into the frame the pane just drew. A float
+            // whose program ended is kept on screen rather than closed, so this is what says so.
+            if (pane.exited) self.drawExitedPane(pane);
         }
 
         // While a dock target is being chosen, each tiled pane shows its number.
@@ -716,6 +719,31 @@ pub const Client = struct {
             &buffer,
             "\x1b[{d};{d}H\x1b[7m {d} \x1b[0m",
             .{ rect.y + 1, column + 1, pane.label },
+        ) catch return;
+        local.writeAll(move) catch {};
+    }
+
+    /// Paint a float's frame to say its program has ended.
+    ///
+    /// A pane whose program exits keeps its last screen, which is what makes the output readable
+    /// after the fact. Without a mark the frame around it looks exactly like a pane whose program is
+    /// still running and simply not printing, so a user would wait for output that is never coming.
+    ///
+    /// The mark goes on the top edge, where the dock label also goes, because that edge already
+    /// carries the one piece of state zmux writes into a pane's frame.
+    fn drawExitedPane(self: *Client, pane: *RemotePane) void {
+        const local = self.local orelse return;
+        const rect = pane.rect;
+        // The same minimum as a label: a frame narrower than this has no room for text inside its
+        // top edge, and overwriting the corner would break the frame rather than annotate it.
+        if (rect.width < 6 or rect.height < 3) return;
+
+        var buffer: [48]u8 = undefined;
+        const column = rect.x + (rect.width / 2) - 3;
+        const move = std.fmt.bufPrint(
+            &buffer,
+            "\x1b[{d};{d}H\x1b[7m exited \x1b[0m",
+            .{ rect.y + 1, column + 1 },
         ) catch return;
         local.writeAll(move) catch {};
     }

@@ -615,6 +615,25 @@ state with nothing left to reveal. That bookkeeping now lives in `Session.forget
 touches no pty and is therefore testable; closing a real pane frees a terminal and a reply route,
 which a fabricated pane does not own.
 
+A float is the exception, and it took three attempts to get right. A float whose program exits is
+kept, showing that it ended, rather than closed. It is where a program is consulted, and the output
+it leaves is usually the reason it was being consulted, so discarding it the moment the program ends
+destroys the thing the user was looking at; and a float occupies no space the layout would reclaim,
+so there is nothing to give away. A badge reading `exited` goes on its top edge, where the dock label
+also goes, because without one the frame is indistinguishable from a program that is running and
+simply not printing.
+
+Getting there exposed two faults that had been there all along. `paneEnded` counted all panes rather
+than tiled ones, so a float's exit took the tiled path and closed the pane. And the pane list cannot
+tell a float from a tiled pane at all, since both are in it: the float list is the only thing that
+knows, which is what `isFloating` answers and what the test pins.
+
+Two of the three attempts at verifying this were wrong in the same way. A hand-written VT parser in
+the probe dropped the float's frame and reported that the float had vanished — which is what the
+*old* behaviour looked like, so it read as confirmation of the bug being fixed. Feeding the client's
+output through libghostty-vt instead, the same library the product uses, gave the real screen. A
+probe that parses escape sequences is a second implementation of the thing under test.
+
 ### A flaky test, and what it was
 
 `pty.test.spawn a child on the pty and read its output` failed about one run in three. The

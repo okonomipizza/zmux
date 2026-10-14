@@ -122,7 +122,7 @@ their new rectangles, so a swap costs nothing but a redraw.
 Each pane is its own program on its own pty, so a split gives two shells side by
 side. A pane is drawn with a border around it, and the program is given the area
 inside that border rather than the whole rectangle, so its own wrapping agrees with
-what you see. A pane whose program exits is closed and its space given to a
+what you see. A tiled pane whose program exits is closed and its space given to a
 neighbour, and so is one closed with `ctrl-b q`. When it is the last pane the
 session goes with it: a session with nothing to draw has nothing to attach to, so
 the client is told it ended and returns to the terminal zmux was started from.
@@ -132,6 +132,12 @@ does not touch its pty, so the program inside carries on without noticing, and t
 space it leaves is given to a neighbouring pane that grows into it. Docking asks
 which pane to split: the layout freezes, each tiled pane shows a number, and the
 number you press is divided along its longer side. Escape cancels.
+
+A float whose program exits is kept rather than closed, with an `exited` badge on
+its top edge. The output it leaves behind is usually why it was being consulted,
+and a float occupies no space the layout would reclaim, so it stays until you close
+it with `ctrl-b q`. A tiled pane is different: its space belongs to the layout, so
+it is closed and a neighbour grows into the room.
 
 `ctrl-b f` puts the floating panes away and brings them back. A hidden float keeps
 running and keeps its screen; it is simply not drawn, and it cannot take focus, so

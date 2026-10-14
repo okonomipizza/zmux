@@ -1497,9 +1497,28 @@ pub const Server = struct {
         if (pane_index >= session.panes.items.len) return;
         if (session.panes.items[pane_index].exited) return;
 
-        const tiled_before = session.tree.count();
-        const is_tiled = session.tree.contains(session.panes.items[pane_index].id);
-        const tiled_after = if (is_tiled and tiled_before > 0) tiled_before - 1 else tiled_before;
+        const id = session.panes.items[pane_index].id;
+        const is_tiled = session.tree.contains(id);
+
+        // A float whose program exits is kept, showing that it has ended, rather than discarded.
+        //
+        // A float is not part of the arrangement: it is where a program is consulted, and the output
+        // it leaves behind is often the reason it was being consulted. Throwing it away the moment
+        // the program ends loses that output, and the space it occupied does not belong to any
+        // layout that would reclaim it. So it stays until the user closes it, which is what the pane
+        // already does while a program is running.
+        //
+        // The pane is not closed, so nothing is relaid out and no screens are re-sent: it keeps the
+        // rectangle it had, and the cells already on screen are the ones it exited with.
+        if (!is_tiled) {
+            const pane = &session.panes.items[pane_index];
+            pane.exited = true;
+            pane.status = status;
+            try self.sendLayout(session);
+            return;
+        }
+
+        const tiled_after = if (session.tree.count() > 0) session.tree.count() - 1 else 0;
 
         if (tiled_after >= 1) {
             try self.closePane(session_index, pane_index);
@@ -2618,4 +2637,53 @@ test "a command about the focused pane means the raised float" {
     // A raised float the client has not been told about falls back rather than failing.
     session.focused_float = 9999;
     try std.testing.expectEqual(tiled, session.panes.items[session.focusedPane().?].id);
+}
+
+test "a float is told apart from a tiled pane by the float list, not the tree" {
+    // `paneEnded` keeps a float whose program has exited and reclaims a tiled pane's space, so it
+    // has to know which it is looking at. The tree cannot answer that: a float was detached from it
+    // when it was floated, so asking the tree would call a float "not a pane at all" and asking the
+    // pane list would call every pane tiled. The float list is the only thing that knows.
+    const gpa = std.testing.allocator;
+    var session = Session.init(gpa, try protocol.Name.init("s"));
+    defer {
+        session.panes.deinit(gpa);
+        session.floats.deinit(gpa);
+        session.watchers.deinit(gpa);
+        session.placements.deinit(gpa);
+        session.tree.deinit();
+    }
+
+    const tiled = session.tree.allocateId();
+    try session.tree.setRoot(tiled);
+    const parked = session.tree.allocateId();
+    try session.tree.split(tiled, .horizontal, parked);
+
+    // Both are panes, and both are in the tree, before one is floated.
+    try std.testing.expect(session.tree.contains(tiled));
+    try std.testing.expect(session.tree.contains(parked));
+    try std.testing.expect(!isFloating(&session, tiled));
+    try std.testing.expect(!isFloating(&session, parked));
+
+    // Floating one moves it out of the tree and into the float list, which is the whole of the
+    // difference.
+    _ = try session.tree.detach(parked, session.cols, session.rows);
+    try session.floats.append(gpa, parked);
+
+    try std.testing.expect(!session.tree.contains(parked));
+    try std.testing.expect(isFloating(&session, parked));
+    try std.testing.expect(!isFloating(&session, tiled));
+
+    // The pane stays in the pane list either way, which is why the pane list cannot answer this.
+    try session.panes.append(gpa, .{
+        .id = tiled,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+    try session.panes.append(gpa, .{
+        .id = parked,
+        .pty = .{ .master = -1, .child = 0 },
+        .terminal = undefined,
+    });
+    try std.testing.expect(session.findPane(parked) != null);
 }
