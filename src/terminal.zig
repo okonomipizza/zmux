@@ -1,10 +1,11 @@
 //! The local terminal zmux is running inside: raw mode, screen setup, and the
 //! renderer that paints a `vt.RenderState` onto it.
 //!
-//! Phase 1 has no client/server split, so zmux draws straight to its own
-//! terminal. Everything here is about putting that terminal into a known state
-//! and putting it back afterwards, which matters because a crash that leaves a
-//! terminal in raw mode is very hard to recover from by hand.
+//! This is the client's half of the split: the server owns the sessions and their
+//! parsed screens, and this module is what an attached client draws them with.
+//! Everything here is about putting the terminal into a known state and putting it
+//! back afterwards, which matters because a crash that leaves a terminal in raw
+//! mode is very hard to recover from by hand.
 
 const std = @import("std");
 const linux = std.os.linux;

@@ -61,16 +61,11 @@ pub const Name = struct {
 pub const Request = union(enum) {
     /// List the live sessions.
     list,
-    /// Start a new session running the given program.
-    create: struct {
-        name: Name,
-        rows: u16,
-        cols: u16,
-        /// The program and its arguments, separated by NUL. Empty means the
-        /// server's own `$SHELL`.
-        program: []const u8,
-    },
     /// Attach to a session. The size is this client's terminal.
+    ///
+    /// There is no `create`: it was how `zmux run` started a program in one step, and that command
+    /// was removed, so nothing ever sent it. A session is started by attaching to a name that does
+    /// not exist yet, which is what a user typing a session name means.
     attach: struct {
         name: Name,
         rows: u16,
@@ -242,10 +237,6 @@ pub const Event = union(enum) {
     detached: struct {
         name: Name,
     },
-    /// A session was created.
-    created: struct {
-        name: Name,
-    },
     /// The session is gone. Sent to every client watching it.
     exited: struct {
         name: Name,
@@ -334,9 +325,11 @@ pub const PanePlacement = struct {
 /// Spelled out rather than taken from the enum ordinal, because these are the
 /// protocol: reordering a union arm must not silently renumber the wire.
 pub const Tag = struct {
-    // Requests, 1..=17.
+    // Requests. 2 is not used: it was `create`, which `zmux run` sent before that command was
+    // removed. The number is left as a gap rather than reused, because a tag is what tells two
+    // builds apart and reassigning it would make an old client's `create` arrive as whatever took
+    // its place.
     pub const list: u8 = 1;
-    pub const create: u8 = 2;
     pub const attach: u8 = 3;
     pub const detach: u8 = 4;
     pub const kill: u8 = 5;
@@ -353,12 +346,13 @@ pub const Tag = struct {
     pub const layout_move: u8 = 16;
     pub const switch_session: u8 = 17;
     // Events, 64..=127. The gap leaves room to add either kind later without
-    // renumbering.
+    // renumbering. 68 is not used: it was `created`, which the server sent to answer the `create`
+    // request. Both are gone with `zmux run`, and the number is left as a gap for the same reason
+    // the request tag is.
     pub const session: u8 = 64;
     pub const list_end: u8 = 65;
     pub const attached: u8 = 66;
     pub const detached: u8 = 67;
-    pub const created: u8 = 68;
     pub const exited: u8 = 69;
     pub const output: u8 = 70;
     pub const failure: u8 = 71;
@@ -448,13 +442,6 @@ pub const Encoder = struct {
         switch (request) {
             .list => try self.begin(Tag.list),
             .kill_all => try self.begin(Tag.kill_all),
-            .create => |create| {
-                try self.begin(Tag.create);
-                try self.name(&create.name);
-                try self.u16le(create.rows);
-                try self.u16le(create.cols);
-                try self.blob(create.program);
-            },
             .attach => |attach| {
                 try self.begin(Tag.attach);
                 try self.name(&attach.name);
@@ -549,10 +536,6 @@ pub const Encoder = struct {
             .detached => |detached| {
                 try self.begin(Tag.detached);
                 try self.name(&detached.name);
-            },
-            .created => |created| {
-                try self.begin(Tag.created);
-                try self.name(&created.name);
             },
             .exited => |exited| {
                 try self.begin(Tag.exited);
@@ -684,12 +667,6 @@ pub const Decoder = struct {
         return switch (self.bytes[0]) {
             Tag.list => Request.list,
             Tag.kill_all => Request.kill_all,
-            Tag.create => Request{ .create = .{
-                .name = try self.name(),
-                .rows = try self.u16le(),
-                .cols = try self.u16le(),
-                .program = try self.blob(),
-            } },
             Tag.attach => Request{ .attach = .{
                 .name = try self.name(),
                 .rows = try self.u16le(),
@@ -757,7 +734,6 @@ pub const Decoder = struct {
                 .cols = try self.u16le(),
             } },
             Tag.detached => Event{ .detached = .{ .name = try self.name() } },
-            Tag.created => Event{ .created = .{ .name = try self.name() } },
             Tag.exited => Event{ .exited = .{
                 .name = try self.name(),
                 .status = try self.u8le(),
@@ -823,6 +799,10 @@ pub const Decoder = struct {
 /// The program travels as one blob with NUL separators rather than a length
 /// per argument, because `execve` wants NUL-terminated strings anyway and the
 /// server only has to replace the separators with terminators.
+///
+/// There is no matching `joinProgram`: it existed to build the blob for a `create` request, and
+/// nothing sends one any more. Splitting is still needed, because a `split` request carries the
+/// program for the new pane.
 pub fn splitProgram(program: []const u8, out: [][]const u8) usize {
     var count: usize = 0;
     var iterator = std.mem.splitScalar(u8, program, 0);
@@ -833,17 +813,6 @@ pub fn splitProgram(program: []const u8, out: [][]const u8) usize {
         count += 1;
     }
     return count;
-}
-
-/// Join arguments into a NUL-separated program string.
-pub fn joinProgram(out: *std.ArrayList(u8), gpa: std.mem.Allocator, argv: []const []const u8) !void {
-    for (argv, 0..) |argument, index| {
-        if (index != 0) try out.append(gpa, 0);
-        // A NUL inside an argument would be indistinguishable from a separator,
-        // so it cannot be represented and is not silently dropped.
-        if (std.mem.findScalar(u8, argument, 0) != null) return Error.BadValue;
-        try out.appendSlice(gpa, argument);
-    }
 }
 
 test "a layout event round-trips with every pane's rectangle intact" {
@@ -1276,31 +1245,6 @@ test "a program string splits on its NUL separators" {
     try std.testing.expectEqualStrings("vim", argv[0]);
     try std.testing.expectEqualStrings("-c", argv[1]);
     try std.testing.expectEqualStrings("set nu", argv[2]);
-}
-
-test "joining a program round trips through splitting" {
-    const gpa = std.testing.allocator;
-
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(gpa);
-    try joinProgram(&joined, gpa, &.{ "sh", "-c", "echo hi" });
-
-    var argv: [8][]const u8 = undefined;
-    const count = splitProgram(joined.items, &argv);
-    try std.testing.expectEqual(@as(usize, 3), count);
-    try std.testing.expectEqualStrings("sh", argv[0]);
-    try std.testing.expectEqualStrings("echo hi", argv[2]);
-}
-
-test "an argument containing NUL is rejected" {
-    const gpa = std.testing.allocator;
-
-    var joined: std.ArrayList(u8) = .empty;
-    defer joined.deinit(gpa);
-    try std.testing.expectError(
-        Error.BadValue,
-        joinProgram(&joined, gpa, &.{ "echo", "a\x00b" }),
-    );
 }
 
 test "a layout event reports hidden floats by omitting them" {

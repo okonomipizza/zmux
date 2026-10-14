@@ -27,6 +27,15 @@ const layout = @import("layout.zig");
 const protocol = @import("protocol.zig");
 const terminal_mod = @import("terminal.zig");
 
+/// How much may be queued for one client before it is dropped.
+///
+/// A client that has stopped reading must not be allowed to make the server hold an unbounded amount
+/// on its behalf: the server owns every session, so one stalled client would grow the process that
+/// all the others depend on. This is generous enough that a client merely behind for a moment is
+/// never dropped, and small enough that a wedged one is. A dropped client is not a lost session: the
+/// programs keep running and the user can attach again.
+pub const outgoing_limit = 16 * 1024 * 1024;
+
 pub const Error = error{
     /// A raw syscall failed.
     SyscallFailed,
@@ -261,7 +270,6 @@ const Session = struct {
         return null;
     }
 
-    /// The pane holding focus, if any.
     /// The pane the user is working in, which is the raised float when one is up.
     ///
     /// A float is drawn on top and takes the keystrokes, so it is what the user is looking at and
@@ -700,6 +708,13 @@ pub const Server = struct {
             for (self.clients.items, 0..) |client, index| {
                 if (client.gone) continue;
                 if (client.outgoing.items.len == 0) continue;
+                // A client that has been sent more than the server will hold for it is dropped
+                // rather than flushed. Checked before the flush because the flush returns early on a
+                // full socket, which is precisely the case where the queue is not shrinking.
+                if (overLimit(&client)) {
+                    self.dropClient(index);
+                    continue;
+                }
                 self.flushClient(index) catch {};
             }
         }
@@ -740,7 +755,6 @@ pub const Server = struct {
         return null;
     }
 
-    /// Read and act on everything one client has sent.
     /// Read and act on everything one client has sent.
     ///
     /// The reply is flushed on every path out, including the ones that end the connection. A
@@ -817,20 +831,6 @@ pub const Server = struct {
                 // Every session is gone, and with them the reason the server exists,
                 // so it stops and the socket is removed.
                 self.state = .stop;
-            },
-            .create => |create| {
-                var arguments: [64][]const u8 = undefined;
-                const count = protocol.splitProgram(create.program, &arguments);
-                const index = try self.createSession(.{
-                    .name = create.name.slice(),
-                    .rows = create.rows,
-                    .cols = create.cols,
-                    .argv = arguments[0..count],
-                });
-                // The creating client attaches to what it just made, which is what makes
-                // `zmux run` one step.
-                try self.sendEvent(client, .{ .created = .{ .name = create.name } });
-                try self.attachClient(client, index, create.rows, create.cols);
             },
             .attach => |attach| {
                 // Attaching to a session that does not exist creates it, running the server's own
@@ -1256,7 +1256,6 @@ pub const Server = struct {
         _ = session.tree.close(id) catch null;
     }
 
-    /// Tell every watcher where the panes are and which one has focus.
     /// Tell every watcher where the panes are, which one has focus, and whether a dock target is
     /// being chosen.
     ///
@@ -1270,6 +1269,12 @@ pub const Server = struct {
 
         // Labels are assigned in list order, so that the number the user types is the position the
         // pane occupies in the layout event. They are only meaningful in dock-select mode.
+        //
+        // A `u8` is enough because the tree refuses to hold more than `max_panes` leaves, and only
+        // a tiled pane reaches this increment. That bound is what keeps this from overflowing: with
+        // the guard removed, the 256th pane panicked the server here and every session went with it.
+        // This is not a place to widen the type and drop the guard, because the rest of zmux cannot
+        // describe pane 257 either -- `focusNext` walks a `[max_panes]PaneId` buffer.
         var label: u8 = 0;
 
         for (session.panes.items) |pane| {
@@ -1363,8 +1368,7 @@ pub const Server = struct {
         return false;
     }
 
-    /// End a session, telling its watchers and releasing its resources.
-    /// Discard a session, telling its watchers why it went away.
+    /// End a session, telling its watchers why it went away and releasing its resources.
     ///
     /// `killed` says whether the session was destroyed while its programs were still running, as
     /// opposed to ending because the last program finished. The two look the same to a client
@@ -1576,14 +1580,6 @@ pub const Server = struct {
         }
     }
 
-    /// Send a client the whole screen as a fresh VT byte stream.
-    ///
-    /// Rather than a snapshot format, the screen is re-emitted as the sequences
-    /// that would produce it: cursor moves, SGR, and the text of each non-blank
-    /// row. The client parses it with the terminal it already has, so there is
-    /// no second rendering path and no snapshot API to keep in step with
-    /// libghostty-vt.
-    /// Send a client the current screen of every pane in a session.
     /// Send a client the current screen of every pane in a session.
     ///
     /// The whole screen is cleared once, before any pane is drawn. It used to be cleared inside the
@@ -1644,6 +1640,11 @@ pub const Server = struct {
     }
 
     /// Write as much of a client's queue as the socket accepts.
+    ///
+    /// A client that stops reading but keeps its socket open is dropped once its queue passes
+    /// `outgoing_limit`. This is the bound the comment here used to claim without there being one:
+    /// the queue was only ever released by a read or a write *failing*, and a peer that simply stops
+    /// consuming never does either, so its backlog grew for as long as the server ran.
     fn flushClient(self: *Server, index: usize) !void {
         var client = &self.clients.items[index];
         while (client.outgoing.items.len > 0) {
@@ -1652,9 +1653,7 @@ pub const Server = struct {
                 return;
             };
             if (written == 0) return;
-            // Dropping from the front is O(n); the queue is small because a
-            // client that falls behind is dropped rather than buffered
-            // without limit.
+            // Dropping from the front is O(n) in the queue, which `outgoing_limit` bounds.
             std.mem.copyForwards(
                 u8,
                 client.outgoing.items[0 .. client.outgoing.items.len - written],
@@ -1662,6 +1661,15 @@ pub const Server = struct {
             );
             client.outgoing.shrinkRetainingCapacity(client.outgoing.items.len - written);
         }
+    }
+
+    /// Whether a client has been sent more than the server is willing to hold for it.
+    ///
+    /// Checked after a queue has grown rather than while flushing, because a client with a large
+    /// backlog is one whose write path would return early on a full socket and never reach a check
+    /// placed after the loop.
+    fn overLimit(client: *const Client) bool {
+        return client.outgoing.items.len > outgoing_limit;
     }
 
     /// Mark a client dead and release it at the end of the loop pass.
@@ -1829,7 +1837,6 @@ fn isBlankRow(line: []const u8) bool {
     return true;
 }
 
-/// Copies the text of each cell into a line buffer.
 /// Copy one row's cells into a byte stream, styles included.
 ///
 /// The styles matter as much as the glyphs. A screen is re-sent by re-emitting the sequences that
@@ -1898,8 +1905,6 @@ const CellCollector = struct {
     }
 };
 
-/// Receive the bytes the terminal wants sent to the program.
-///
 /// A child's exit status as one byte, the way a shell reports it.
 ///
 /// A signalled child is 128 plus the signal number. The clamp is on the sum rather
@@ -2052,6 +2057,46 @@ fn onWritePty(
     // instead.
     const pane = &route.server.sessions.items[session_index].panes.items[pane_index];
     pane.to_program.appendSlice(route.server.gpa, data[0..len]) catch {};
+}
+
+test "a client with more queued than the server will hold is over the limit" {
+    // The comment on `flushClient` claimed a client that falls behind "is dropped rather than
+    // buffered without limit", and nothing implemented it: the queue was only released when a read
+    // or a write failed, and a peer that simply stops consuming does neither. This pins the bound
+    // that now exists.
+    const gpa = std.testing.allocator;
+    var server: Server = .{
+        .gpa = gpa,
+        .listener = .{ .fd = -1, .path = "/nonexistent" },
+        .epfd = -1,
+        .path = "/nonexistent",
+        .encoder = protocol.Encoder.init(gpa),
+        .environ = undefined,
+    };
+    defer {
+        server.encoder.deinit();
+        for (server.clients.items) |*client| client.outgoing.deinit(gpa);
+        server.clients.deinit(gpa);
+        server.sessions.deinit(gpa);
+    }
+
+    try server.clients.append(gpa, .{ .connection = .{ .fd = -1 } });
+    var client = &server.clients.items[0];
+
+    // A queue at the limit is still served; the drop happens only past it. The capacity is reserved
+    // first so that filling to the limit is a few operations rather than a reallocation per byte.
+    try client.outgoing.ensureTotalCapacity(gpa, outgoing_limit + 1);
+    try client.outgoing.appendNTimes(gpa, 'x', outgoing_limit);
+    try std.testing.expectEqual(@as(usize, outgoing_limit), client.outgoing.items.len);
+    try std.testing.expect(!Server.overLimit(client));
+
+    // One byte more, and the server has held as much as it is prepared to.
+    try client.outgoing.append(gpa, 'x');
+    try std.testing.expect(Server.overLimit(client));
+
+    // An empty queue is never over the limit, so a client that is merely idle is not dropped.
+    client.outgoing.clearRetainingCapacity();
+    try std.testing.expect(!Server.overLimit(client));
 }
 
 test "removing a client rewrites the indices of the one moved into its slot" {
@@ -2231,8 +2276,9 @@ test "contains reports membership after a pane is closed" {
 }
 
 test "the toggle hides and shows, and restores focus both ways" {
-    // The whole behaviour of `ctrl-a -`, exercised on the state machine rather than through a pty. The
-    // pty check confirms the pixels; this confirms which pane owns focus, which the pixels do not show.
+    // The whole behaviour of the float toggle (`ctrl-b f`), exercised on the state machine rather
+    // than through a pty. The pty check confirms the pixels; this confirms which pane owns focus,
+    // which the pixels do not show.
     const gpa = std.testing.allocator;
     var server: Server = .{
         .gpa = gpa,

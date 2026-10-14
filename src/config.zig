@@ -77,7 +77,15 @@ pub const Rgb = struct {
 /// A malformed file and an unwritable one are not errors here: both fall back to the defaults, which
 /// is the same thing a user who has not configured anything gets. Only a path that does not fit the
 /// caller's buffer has to be reported, because there is nothing sensible to do instead.
-pub const Error = error{PathTooLong};
+pub const Error = error{
+    PathTooLong,
+    /// The configuration file does not exist, which is the ordinary first-run state.
+    ///
+    /// Distinct from the other read failures because it is the only one nobody needs to be told
+    /// about. The raw `open` reports `ENOENT` and a permission denial the same way, so the errno is
+    /// decoded at the point where it is still available.
+    FileAbsent,
+};
 
 /// Every setting, with the name it has in the file.
 ///
@@ -139,16 +147,79 @@ pub const Entry = struct {
     }
 };
 
+/// Why the configuration is not entirely the user's own.
+///
+/// The fallback to defaults is deliberate and stays: a file that cannot be understood must not stop
+/// zmux from starting, and anything it does say is still applied. What was wrong was doing it
+/// silently. A JSON error makes *every* setting revert at once, so a user who mistyped one line lost
+/// their colours and their other bindings with no indication of which line it was or that anything
+/// had happened. A file that is absent is not worth a word; one that exists and was not used is.
+pub const Problem = union(enum) {
+    /// There is no configuration file, which is the ordinary first-run state.
+    absent,
+    /// The file is there but its contents could not be decoded as JSON.
+    malformed,
+    /// The file could not be read at all: permissions, or a path that did not fit.
+    unreadable,
+};
+
+/// A configuration, and what had to be assumed to get it.
+pub const Loaded = struct {
+    config: Config,
+    problem: Problem = .absent,
+};
+
 /// Read the configuration, falling back to the defaults wherever it says nothing.
 ///
 /// A file that cannot be read is not an error: the defaults are what a user who has not configured
-/// anything gets, and starting without a configuration is better than refusing to start.
-pub fn load(gpa: std.mem.Allocator, environ: std.process.Environ) Config {
+/// anything gets, and starting without a configuration is better than refusing to start. The reason
+/// is returned rather than discarded so that the caller can say what happened.
+pub fn load(gpa: std.mem.Allocator, environ: std.process.Environ) Loaded {
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const path = configPath(environ, &path_buffer) catch return .{};
-    const text = readFile(gpa, path) catch return .{};
+    const path = configPath(environ, &path_buffer) catch {
+        return .{ .config = .{}, .problem = .unreadable };
+    };
+    const text = readFile(gpa, path) catch |err| {
+        // A file that is not there is the normal case and says nothing: on a machine where zmux has
+        // never been configured there is simply no file. Anything else -- a permission problem, a
+        // path that did not fit, a file far too large to be a configuration -- is a configuration the
+        // user wrote that zmux is not honouring, and that is worth a word.
+        const problem: Problem = if (err == error.FileAbsent) .absent else .unreadable;
+        return .{ .config = .{}, .problem = problem };
+    };
     defer gpa.free(text);
-    return parse(gpa, text);
+    // Parsed once, with both answers taken from the same attempt. Asking a second time to find out
+    // whether the first one worked would decode the whole document twice on every attach.
+    var config = Config{};
+    const problem = parseInto(&config, gpa, text);
+    return .{ .config = config, .problem = problem };
+}
+
+/// Apply a configuration file's contents over the defaults, reporting whether it decoded at all.
+///
+/// `parse` is deliberately lenient per setting, so most outcomes are not worth reporting: a file that
+/// decodes but names nothing this build knows is fine, and so is a partial one. Only a document that
+/// does not parse at all costs the user every setting they wrote, and that is the case the caller
+/// warns about.
+fn parseInto(config: *Config, gpa: std.mem.Allocator, text: []const u8) Problem {
+    const parsed = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch return .malformed;
+    defer parsed.deinit();
+
+    const object = switch (parsed.value) {
+        .object => |object| object,
+        else => return .absent,
+    };
+
+    var it = object.iterator();
+    while (it.next()) |pair| {
+        const value = switch (pair.value_ptr.*) {
+            .string => |string| string,
+            else => continue,
+        };
+        apply(config, pair.key_ptr.*, value);
+    }
+
+    return .absent;
 }
 
 /// Read a whole file, or report why not.
@@ -161,7 +232,11 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try std.fmt.bufPrintZ(&path_buffer, "{s}", .{path});
 
     const opened = linux.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(opened) != .SUCCESS) return error.OpenFailed;
+    switch (linux.errno(opened)) {
+        .SUCCESS => {},
+        .NOENT => return Error.FileAbsent,
+        else => return error.OpenFailed,
+    }
     const fd: i32 = @intCast(opened);
     defer _ = linux.close(fd);
 
@@ -190,24 +265,7 @@ fn readFile(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
 /// cost the user the rest of their settings.
 pub fn parse(gpa: std.mem.Allocator, text: []const u8) Config {
     var config = Config{};
-
-    const parsed = std.json.parseFromSlice(std.json.Value, gpa, text, .{}) catch return config;
-    defer parsed.deinit();
-
-    const object = switch (parsed.value) {
-        .object => |object| object,
-        else => return config,
-    };
-
-    var it = object.iterator();
-    while (it.next()) |pair| {
-        const value = switch (pair.value_ptr.*) {
-            .string => |string| string,
-            else => continue,
-        };
-        apply(&config, pair.key_ptr.*, value);
-    }
-
+    _ = parseInto(&config, gpa, text);
     return config;
 }
 
@@ -399,6 +457,87 @@ test "a malformed file is the defaults rather than a failure" {
     // A configuration that cannot be parsed must not be a reason for zmux not to start.
     const config = parse(std.testing.allocator, "{ this is not json");
     try std.testing.expectEqual(@as(u8, 'q'), config.keybinds.close);
+}
+
+test "only a document that does not parse at all is reported as malformed" {
+    // The warning exists for the case where the user loses *every* setting at once, which is what a
+    // JSON error costs. The lenient outcomes must stay quiet, or the warning becomes noise that a
+    // user learns to ignore: a file that parses but names nothing this build knows still applies
+    // everything it can, and a partial file is a supported way to write one.
+    const gpa = std.testing.allocator;
+
+    // The verdict and the settings come from one parse, so a case is described by calling both and
+    // checking they agree. `verdict` is what the caller would warn about.
+    const verdict = struct {
+        fn of(text: []const u8) Problem {
+            var config = Config{};
+            return parseInto(&config, gpa, text);
+        }
+    }.of;
+
+    try std.testing.expectEqual(Problem.malformed, verdict("{ this is not json"));
+    try std.testing.expectEqual(Problem.malformed, verdict(""));
+
+    try std.testing.expectEqual(Problem.absent, verdict("{}"));
+    try std.testing.expectEqual(Problem.absent, verdict("{\"nonsense.key\": \"x\"}"));
+    try std.testing.expectEqual(Problem.absent, verdict("{\"keybind.close\": \"Q\"}"));
+
+    // A document that is valid JSON but not an object is applied as nothing, which the per-setting
+    // leniency already covers. It parses, so it is not the all-settings-lost case.
+    try std.testing.expectEqual(Problem.absent, verdict("[1, 2, 3]"));
+
+    // The two must agree: anything reported as malformed really does lose every setting, and
+    // anything reported as fine really does keep the one it names.
+    const broken = "{\"keybind.close\": \"Q\"";
+    try std.testing.expectEqual(Problem.malformed, verdict(broken));
+    try std.testing.expectEqual(@as(u8, 'q'), parse(gpa, broken).keybinds.close);
+
+    const good = "{\"keybind.close\": \"Q\"}";
+    try std.testing.expectEqual(Problem.absent, verdict(good));
+    try std.testing.expectEqual(@as(u8, 'Q'), parse(gpa, good).keybinds.close);
+}
+
+test "an absent file is told apart from one that could not be read" {
+    // This distinction is the whole reason the warning is worth having. On a machine where zmux has
+    // never been configured there is no file, and saying so every time would be noise; a file that is
+    // there and was not read is a configuration the user wrote and zmux is ignoring.
+    //
+    // A file that exists is created here rather than with a `std.fs` helper, because Zig 0.16 moved
+    // those to `std.Io.Dir`, which wants an `Io`. The raw syscalls are what this module uses
+    // throughout, for the same reason.
+    const gpa = std.testing.allocator;
+
+    var name_buffer: [64]u8 = undefined;
+    const file_name = try std.fmt.bufPrintZ(&name_buffer, "/tmp/zmux-config-test-{d}.json", .{
+        linux.getpid(),
+    });
+
+    // Nothing has been created at this name, so it is absent.
+    _ = linux.unlink(file_name.ptr);
+    try std.testing.expectError(Error.FileAbsent, readFile(gpa, file_name));
+
+    // Create it with contents, and the same call now reads them. That shows the error above was
+    // about absence rather than about the read path being broken.
+    const contents = "{\"keybind.close\": \"Q\"}";
+    const created = linux.open(file_name.ptr, .{
+        .ACCMODE = .WRONLY,
+        .CREAT = true,
+        .TRUNC = true,
+    }, 0o600);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.errno(created));
+    const fd: i32 = @intCast(created);
+    defer {
+        _ = linux.close(fd);
+        _ = linux.unlink(file_name.ptr);
+    }
+    // The length comes from the literal rather than being written out, so that editing the text
+    // cannot leave the two disagreeing: a short write would make the read below fail for a reason
+    // that has nothing to do with what this test is about.
+    try std.testing.expectEqual(contents.len, linux.write(fd, contents.ptr, contents.len));
+
+    const text = try readFile(gpa, file_name);
+    defer gpa.free(text);
+    try std.testing.expectEqualStrings(contents, text);
 }
 
 test "a setting with a value of the wrong shape is skipped, and the rest applies" {

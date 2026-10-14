@@ -1164,10 +1164,28 @@ test "every scroll movement goes the way it says" {
     try std.testing.expect(terminal.viewportActive());
 
     // Scrolling past either end is clamped rather than wrapping or reporting an error, so a reader
-    // holding a key at the top does not end up at the bottom.
+    // holding a key at the top does not end up at the bottom, and one at the bottom does not end up
+    // in the middle of history.
+    //
+    // Both ends are checked against a row read before the movement, because the assertion that was
+    // here -- `row(terminal) - (row(terminal) - 0) == 0` -- is true for every value and was pinning
+    // nothing at all.
+    terminal.scrollToTop();
+    const top = row(terminal);
     terminal.scrollBy(-5000);
-    try std.testing.expectEqual(@as(usize, 0), row(terminal));
+    try std.testing.expectEqual(top, row(terminal));
+
+    terminal.scrollToBottom();
+    const bottom = row(terminal);
+    // Scrolling down from the bottom must not move the viewport, whatever the amount.
     terminal.scrollBy(5000);
-    try std.testing.expectEqual(@as(usize, 0), row(terminal) - (row(terminal) - 0));
+    try std.testing.expectEqual(bottom, row(terminal));
+    // And it is still the live screen rather than somewhere in history.
     try std.testing.expect(terminal.viewportActive());
+
+    // A scroll up from the bottom really does move, so the assertion above is not passing because
+    // scrolling never works: without this, a `scrollBy` that did nothing at all would pass.
+    terminal.scrollBy(-5);
+    try std.testing.expect(row(terminal) < bottom);
+    try std.testing.expect(!terminal.viewportActive());
 }

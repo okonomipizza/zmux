@@ -183,7 +183,7 @@ is useful for inspecting what zmux makes of a byte stream:
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-Not yet built: copy mode and configuration. `zmux detach` outside
+Not yet built: copy mode. `zmux detach` outside
 an attached client reports that, because the prefix key is how a client detaches.
 See [ROADMAP.md](ROADMAP.md).
 

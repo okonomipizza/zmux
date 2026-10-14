@@ -108,6 +108,23 @@ const PendingOutput = struct {
     data: std.ArrayList(u8) = .empty,
 };
 
+/// How many bytes may be held for a pane the layout has not described.
+///
+/// This exists because of a case the original reasoning missed. The bytes are held so that a pane's
+/// first output is not lost when its layout event is still behind them in the same batch, and that
+/// window is tiny -- a few messages.
+///
+/// But a pane can be *permanently* absent from every layout event while still producing output: a
+/// float whose program keeps printing, while the floats are hidden, is left out of the layout by
+/// `sendLayout` for as long as it stays hidden, and the server forwards its output regardless. The
+/// old comment claimed the queue was bounded by what a program could print "between a split and its
+/// own layout event", which is not true of that case, so a hidden `tail -f` grew it without limit.
+///
+/// The cap is what makes the queue bounded for real. A pane that never appears loses the oldest bytes
+/// rather than the newest, since the recent output is what a reader wants when the pane does appear,
+/// and losing output at all is only possible in a case where the pane is not on screen.
+const pending_limit = 256 * 1024;
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     connection: socket.Connection,
@@ -1046,10 +1063,10 @@ pub const Client = struct {
 
     /// Handle one keystroke, returning true when the client should detach.
     ///
-    /// Ctrl-a is the prefix. On its own it detaches, as it did before panes existed; followed
-    /// by one of the command keys it acts on the layout instead. The prefix is armed by the
-    /// first byte and consumed by the second, so a prefix followed by a key the layout does
-    /// not use falls back to detaching rather than being swallowed.
+    /// `ctrl-b` is the prefix. Twice detaches, leaving the session running; followed by one of the
+    /// command keys it acts on the layout instead. The prefix is armed by the first byte and consumed
+    /// by the second, so a prefix followed by a key the layout does not use simply does nothing
+    /// rather than being swallowed. It used to detach, which ended the client on a mistyped key.
     fn handleByte(
         self: *Client,
         byte: u8,
@@ -1576,7 +1593,6 @@ pub const Client = struct {
                 _ = detached;
                 self.finished = true;
             },
-            .created => {},
             .exited => |exited| {
                 self.exit_status = exited.status;
                 // Recorded before finishing, so that the status line shows the session as
@@ -1772,15 +1788,20 @@ pub const Client = struct {
     }
 
     /// Hold bytes that arrived for a pane the layout has not described yet.
+    ///
+    /// Bounded by `pending_limit`: a pane that is never described would otherwise be a place for
+    /// output to accumulate for as long as the client runs. See that constant for the case.
     fn holdOutput(self: *Client, pane: u64, data: []const u8) !void {
         for (self.pending.items) |*entry| {
             if (entry.pane == pane) {
                 try entry.data.appendSlice(self.gpa, data);
+                trimPending(&entry.data);
                 return;
             }
         }
         var entry = PendingOutput{ .pane = pane };
         try entry.data.appendSlice(self.gpa, data);
+        trimPending(&entry.data);
         try self.pending.append(self.gpa, entry);
     }
 
@@ -1814,7 +1835,6 @@ pub const Client = struct {
         });
     }
 
-    /// Receive bytes the client's terminal wants sent to the program.
     /// Receive bytes one pane's terminal wants sent to that pane's program.
     ///
     /// This runs inside `vt_write`, so it may only append to a buffer. Writing to the
@@ -1953,6 +1973,19 @@ fn appendRepeated(
 ) !void {
     var written: u16 = 0;
     while (written < count) : (written += 1) try buffer.appendSlice(gpa, text);
+}
+
+/// Drop the oldest bytes from a pending pane's buffer once it is over the limit.
+///
+/// The newest bytes are the ones kept. If the pane does appear, what a reader wants is the output
+/// closest to now; the alternative, refusing the new bytes, would hold a stale screen and show it as
+/// though it were current. Removing from the front is O(n) in the buffer, which is bounded by
+/// `pending_limit` and only runs on the overflow path.
+fn trimPending(data: *std.ArrayList(u8)) void {
+    if (data.items.len <= pending_limit) return;
+    const excess = data.items.len - pending_limit;
+    std.mem.copyForwards(u8, data.items[0 .. data.items.len - excess], data.items[excess..]);
+    data.shrinkRetainingCapacity(data.items.len - excess);
 }
 
 /// The size a pane's terminal should have for a given rectangle, or null when it cannot have one.
@@ -2197,6 +2230,62 @@ test "one keystroke repaints one row, not the screen" {
     try render.update(terminal);
     frame = try paint(render);
     try std.testing.expectEqual(@as(usize, 0), frame.painted);
+}
+
+test "output held for a pane that never appears stays bounded" {
+    // The defect this guards against: a pane the layout never describes, accumulating output for as
+    // long as the client runs. A float whose program keeps printing while the floats are hidden is
+    // exactly that -- `sendLayout` leaves hidden floats out, and the server forwards their output
+    // anyway -- so a hidden `tail -f` grew this without limit.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.pending.items) |*entry| entry.data.deinit(gpa);
+        client.pending.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // A chunk far larger than the limit, so one call is enough to overflow it.
+    const chunk = "x" ** (pending_limit * 3);
+    try client.holdOutput(42, chunk);
+
+    try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    const held = client.pending.items[0].data.items.len;
+    // The bound is the limit, not three times it.
+    try std.testing.expectEqual(@as(usize, pending_limit), held);
+
+    // Feeding more keeps it there rather than growing.
+    for (0..8) |_| try client.holdOutput(42, chunk);
+    try std.testing.expectEqual(@as(usize, pending_limit), client.pending.items[0].data.items.len);
+    // Still one entry for the one pane, and every byte in it is real output rather than a hole from
+    // a bad copy.
+    try std.testing.expectEqual(@as(usize, 1), client.pending.items.len);
+    try std.testing.expect(client.pending.items[0].data.items[0] == 'x');
+
+    // The newest bytes are the ones kept, which is what makes the trimmed buffer worth showing if
+    // the pane does appear. A distinct tail marks it.
+    try client.holdOutput(42, "TAIL");
+    try std.testing.expectEqual(@as(usize, pending_limit), client.pending.items[0].data.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, client.pending.items[0].data.items, "TAIL"));
+
+    // A second pane is bounded on its own rather than sharing the allowance.
+    try client.holdOutput(43, chunk);
+    try std.testing.expectEqual(@as(usize, 2), client.pending.items.len);
+    try std.testing.expectEqual(@as(usize, pending_limit), client.pending.items[1].data.items.len);
+
+    // Under the limit nothing is trimmed, so the ordinary case does not lose the pane's first output.
+    var small: std.ArrayList(u8) = .empty;
+    defer small.deinit(gpa);
+    try small.appendSlice(gpa, "hello");
+    trimPending(&small);
+    try std.testing.expectEqualStrings("hello", small.items);
 }
 
 test "a pane is covered only by an overlapping float" {

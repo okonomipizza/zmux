@@ -84,6 +84,8 @@ pub const Error = error{
     OutOfMemory,
     /// A ratio outside the range the tree can represent.
     BadRatio,
+    /// The tree already holds `max_panes` panes.
+    TooManyPanes,
 };
 
 /// A node is either a pane or a split between two subtrees.
@@ -125,6 +127,13 @@ pub const Tree = struct {
     /// Handed out to panes so that each has an identifier no other can take,
     /// even after panes have been closed and their slots reused.
     next_id: PaneId = 1,
+    /// How many leaves the tree holds.
+    ///
+    /// Maintained on every add and remove rather than recomputed, because `count` is a
+    /// whole-tree walk and the two places that need this need it per operation: `split`
+    /// has to refuse a full tree, and `sendLayout` numbers the panes it emits. Asking the
+    /// tree to walk itself each time would make splitting quadratic in the pane count.
+    leaves: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator) Tree {
         return .{ .gpa = gpa };
@@ -137,6 +146,7 @@ pub const Tree = struct {
         }
         self.root = null;
         self.focused = null;
+        self.leaves = 0;
     }
 
     pub fn isEmpty(self: Tree) bool {
@@ -171,6 +181,7 @@ pub const Tree = struct {
         node.* = .{ .leaf = id };
         self.root = node;
         self.focused = id;
+        self.leaves = 1;
     }
 
     /// Split the pane `target` in two.
@@ -179,7 +190,14 @@ pub const Tree = struct {
     /// the pane the user was looking at stays where it was and the new one appears
     /// after it. Focus moves to the new pane, which is what makes a split useful
     /// immediately: the next thing typed goes into the new program.
+    ///
+    /// A tree at `max_panes` refuses rather than growing. That is not a limit on memory, which the
+    /// heap could supply: it is the point past which the rest of zmux stops being able to describe
+    /// the session. `focusNext` walks into a `[max_panes]PaneId` stack buffer, and `sendLayout`
+    /// numbers the tiled panes into a `u8`, so the 256th pane is where a session's own bookkeeping
+    /// runs out. Without this guard, reaching it panicked the server and took every session with it.
     pub fn split(self: *Tree, target: PaneId, axis: Axis, new_id: PaneId) !void {
+        if (self.leaves >= max_panes) return Error.TooManyPanes;
         const leaf = self.findLeaf(target) orelse return Error.NoSuchPane;
 
         const first = try self.gpa.create(Node);
@@ -198,6 +216,7 @@ pub const Tree = struct {
             .second = second,
         } };
 
+        self.leaves += 1;
         self.focused = new_id;
     }
 
@@ -237,6 +256,7 @@ pub const Tree = struct {
             self.gpa.destroy(root);
             self.root = null;
             self.focused = null;
+            self.leaves = 0;
             return null;
         }
 
@@ -257,6 +277,7 @@ pub const Tree = struct {
         doomed.deinit(self.gpa);
         self.gpa.destroy(doomed);
         self.gpa.destroy(survivor);
+        self.leaves -= 1;
 
         if (self.focused) |focused| {
             if (focused == target) self.focused = firstPaneOf(parent);
@@ -377,6 +398,7 @@ pub const Tree = struct {
             self.gpa.destroy(root);
             self.root = null;
             self.focused = null;
+            self.leaves = 0;
             return null;
         }
 
@@ -397,6 +419,7 @@ pub const Tree = struct {
         doomed.deinit(self.gpa);
         self.gpa.destroy(doomed);
         self.gpa.destroy(survivor);
+        self.leaves -= 1;
 
         const next_focus = firstPaneOf(parent);
         self.focused = next_focus;
@@ -604,15 +627,7 @@ pub const Tree = struct {
 
     /// How many panes the tree holds.
     pub fn count(self: *Tree) usize {
-        const root = self.root orelse return 0;
-        return countNode(root);
-    }
-
-    fn countNode(node: *Node) usize {
-        return switch (node.*) {
-            .leaf => 1,
-            .branch => |node_split| countNode(node_split.first) + countNode(node_split.second),
-        };
+        return self.leaves;
     }
 
     fn findLeaf(self: *Tree, target: PaneId) ?*Node {
@@ -974,6 +989,47 @@ test "closing an unknown pane is an error" {
     try tree.setRoot(a);
     try std.testing.expectError(Error.NoSuchPane, tree.close(9999));
     try std.testing.expectError(Error.NoSuchPane, tree.split(9999, .horizontal, tree.allocateId()));
+}
+
+test "a full tree refuses another pane rather than overflowing a label" {
+    // The defect this guards against is a server-wide crash. `sendLayout` numbers the tiled panes
+    // into a `u8`, so the 256th pane incremented it past 255; under `-Doptimize=ReleaseSafe`,
+    // which is how the flake builds zmux, that is a panic, and a panicking server takes every
+    // session with it. The tree is the only place that can refuse, since it is what knows how many
+    // panes there are.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const first = tree.allocateId();
+    try tree.setRoot(first);
+    try std.testing.expectEqual(@as(usize, 1), tree.count());
+
+    // Fill to the limit. Each split adds exactly one leaf, so the count is the check that the
+    // tracked field and the tree agree while it is being built.
+    var filled: usize = 1;
+    while (filled < max_panes) : (filled += 1) {
+        try tree.split(first, .horizontal, tree.allocateId());
+    }
+    try std.testing.expectEqual(@as(usize, max_panes), tree.count());
+
+    // The next one is refused, and refusing changes nothing: a tree left one pane short would be a
+    // worse outcome than the refusal.
+    try std.testing.expectError(
+        Error.TooManyPanes,
+        tree.split(first, .horizontal, tree.allocateId()),
+    );
+    try std.testing.expectEqual(@as(usize, max_panes), tree.count());
+
+    // Closing a pane makes room again, so the limit is a ceiling and not a one-way door.
+    _ = try tree.close(first);
+    try std.testing.expectEqual(@as(usize, max_panes - 1), tree.count());
+    try tree.split(tree.focused.?, .horizontal, tree.allocateId());
+    try std.testing.expectEqual(@as(usize, max_panes), tree.count());
+
+    // And detaching frees a slot too, which is the other way a pane leaves the tree.
+    _ = try tree.detach(tree.focused.?, 80, 24);
+    try std.testing.expectEqual(@as(usize, max_panes - 1), tree.count());
 }
 
 test "focus moves in tree order and wraps" {

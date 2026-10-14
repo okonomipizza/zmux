@@ -417,8 +417,22 @@ fn runAttach(
         try err.writeAll("zmux: wrote a default configuration; see it for every setting\n");
     }
 
-    const config = config_mod.load(gpa, env);
-    const client = client_mod.Client.init(gpa, paths.socket_path, .interactive, config, err, err) catch {
+    // A configuration that was there and could not be used is said out loud, because the fallback is
+    // to the defaults and a JSON error drops *every* setting at once. Silently starting with the
+    // user's colours and bindings gone is how a mistyped line reads as zmux ignoring the file.
+    const loaded = config_mod.load(gpa, env);
+    switch (loaded.problem) {
+        .absent => {},
+        .malformed => try err.writeAll(
+            "zmux: the configuration file is not valid JSON; every setting is at its default\n",
+        ),
+        .unreadable => try err.writeAll(
+            "zmux: the configuration file could not be read; every setting is at its default\n",
+        ),
+    }
+    if (loaded.problem != .absent) try err.flush();
+
+    const client = client_mod.Client.init(gpa, paths.socket_path, .interactive, loaded.config, err, err) catch {
         try err.writeAll("zmux: cannot reach the server\n");
         try err.flush();
         std.process.exit(1);
@@ -446,7 +460,7 @@ fn runAttach(
 fn runDetach(gpa: std.mem.Allocator, env: std.process.Environ, err: *std.Io.Writer) !void {
     _ = gpa;
     _ = env;
-    try err.writeAll("zmux: detach is sent by an attached client; press ctrl-a to detach\n");
+    try err.writeAll("zmux: detach is sent by an attached client; press ctrl-b twice to detach\n");
     try err.flush();
     std.process.exit(1);
 }
