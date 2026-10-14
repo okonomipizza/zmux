@@ -744,45 +744,54 @@ Done:
 
 Still open:
 
-- Bound per-session memory. Measured, and the numbers say the current limits are
-  already inside a reasonable bound; see below.
+- Bound per-session memory. The per-pane ceiling was lowered after measuring; see
+  below. A bound across the whole server is not written yet and is not needed at the
+  new default.
 
 ### What the scrollback actually costs
 
 Measured by filling a terminal and reading `/proc/self/statm`, on the pinned
-libghostty-vt:
+libghostty-vt. The line limit decides the ceiling and nothing else:
 
-| lines printed | history held | resident |
-| --- | --- | --- |
-| 1,000 | 977 | 0.8 MiB |
-| 5,000 | 4,977 | 3.3 MiB |
-| 10,000 | 9,977 | **6.6 MiB** |
-| 20,000 | 9,555 | 6.3 MiB |
-| 40,000 | 9,869 | 6.5 MiB |
+| line limit | empty pane | full | rows held |
+| --- | --- | --- | --- |
+| 2,000 | 44 KiB | **1.4 MiB** | 1,924 |
+| 5,000 | 44 KiB | 3.0 MiB | 4,555 |
+| 10,000 | 44 KiB | 6.4 MiB | 9,712 |
+| 20,000 | 44 KiB | 12.8 MiB | 19,447 |
 
-That is about 690 bytes per row, and a full 10,000-line history costs 6.6 MiB per
-pane. Two things follow.
+About 680 bytes per row, whatever the limit. Three things follow, and the first
+two are the ones that were guessed wrong before the measurement.
 
-The 32 MiB byte limit is **not** the binding constraint at the line limit: the line
-limit is reached at 6.6 MiB, long before the byte limit would apply. The byte limit
-matters only below 10,000 lines, which is exactly the bug it was raised to fix, and
-there it is doing its job. It is a ceiling that is never touched in the ordinary
-case, which is the right shape for a ceiling.
+**An empty pane costs 44 KiB at every limit.** It is not proportional to the line
+limit, so the limit is not a start-up cost. There is also a one-time ~1 MiB of
+library setup per server, which is neither per pane nor avoidable, and which the
+first measurement in this file wrongly attributed to panes.
 
-For comparison, tmux's default `history-limit` is 2,000 lines, and its server grew
-from 3.9 MiB to 4.2 MiB when 2,000 lines were printed: about 170 bytes per row. So
-zmux holds five times the history for about nineteen times the memory per row, and
-6.6 MiB per pane against tmux's 0.34 MiB. With four panes at a full history that is
-about 26 MiB, and with ten about 66 MiB.
+**What the line limit sets is the ceiling**: 1.4 MiB per pane at 2,000 rows against
+6.4 MiB at 10,000. The default was lowered from 10,000 to 2,000 for that reason.
+Ten panes at a full history go from about 64 MiB to about 14 MiB. The judgement is
+that ten thousand lines is more than a screenful-by-screenful reader walks, and
+that the panes which fill up fastest are the ones printing long output, which is
+when memory is least welcome. tmux's default is 2,000 as well, so this is the
+familiar number rather than a new one.
 
-Whether that is acceptable is a judgement rather than a measurement. The case for
-leaving it: 6.6 MiB is small next to the editors and browsers a terminal sits beside,
-the scrollback is only that large when it is actually full, and 10,000 lines is the
-reason a long build or test log can be read back at all. The case against: nothing
-stops ten panes and 66 MiB, and a user who never scrolls pays it anyway.
+**Even so, zmux costs about four times tmux per full pane**: 1.4 MiB for 1,924 rows
+against tmux's 0.34 MiB for 2,000. That is per-row storage and not the limit, and it
+is a separate question from the one answered here. Nothing has been done about it.
 
-What is *not* yet written down is a limit on the total across a server rather than per
-pane. That is the shape a memory bound would need, and it is not there.
+The byte limit is **not** the binding constraint at the line limit and never was:
+the line limit is reached at 1.4 MiB, long before a 4 MiB byte limit would apply. It
+matters only below the line limit, which is exactly the bug it was raised to fix, and
+there it does its job. A ceiling that is not reached in the ordinary case is the right
+shape for a ceiling. It was lowered alongside the line limit, from 32 MiB, because a
+limit that cannot be reached is not protecting anything; 4 MiB still leaves room for
+a row carrying far more styling than ordinary text.
+
+What is still not written down is a bound on the total across a server rather than
+per pane. With the default lowered it is not needed yet: ten panes at a full history
+is about 14 MiB. It would be the shape a memory bound needs if the per-pane ceiling
+were ever raised again.
 - Server restart behaviour: sessions are lost, but the client reports it clearly. The report
   is now clearer, but nothing survives a restart.
 - **Unverified at the time, now verified:** a server that dies while a client is attached,

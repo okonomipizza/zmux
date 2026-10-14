@@ -39,16 +39,31 @@ pub const Terminal = struct {
         cols: u16,
         rows: u16,
         /// Maximum lines retained in scrollback history.
-        max_scrollback: usize = 10_000,
+        ///
+        /// Two thousand, which is tmux's default. Measured on the pinned library, a full history
+        /// costs about 680 bytes per row whatever the limit, so this is the ceiling of a pane's
+        /// memory: 1.3 MiB per pane here against 6.4 MiB at ten thousand. An empty pane costs 44 KiB
+        /// at either limit, so this is not a start-up cost; it is what a pane can grow to.
+        ///
+        /// The number is a judgement about how much history is worth paying for. Ten thousand lines
+        /// is more than a screenful-by-screenful reader ever walks, and the panes that fill up
+        /// fastest are the ones printing long output, which is exactly when the memory is least
+        /// welcome.
+        max_scrollback: usize = 2_000,
         /// Maximum bytes of scrollback history, or null for the library's default.
         ///
         /// The line limit alone is not enough, and this is the reason a long run of output stopped
         /// being reachable part-way. The library keeps *both* limits and prunes at whichever is
-        /// reached first, and its default byte limit is small enough to be hit long before ten
-        /// thousand lines: printing `seq 1 1000` into an 80-column pane retained only about 870 rows
-        /// and silently discarded the rest. Raising it is what lets the line limit be the one that
+        /// reached first, and its default byte limit is small enough to be hit long before the line
+        /// limit: printing `seq 1 1000` into an 80-column pane retained only about 870 rows and
+        /// silently discarded the rest. Raising it is what lets the line limit be the one that
         /// governs, which is the limit a reader expects.
-        max_scrollback_bytes: ?usize = 32 * 1024 * 1024,
+        ///
+        /// Four mebibytes is ample for two thousand rows, which measure about 1.3 MiB for ordinary
+        /// text. It is a ceiling that is not reached in the ordinary case, which is the right shape
+        /// for one: it exists to bound a pathological row, such as one carrying a great many styles,
+        /// not to decide how much history a pane keeps.
+        max_scrollback_bytes: ?usize = 4 * 1024 * 1024,
     };
 
     pub fn init(options: Options) Error!Terminal {
@@ -1014,34 +1029,39 @@ test "write_pty keeps working when the owner is heap-allocated" {
 
 test "a long run of output is retained up to the line limit" {
     // The defect this guards against: the library keeps both a line limit and a byte limit and prunes
-    // at whichever is reached first, and its default byte limit is far smaller than what ten thousand
-    // lines need. Printing `seq 1 1000` into an 80-column pane therefore kept only about 870 rows and
+    // at whichever is reached first, and its default byte limit is far smaller than what the line
+    // limit needs. Printing `seq 1 1000` into an 80-column pane therefore kept only about 870 rows and
     // silently discarded the rest, so scrolling back stopped part-way with no indication why.
     //
     // Every line here is short and unstyled, which is the cheapest case for the byte limit; a run
     // with colour would be pruned sooner still.
+    const limit = (Terminal.Options{ .cols = 1, .rows = 1 }).max_scrollback;
     var terminal = try Terminal.init(.{ .cols = 78, .rows = 21 });
     defer terminal.deinit();
 
     var n: usize = 1;
     var buf: [32]u8 = undefined;
-    while (n <= 1000) : (n += 1) {
+    // Half the limit, so that the first half of the test is about retention rather than about what
+    // the limit is.
+    const below = limit / 2;
+    while (n <= below) : (n += 1) {
         terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{n}));
     }
 
-    // A thousand lines into twenty-one rows leaves every line above the last screenful in history.
+    // Those lines into twenty-one rows leaves every line above the last screenful in history.
     const held = terminal.scrollbackRows();
-    try std.testing.expect(held >= 1000 - 21);
+    try std.testing.expect(held >= below - 21);
 
     // And the limit is still a limit: printing far past it keeps the configured number of lines
-    // rather than growing without bound.
-    var count: usize = 1001;
-    while (count <= 12_000) : (count += 1) {
+    // rather than growing without bound. The bound is the configured one and not a literal, so that
+    // changing the default does not silently stop this from testing anything.
+    var count: usize = below + 1;
+    while (count <= limit * 3) : (count += 1) {
         terminal.write(try std.fmt.bufPrint(&buf, "{d}\r\n", .{count}));
     }
     const capped = terminal.scrollbackRows();
-    try std.testing.expect(capped <= 10_000);
-    try std.testing.expect(capped > 9_000);
+    try std.testing.expect(capped <= limit);
+    try std.testing.expect(capped > limit * 9 / 10);
 }
 
 test "the byte limit can be lowered, and is what stops a run when it is" {
