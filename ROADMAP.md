@@ -744,15 +744,53 @@ Done:
 
 Still open:
 
-- Bound per-session memory; large scrollback is the main consumer. The configuration sets a
-  32 MiB byte limit per pane, which is a deliberate ceiling rather than a measured one.
+- Bound per-session memory. Measured, and the numbers say the current limits are
+  already inside a reasonable bound; see below.
+
+### What the scrollback actually costs
+
+Measured by filling a terminal and reading `/proc/self/statm`, on the pinned
+libghostty-vt:
+
+| lines printed | history held | resident |
+| --- | --- | --- |
+| 1,000 | 977 | 0.8 MiB |
+| 5,000 | 4,977 | 3.3 MiB |
+| 10,000 | 9,977 | **6.6 MiB** |
+| 20,000 | 9,555 | 6.3 MiB |
+| 40,000 | 9,869 | 6.5 MiB |
+
+That is about 690 bytes per row, and a full 10,000-line history costs 6.6 MiB per
+pane. Two things follow.
+
+The 32 MiB byte limit is **not** the binding constraint at the line limit: the line
+limit is reached at 6.6 MiB, long before the byte limit would apply. The byte limit
+matters only below 10,000 lines, which is exactly the bug it was raised to fix, and
+there it is doing its job. It is a ceiling that is never touched in the ordinary
+case, which is the right shape for a ceiling.
+
+For comparison, tmux's default `history-limit` is 2,000 lines, and its server grew
+from 3.9 MiB to 4.2 MiB when 2,000 lines were printed: about 170 bytes per row. So
+zmux holds five times the history for about nineteen times the memory per row, and
+6.6 MiB per pane against tmux's 0.34 MiB. With four panes at a full history that is
+about 26 MiB, and with ten about 66 MiB.
+
+Whether that is acceptable is a judgement rather than a measurement. The case for
+leaving it: 6.6 MiB is small next to the editors and browsers a terminal sits beside,
+the scrollback is only that large when it is actually full, and 10,000 lines is the
+reason a long build or test log can be read back at all. The case against: nothing
+stops ten panes and 66 MiB, and a user who never scrolls pays it anyway.
+
+What is *not* yet written down is a limit on the total across a server rather than per
+pane. That is the shape a memory bound would need, and it is not there.
 - Server restart behaviour: sessions are lost, but the client reports it clearly. The report
   is now clearer, but nothing survives a restart.
-- **Unverified:** a server that dies while a client is attached, rather than one that is
-  killed by `kill-all`. The message is written and reachable, but driving it needs the
-  server's own pid, and `zmux ls` reports the *pane's* pid. Killing that is an ordinary
-  program exit, which is what three attempts at the probe did before this was noticed —
-  each one looked like confirmation that the fix was needed.
+- **Unverified at the time, now verified:** a server that dies while a client is attached,
+  rather than one killed by `kill-all`. The client prints `zmux: lost the server (Closed);
+  the session is gone` and exits without inventing an exit status. Reaching it took three
+  wrong probes, all of which killed the *pane's program* instead of the server: `zmux ls`
+  reports `first_pane`, so the pid it prints is the program inside the pane. The server is
+  that process's **parent**, which `/proc/<pid>/stat` gives in its fourth field.
 
 ## Open questions
 
