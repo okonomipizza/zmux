@@ -400,6 +400,18 @@ beside each other, and a dash lies the way they are stacked. The old keys are fr
 `v` had the further problem of being vim's visual mode, which is the one thing a
 multiplexer's `v` might be expected to mean.
 
+The focus keys were the one part of the vim flavour that did not hold up. `h`/`k` were
+both "previous" and `l`/`j` both "next", walking the tree's order and wrapping, so in a
+layout of three columns `j` moved sideways and `k` moved the way `h` did: the keys named
+directions and did something else. They now move one pane the way the key points, chosen
+from the geometry the server already computed — the nearest pane in that direction whose
+band overlaps the current one, so a tall pane beside a stack of two is reachable from
+both. A direction with nothing in it moves nothing rather than wrapping, and a raised
+float refuses the move outright, because a float has no rectangle in the layout and no
+neighbour to reach. The swap and rotate keys keep the tree order they always had, which
+is a different question — "which pane comes next in the arrangement" rather than "which
+pane is over there" — and the README no longer claims the two orders are the same.
+
 Closing the last pane discards the session, which is what a program exiting in it already
 did. It used to remove the pane and leave the session behind, so the client stayed attached
 to an empty window with a status line over it, and its state had no name: attached to

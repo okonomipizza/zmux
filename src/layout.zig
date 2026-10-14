@@ -77,6 +77,32 @@ pub const Axis = enum {
     vertical,
 };
 
+/// Which way the user is looking when they ask to move.
+///
+/// Separate from `Axis` because the two answer different questions and their names would
+/// otherwise lie. A `horizontal` split puts its children side by side, but the key that moves to
+/// one of them points left or right; `Axis.horizontal` is the split's own axis, and `.left` is
+/// where the eye goes. Sharing one enum would make `left` mean `horizontal` at the call site and
+/// read as a bug.
+pub const Direction = enum {
+    left,
+    right,
+    up,
+    down,
+
+    /// Which way the move runs along its axis, for callers comparing coordinates.
+    ///
+    /// Right and down run with increasing coordinates, left and up against them. The axis itself is
+    /// not exposed: what a caller needs is which way along it to look, and the two comparisons that
+    /// use this are written per direction anyway, because the band each one shares is different.
+    pub fn forward(self: Direction) bool {
+        return switch (self) {
+            .right, .down => true,
+            .left, .up => false,
+        };
+    }
+};
+
 pub const Error = error{
     /// No pane has that identifier.
     NoSuchPane,
@@ -193,9 +219,10 @@ pub const Tree = struct {
     ///
     /// A tree at `max_panes` refuses rather than growing. That is not a limit on memory, which the
     /// heap could supply: it is the point past which the rest of zmux stops being able to describe
-    /// the session. `focusNext` walks into a `[max_panes]PaneId` stack buffer, and `sendLayout`
-    /// numbers the tiled panes into a `u8`, so the 256th pane is where a session's own bookkeeping
-    /// runs out. Without this guard, reaching it panicked the server and took every session with it.
+    /// the session. `sendLayout` numbers the tiled panes into a `u8`, and the focus keys read the
+    /// arrangement into a `[max_panes]Placement` buffer instead of allocating on a keystroke, so the
+    /// 256th pane is where a session's own bookkeeping runs out. Without this guard, reaching it
+    /// panicked the server and took every session with it.
     pub fn split(self: *Tree, target: PaneId, axis: Axis, new_id: PaneId) !void {
         if (self.leaves >= max_panes) return Error.TooManyPanes;
         const leaf = self.findLeaf(target) orelse return Error.NoSuchPane;
@@ -426,58 +453,60 @@ pub const Tree = struct {
         return next_focus;
     }
 
-    /// Move focus to the next pane in tree order, wrapping around.
+    /// Move focus to the pane `direction` of the one that has it.
     ///
-    /// Tree order is left-to-right and top-to-bottom for the layout the tree
-    /// describes, so "next" follows what the eye does.
+    /// The move is geometric, because that is what makes the keys mean what they look like: a
+    /// layout with three panes side by side has nothing above or below them, so `j` and `k` have
+    /// nowhere to go, while `h` and `l` walk the row. A tree-order walk cannot express that — it
+    /// answers "which pane comes next", and the answer for `j` and `l` is the same pane, so half
+    /// the keys look broken.
     ///
-    /// The order is recomputed on each call rather than cached, because the tree
-    /// changes as panes are split and closed and a cached order would have to be
-    /// invalidated in every one of those paths. The walk is over a fixed buffer, so
-    /// a keystroke can move focus without allocating.
-    pub fn focusNext(self: *Tree) ?PaneId {
-        var ids: [max_panes]PaneId = undefined;
-        var found: usize = 0;
-        if (self.root) |root| collectInto(root, &ids, &found);
+    /// The nearest pane in the direction wins, and a pane that only partly overlaps the current
+    /// one's band still counts: it is on screen in that direction, so refusing to move there would
+    /// read as a dead key. The distance is measured between the two panes' facing edges, so a
+    /// neighbour that begins right at the current pane's edge is one step away however long either
+    /// pane is, and a pane further along the same direction loses to the one beside it.
+    ///
+    /// The geometry is recomputed on each call rather than cached, because the tree changes as
+    /// panes are split, closed and resized, and a cached arrangement would have to be invalidated
+    /// in every one of those paths.
+    ///
+    /// Returns null and leaves focus alone when there is nothing in that direction, which is not an
+    /// error: the user pressed a key that points at the edge of the layout. Nothing wraps, because
+    /// wrapping would contradict the direction the key names — pressing `l` in the rightmost pane
+    /// would send the eye back to the left.
+    ///
+    /// `cols` and `rows` must be the area the panes were last laid out in, or the neighbours are
+    /// computed from rectangles that do not match the screen. The session stores both, and
+    /// `relayout` is what keeps them in step with the tree.
+    pub fn focusDirection(
+        self: *Tree,
+        direction: Direction,
+        cols: u16,
+        rows: u16,
+    ) !?PaneId {
+        var placements: std.ArrayList(Placement) = .empty;
+        defer placements.deinit(self.gpa);
+        try self.layout(&placements, cols, rows);
 
-        if (found == 0) return null;
+        const current = self.focused orelse return null;
 
-        const current = self.focused orelse {
-            self.focused = ids[0];
-            return self.focused;
-        };
-        for (ids[0..found], 0..) |id, index| {
-            if (id == current) {
-                self.focused = ids[(index + 1) % found];
-                return self.focused;
+        var from: Rect = .{};
+        var found = false;
+        for (placements.items) |placement| {
+            if (placement.id == current) {
+                from = placement.rect;
+                found = true;
+                break;
             }
         }
-        // The focused pane is not in the tree, which should not happen; falling
-        // back to the first is better than leaving focus pointing nowhere.
-        self.focused = ids[0];
-        return self.focused;
-    }
+        // The focused pane is not in the tree. That should not happen; leaving focus where it is
+        // beats moving it to a pane the user did not ask for.
+        if (!found) return null;
 
-    /// Move focus to the previous pane in tree order, wrapping around.
-    pub fn focusPrevious(self: *Tree) ?PaneId {
-        var ids: [max_panes]PaneId = undefined;
-        var found: usize = 0;
-        if (self.root) |root| collectInto(root, &ids, &found);
-
-        if (found == 0) return null;
-
-        const current = self.focused orelse {
-            self.focused = ids[0];
-            return self.focused;
-        };
-        for (ids[0..found], 0..) |id, index| {
-            if (id == current) {
-                self.focused = ids[(index + found - 1) % found];
-                return self.focused;
-            }
-        }
-        self.focused = ids[0];
-        return self.focused;
+        const neighbour = adjacentTo(placements.items, current, from, direction) orelse return null;
+        self.focused = neighbour;
+        return neighbour;
     }
 
     /// Give a pane a new share of its parent split.
@@ -675,25 +704,85 @@ pub const Tree = struct {
 
 /// The most panes one tree may hold.
 ///
-/// This bounds the stack buffer `focusNext` walks into. It is not a limit on the
-/// tree itself, which grows on the heap; it is the point past which focus cycling
-/// would have to allocate, and a user navigating that many panes one keypress at a
-/// time is not the case worth allocating for.
-pub const max_panes = 256;
+/// This is the point past which the rest of zmux stops being able to describe the session. A
+/// client's layout event numbers its panes into a `u8`, and `protocol.Decoder.max_panes` bounds the
+/// placements it can carry. It is not a limit on memory, which the heap could supply.
+pub const max_panes = protocol.Decoder.max_panes;
 
-fn collectInto(node: *Node, out: *[max_panes]PaneId, count: *usize) void {
-    switch (node.*) {
-        .leaf => |id| {
-            if (count.* < out.len) {
-                out[count.*] = id;
-                count.* += 1;
-            }
-        },
-        .branch => |node_split| {
-            collectInto(node_split.first, out, count);
-            collectInto(node_split.second, out, count);
-        },
+/// Choose which pane focus moves to when the user points in a direction.
+///
+/// A candidate is any pane lying that way whose band overlaps the current one's, and the nearest of
+/// those wins. "Lies that way" is decided by the two edges rather than by the centres: a tall pane
+/// beside a stack of two short ones is next to both of them, and comparing centres would pick
+/// whichever centre happened to be nearer rather than the pane actually alongside.
+///
+/// Distance is measured between the facing edges, so a candidate that starts immediately at the
+/// current pane's edge is one cell away however long the two of them are. Measuring centre to centre
+/// would instead make a long pane look far away and a short one look near, which is not what the eye
+/// sees.
+///
+/// Overlap is required rather than exact alignment, because panes divided unevenly do not line up:
+/// three columns of different widths each overlap the others only partly, and demanding an exact
+/// match would leave most of them unreachable.
+fn adjacentTo(
+    placements: []const Placement,
+    current: PaneId,
+    from: Rect,
+    direction: Direction,
+) ?PaneId {
+    var best: ?PaneId = null;
+    var best_distance: u32 = std.math.maxInt(u32);
+
+    for (placements) |placement| {
+        if (placement.id == current) continue;
+        const rect = placement.rect;
+
+        // The band the two panes have to share, and the gap between their facing edges. A move
+        // left or right shares rows and is measured in columns; a move up or down shares columns
+        // and is measured in rows. The band is an overlap test, not an equality one: panes divided
+        // unevenly do not line up, and demanding a match would make most of them unreachable.
+        const distance: ?u32 = switch (direction) {
+            .left, .right => blk: {
+                const shares_rows = rect.y < from.y + from.height and from.y < rect.y + rect.height;
+                if (!shares_rows) break :blk null;
+                break :blk gap(from.x, from.width, rect.x, rect.width, direction.forward());
+            },
+            .up, .down => blk: {
+                const shares_cols = rect.x < from.x + from.width and from.x < rect.x + rect.width;
+                if (!shares_cols) break :blk null;
+                break :blk gap(from.y, from.height, rect.y, rect.height, direction.forward());
+            },
+        };
+
+        // A pane that lies behind the direction rather than ahead of it has no gap to measure.
+        const d = distance orelse continue;
+
+        // Ties are broken by the walk order, which is tree order. Two panes equidistant in the same
+        // direction is a symmetric layout, and either answer is as good as the other.
+        if (d < best_distance) {
+            best_distance = d;
+            best = placement.id;
+        }
     }
+
+    return best;
+}
+
+/// How far `other` lies beyond `current` along one axis, or null when it does not.
+///
+/// `forward` says which way the move goes: right and down run with increasing coordinates, left and
+/// up against them. Only panes strictly ahead count, so a move never lands on a pane the user was
+/// not pointing at, and the distance is measured between the facing edges -- so a candidate that
+/// starts immediately at the current pane's edge is one step away however long either pane is.
+fn gap(current_start: u16, current_size: u16, other_start: u16, other_size: u16, forward: bool) ?u32 {
+    if (forward) {
+        const current_end = @as(u32, current_start) + current_size;
+        if (other_start < current_end) return null;
+        return @as(u32, other_start) - current_end;
+    }
+    const other_end = @as(u32, other_start) + other_size;
+    if (other_end > current_start) return null;
+    return @as(u32, current_start) - other_end;
 }
 
 /// Split a rectangle along an axis and return the two halves.
@@ -1032,7 +1121,7 @@ test "a full tree refuses another pane rather than overflowing a label" {
     try std.testing.expectEqual(@as(usize, max_panes - 1), tree.count());
 }
 
-test "focus moves in tree order and wraps" {
+test "focus moves toward the pane the direction points at" {
     const gpa = std.testing.allocator;
     var tree = Tree.init(gpa);
     defer tree.deinit();
@@ -1042,10 +1131,173 @@ test "focus moves in tree order and wraps" {
     const b = tree.allocateId();
     try tree.split(a, .horizontal, b);
 
-    // The split focused `b`.
+    // The split focused `b`, which is the right half.
     try std.testing.expectEqual(@as(?PaneId, b), tree.focused);
-    try std.testing.expectEqual(@as(?PaneId, a), tree.focusNext());
-    try std.testing.expectEqual(@as(?PaneId, b), tree.focusNext());
+
+    // `h` reaches the left half, and there is nothing further left to reach.
+    try std.testing.expectEqual(@as(?PaneId, a), try tree.focusDirection(.left, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.left, 80, 24));
+
+    // `l` comes back, and the right edge is the end of the row.
+    try std.testing.expectEqual(@as(?PaneId, b), try tree.focusDirection(.right, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.right, 80, 24));
+}
+
+test "a direction with no pane in it leaves focus alone" {
+    // Two panes side by side have nothing above or below them, so the vertical keys do nothing.
+    // This is the case that made the old tree-order walk look arbitrary: it moved for every key.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const left = tree.allocateId();
+    try tree.setRoot(left);
+    const right = tree.allocateId();
+    try tree.split(left, .horizontal, right);
+
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.up, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, right), tree.focused);
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.down, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, right), tree.focused);
+}
+
+test "focus in a 2x2 grid reaches the pane on each side" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const top_left = tree.allocateId();
+    try tree.setRoot(top_left);
+    const top_right = tree.allocateId();
+    try tree.split(top_left, .horizontal, top_right);
+    const bottom_left = tree.allocateId();
+    try tree.split(top_left, .vertical, bottom_left);
+    const bottom_right = tree.allocateId();
+    try tree.split(top_right, .vertical, bottom_right);
+
+    // Start in the top-left corner.
+    tree.focused = top_left;
+
+    try std.testing.expectEqual(@as(?PaneId, top_right), try tree.focusDirection(.right, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, bottom_right), try tree.focusDirection(.down, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, bottom_left), try tree.focusDirection(.left, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, top_left), try tree.focusDirection(.up, 80, 24));
+}
+
+test "focus leaves the row for the pane that spans it" {
+    // One wide pane on the left, two stacked on the right. From the left pane, `l` has two
+    // candidates and has to pick the one alongside; the tall pane beside a stack is next to both
+    // of the stacked ones, and a centre-to-centre rule would pick whichever centre is nearer.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const left = tree.allocateId();
+    try tree.setRoot(left);
+    const right_top = tree.allocateId();
+    try tree.split(left, .horizontal, right_top);
+    const right_bottom = tree.allocateId();
+    try tree.split(right_top, .vertical, right_bottom);
+
+    tree.focused = left;
+
+    // Both stacked panes start at the same column, so either is correct; what matters is that a
+    // move right stays in the right-hand column and does not pick a pane by its centre.
+    const reached = (try tree.focusDirection(.right, 80, 24)).?;
+    try std.testing.expect(reached == right_top or reached == right_bottom);
+
+    // From a stacked pane, moving left crosses the whole width to the wide pane.
+    tree.focused = right_bottom;
+    try std.testing.expectEqual(@as(?PaneId, left), try tree.focusDirection(.left, 80, 24));
+
+    // And from the lower stacked pane, moving up reaches its sibling in the same column. The
+    // previous move left focus on the wide pane, so it is set again rather than assumed.
+    tree.focused = right_bottom;
+    try std.testing.expectEqual(@as(?PaneId, right_top), try tree.focusDirection(.up, 80, 24));
+}
+
+test "focus follows uneven splits rather than exact alignment" {
+    // Three panes: the left one is wide, and the right one is split into two rows. The wide pane's
+    // rows overlap both of the small ones only partly, and never exactly, so a rule demanding a
+    // matching band would leave it unreachable from either.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const left = tree.allocateId();
+    try tree.setRoot(left);
+    const right_top = tree.allocateId();
+    try tree.split(left, .horizontal, right_top);
+    const right_bottom = tree.allocateId();
+    try tree.split(right_top, .vertical, right_bottom);
+
+    // An odd number of rows cannot be halved exactly, so the two right-hand panes do not share
+    // their parent's band with the left one on equal terms.
+    var placements: std.ArrayList(Placement) = .empty;
+    defer placements.deinit(gpa);
+    try tree.layout(&placements, 79, 25);
+    const left_rect = placements.items[0].rect;
+    const top_rect = placements.items[1].rect;
+
+    // The premise: neither right-hand pane shares the left pane's full band.
+    try std.testing.expect(top_rect.height != left_rect.height);
+    try std.testing.expect(top_rect.height < left_rect.height);
+
+    tree.focused = left;
+    try std.testing.expectEqual(@as(?PaneId, right_top), try tree.focusDirection(.right, 79, 25));
+
+    tree.focused = right_bottom;
+    try std.testing.expectEqual(@as(?PaneId, left), try tree.focusDirection(.left, 79, 25));
+}
+
+test "focus picks the nearest pane when several lie the same way" {
+    // Three columns: from the leftmost, moving right must land on the middle one and not the far
+    // one, which is the difference between measuring to the facing edge and measuring to the centre.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .horizontal, b);
+    const c = tree.allocateId();
+    try tree.split(b, .horizontal, c);
+
+    tree.focused = a;
+    try std.testing.expectEqual(@as(?PaneId, b), try tree.focusDirection(.right, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, c), try tree.focusDirection(.right, 80, 24));
+}
+
+test "focus does not wrap around the layout" {
+    // Wrapping would contradict the key: `l` in the rightmost pane would send the eye left.
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    const a = tree.allocateId();
+    try tree.setRoot(a);
+    const b = tree.allocateId();
+    try tree.split(a, .vertical, b);
+
+    tree.focused = a;
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.up, 80, 24));
+
+    tree.focused = b;
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.down, 80, 24));
+}
+
+test "focus on an empty tree has nothing to move to" {
+    const gpa = std.testing.allocator;
+    var tree = Tree.init(gpa);
+    defer tree.deinit();
+
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.left, 80, 24));
+
+    const only = tree.allocateId();
+    try tree.setRoot(only);
+    try std.testing.expectEqual(@as(?PaneId, null), try tree.focusDirection(.right, 80, 24));
+    try std.testing.expectEqual(@as(?PaneId, only), tree.focused);
 }
 
 test "a ratio is clamped so neither pane can be squeezed away" {

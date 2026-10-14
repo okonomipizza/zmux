@@ -111,10 +111,18 @@ pub const Request = union(enum) {
     close: struct {
         name: Name,
     },
-    /// Move focus within the session. `backwards` reverses the direction.
+    /// Move focus to the pane in the given direction.
+    ///
+    /// A direction rather than the old "next"/"previous", because those two were a walk in tree
+    /// order and answered the same for `h`/`k` and for `l`/`j`. Which pane a direction reaches is
+    /// geometry the server owns, so the client sends the key's meaning and the server decides.
+    ///
+    /// The number is a wire value and is not `layout.Direction`'s own order: that enum is free to
+    /// be rearranged, and a value on the wire has to keep its meaning across builds.
     focus: struct {
         name: Name,
-        backwards: bool,
+        /// 0 left, 1 right, 2 up, 3 down.
+        direction: u8,
     },
     /// Move the focused pane within the layout, without disturbing the layout's shape.
     ///
@@ -481,7 +489,7 @@ pub const Encoder = struct {
             .focus => |focus| {
                 try self.begin(Tag.focus);
                 try self.name(&focus.name);
-                try self.u8le(if (focus.backwards) 1 else 0);
+                try self.u8le(focus.direction);
             },
             .layout_move => |move| {
                 try self.begin(Tag.layout_move);
@@ -692,7 +700,7 @@ pub const Decoder = struct {
             Tag.close => Request{ .close = .{ .name = try self.name() } },
             Tag.focus => Request{ .focus = .{
                 .name = try self.name(),
-                .backwards = (try self.u8le()) != 0,
+                .direction = try self.u8le(),
             } },
             Tag.layout_move => Request{ .layout_move = .{
                 .name = try self.name(),
@@ -1065,11 +1073,11 @@ test "split, close and focus requests round-trip" {
     {
         const frame = try encoder.writeRequest(.{ .focus = .{
             .name = name,
-            .backwards = true,
+            .direction = 3,
         } });
         var decoder = Decoder.init(frame);
         const request = try decoder.request();
-        try std.testing.expect(request.focus.backwards);
+        try std.testing.expectEqual(@as(u8, 3), request.focus.direction);
     }
 
     {

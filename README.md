@@ -85,13 +85,20 @@ Inside an attached session the prefix key is `ctrl-b`:
 | `ctrl-b F` | float the focused pane above the layout |
 | `ctrl-b d` | dock a floating pane back into the layout |
 | `ctrl-b f` | hide the floating panes, or show them again |
-| `ctrl-b h` / `k` | move focus to the previous pane |
-| `ctrl-b l` / `j` | move focus to the next pane |
+| `ctrl-b h` / `j` / `k` / `l` | move focus one pane left, down, up or right |
 | `ctrl-b <` / `>` | move the focused pane past its neighbour |
 | `ctrl-b o` | rotate every pane one place along |
 | `ctrl-b w` | list the sessions and switch to one |
 | `ctrl-b x` | read the focused pane's history |
 | `ctrl-b ctrl-b` | detach, leaving every pane running |
+
+`ctrl-b h`, `j`, `k` and `l` move focus one pane in the direction the key points,
+so the keys mean what they look like rather than walking a list. Which pane that
+is comes from the geometry, so a tall pane beside a stack of two short ones is
+reached by both of them, and the nearest pane that way wins. A direction with
+nothing in it moves nothing: in a row of three panes side by side, `j` and `k` do
+not move, and `l` in the rightmost pane stays where it is. Nothing wraps around
+to the other side, which would contradict the direction the key names.
 
 `ctrl-b x` opens the focused pane's scrollback for reading. `j` and `k` move a
 line at a time, `J` and `K` ten, `ctrl-d` and `ctrl-u` half a screen, `ctrl-f`
@@ -112,12 +119,14 @@ running, and its panes are still there when you come back. The list is asked for
 each time the menu opens, so a session started in another terminal is there and
 one whose last pane exited is not.
 
-`ctrl-b <` and `ctrl-b >` swap the focused pane with the pane beside it in the
-layout's order, which is the same order the focus keys walk. `ctrl-b o` shifts
-every pane one place along instead, last to first. Neither changes the shape of
-the layout: the split ratios you built stay as they are, and only which pane sits
-where changes. The programs inside are not disturbed beyond being resized to
-their new rectangles, so a swap costs nothing but a redraw.
+`ctrl-b <` and `ctrl-b >` swap the focused pane with the pane before or after it
+in the layout's own order, which runs left to right and top to bottom. That order
+is not the order the focus keys walk: `h`, `j`, `k` and `l` go by geometry, so
+they move to whichever pane lies that way. `ctrl-b o` shifts every pane one place
+along instead, last to first. None of them changes the shape of the layout: the
+split ratios you built stay as they are, and only which pane sits where changes.
+The programs inside are not disturbed beyond being resized to their new
+rectangles, so a swap costs nothing but a redraw.
 
 Each pane is its own program on its own pty, so a split gives two shells side by
 side. A pane is drawn with a border around it, and the program is given the area

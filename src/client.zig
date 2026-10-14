@@ -1361,9 +1361,13 @@ pub const Client = struct {
             'F'
         else if (byte == keybinds.dock)
             'd'
-        else if (byte == keybinds.focus_previous or byte == keybinds.focus_previous_alt)
+        else if (byte == keybinds.focus_left)
             'h'
-        else if (byte == keybinds.focus_next or byte == keybinds.focus_next_alt)
+        else if (byte == keybinds.focus_down)
+            'j'
+        else if (byte == keybinds.focus_up)
+            'k'
+        else if (byte == keybinds.focus_right)
             'l'
         else if (byte == keybinds.move_next)
             '>'
@@ -1421,20 +1425,19 @@ pub const Client = struct {
                 } });
                 return false;
             },
-            // h/j/k/l move focus. They all map onto the tree's own order for now, which
-            // walks left to right and wraps; a direction-aware move needs the geometry the
-            // server already has and can come later.
-            'h', 'k' => {
+            // h/j/k/l move focus one pane in the direction the key points. The client sends the
+            // direction rather than a pane, because which pane is "to the left" is geometry, and
+            // the server owns the arrangement. A direction with nothing in it moves nothing.
+            'h', 'j', 'k', 'l' => {
+                const direction: u8 = switch (command) {
+                    'h' => 0,
+                    'l' => 1,
+                    'k' => 2,
+                    else => 3,
+                };
                 try self.sendRequest(.{ .focus = .{
                     .name = self.watching,
-                    .backwards = true,
-                } });
-                return false;
-            },
-            'l', 'j' => {
-                try self.sendRequest(.{ .focus = .{
-                    .name = self.watching,
-                    .backwards = false,
+                    .direction = direction,
                 } });
                 return false;
             },

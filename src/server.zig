@@ -914,11 +914,24 @@ pub const Server = struct {
                 const index = self.findSession(focus.name.slice()) orelse
                     return Error.UnknownSession;
                 const session = &self.sessions.items[index];
-                if (focus.backwards) {
-                    _ = session.tree.focusPrevious();
-                } else {
-                    _ = session.tree.focusNext();
-                }
+                // A float is drawn on top and takes the keystrokes, so while one is raised it is
+                // what the direction keys are pointing away from. A float is not in the tree and
+                // the layout has no rectangle for it, so there is no neighbour to reach; the
+                // request is refused rather than applied to the tiled pane hidden behind it.
+                if (session.focused_float != null) return;
+                const direction: layout.Direction = switch (focus.direction) {
+                    0 => .left,
+                    1 => .right,
+                    2 => .up,
+                    3 => .down,
+                    // An unknown direction is a client this server does not understand; doing
+                    // nothing is better than moving focus somewhere the user did not point.
+                    else => return,
+                };
+                // The session's own area is the geometry the panes were last laid out in, so it is
+                // what the neighbour is computed from. Reading it here rather than remembering a
+                // separate copy is what keeps the two from disagreeing after a resize.
+                _ = try session.tree.focusDirection(direction, session.cols, session.rows) orelse return;
                 try self.sendLayout(session);
             },
             .layout_move => |move| {
@@ -1274,7 +1287,8 @@ pub const Server = struct {
         // a tiled pane reaches this increment. That bound is what keeps this from overflowing: with
         // the guard removed, the 256th pane panicked the server here and every session went with it.
         // This is not a place to widen the type and drop the guard, because the rest of zmux cannot
-        // describe pane 257 either -- `focusNext` walks a `[max_panes]PaneId` buffer.
+        // describe pane 257 either -- the number of placements this event carries is bounded by
+        // `protocol.Decoder.max_panes`.
         var label: u8 = 0;
 
         for (session.panes.items) |pane| {
