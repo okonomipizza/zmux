@@ -735,9 +735,23 @@ multiplexer but are a phase of their own. `ghostty_terminal_scroll_viewport`
 already supports absolute and prompt-relative scrolling, so the mechanism
 exists.
 
-**Configuration.** Key bindings, prefix key and appearance are currently
-undecided. A file format should be chosen before bindings proliferate rather
-than after.
+**Configuration.** Settled: a flat JSON object of dotted names to strings, under
+`$XDG_CONFIG_HOME/zmux/config.json`, written in full on first attach and read
+once at start-up. Flat rather than nested because every value is either a single
+character or a colour, and nesting would need a structure and a parser to match
+it for no gain in what a user can say. Written on first use rather than shipped
+with the source, so that the file a user opens shows every knob rather than an
+empty object they have to look up, and so that a packaged zmux does not overwrite
+what they set.
+
+The prefix key itself is not configurable. It is one constant used in three
+places, and a prefix that could be changed in the file but was missed in one of
+them would leave a key either dead or sent to the program by mistake; that is a
+class of bug worth not having. Everything behind the prefix is configurable.
+
+What is still undecided: whether a configuration change should be picked up
+without restarting. Reading the file once is the simple model, and a colour
+already drawn has no way to be reconciled with a file that changed underneath it.
 
 **Multiple sessions per client.** Attaching to one session at a time is the
 simplest model. Switching between sessions within a client, without

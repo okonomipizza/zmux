@@ -321,7 +321,7 @@ test "spawn a child on the pty and read its output" {
     }
 
     try std.testing.expect(len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, collected[0..len], "pty works") != null);
+    try std.testing.expect(std.mem.find(u8, collected[0..len], "pty works") != null);
 
     // The child's output can arrive before it has been collected, so the reap is retried rather
     // than treated as a failure at the first look.
@@ -375,7 +375,7 @@ test "a child runs when the parent is a session leader without a terminal" {
 
         // Exit 0 only if the program actually ran and spoke.
         if (len == 0) linux.exit(13);
-        if (std.mem.indexOf(u8, collected[0..len], "ran anyway") == null) linux.exit(14);
+        if (std.mem.find(u8, collected[0..len], "ran anyway") == null) linux.exit(14);
         linux.exit(0);
     }
 
@@ -452,13 +452,13 @@ test "ctrl-s stops a pane and ctrl-q resumes it, as a terminal does" {
     sleepForTest(400);
     const while_stopped = drainQuietly(&pty, &buffer);
     // Nothing comes back while the pty is stopped.
-    try std.testing.expect(std.mem.indexOf(u8, while_stopped, "HELD-BACK") == null);
+    try std.testing.expect(std.mem.find(u8, while_stopped, "HELD-BACK") == null);
 
     // The start character, and what was waiting arrives.
     _ = pty.write("\x11") catch {};
     sleepForTest(400);
     const after_resume = drainQuietly(&pty, &buffer);
-    try std.testing.expect(std.mem.indexOf(u8, after_resume, "HELD-BACK") != null);
+    try std.testing.expect(std.mem.find(u8, after_resume, "HELD-BACK") != null);
 
     _ = linux.kill(pty.child, linux.SIG.KILL);
     _ = pty.reap();

@@ -54,6 +54,25 @@ Escape sequence handling is deliberately not implemented here.
 `src/vt.zig` is the only module that knows the C ABI. Everything else works
 with Zig types and explicit errors.
 
+### Configuration
+
+`src/config.zig` reads a flat JSON object of dotted names to strings, and owns
+the defaults for every setting. It is read once, when an interactive client
+starts, rather than per frame: a colour that has already been drawn has no way
+to be reconciled with a file that changed underneath it.
+
+The defaults live in one table, which is also what the file written on first use
+is generated from. That is deliberate — a setting added to the structure and
+missed in the table would be invisible to a user, and a name in the table that
+the loader does not act on would be advertised and silently ignored. A test
+walks the table and checks that each name changes something when set, which is
+the only way to catch the second case: the value otherwise falls back to its
+default and every other test still passes.
+
+A missing, unreadable or malformed file is the defaults rather than an error. The
+configuration is not a reason for zmux not to start, and the values a user who
+has not configured anything gets are the same ones the file documents.
+
 ### Terminal replies
 
 A terminal emulator must answer some escape sequences, not merely consume

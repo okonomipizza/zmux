@@ -1,6 +1,7 @@
 const std = @import("std");
 const clap = @import("clap");
 const vt = @import("vt.zig");
+const config_mod = @import("config.zig");
 const terminal_mod = @import("terminal.zig");
 const protocol = @import("protocol.zig");
 const runtime = @import("runtime.zig");
@@ -188,7 +189,7 @@ test "the help text lists every command" {
     const text = writer.buffered();
 
     for (std.enums.values(Command)) |command| {
-        if (std.mem.indexOf(u8, text, command.cliName()) == null) {
+        if (std.mem.find(u8, text, command.cliName()) == null) {
             std.debug.print("help text omits '{s}'\n", .{command.cliName()});
             return error.HelpTextIncomplete;
         }
@@ -316,7 +317,7 @@ fn runQuery(
     try ensureServer(gpa, env, err);
 
     const paths = try Paths.resolve(env);
-    const client = client_mod.Client.init(gpa, paths.socket_path, .query, out, err) catch {
+    const client = client_mod.Client.init(gpa, paths.socket_path, .query, .{}, out, err) catch {
         try err.writeAll("zmux: cannot reach the server\n");
         try err.flush();
         std.process.exit(1);
@@ -405,7 +406,19 @@ fn runAttach(
     };
 
     const paths = try Paths.resolve(env);
-    const client = client_mod.Client.init(gpa, paths.socket_path, .interactive, err, err) catch {
+
+    // The file is seeded before it is read, so that the first run writes one and uses it rather than
+    // writing one and ignoring it. It is written only when there is none: an existing file belongs to
+    // the user, and overwriting it would discard what they set.
+    //
+    // Done here rather than in `load`, because a query or a `ls` should not create a file as a side
+    // effect of asking a question.
+    if (config_mod.writeDefaultsIfAbsent(gpa, env)) {
+        try err.writeAll("zmux: wrote a default configuration; see it for every setting\n");
+    }
+
+    const config = config_mod.load(gpa, env);
+    const client = client_mod.Client.init(gpa, paths.socket_path, .interactive, config, err, err) catch {
         try err.writeAll("zmux: cannot reach the server\n");
         try err.flush();
         std.process.exit(1);
@@ -471,7 +484,7 @@ fn runKill(
     try ensureServer(gpa, env, err);
 
     const paths = try Paths.resolve(env);
-    const client = client_mod.Client.init(gpa, paths.socket_path, .query, err, err) catch {
+    const client = client_mod.Client.init(gpa, paths.socket_path, .query, .{}, err, err) catch {
         try err.writeAll("zmux: cannot reach the server\n");
         try err.flush();
         std.process.exit(1);
@@ -571,6 +584,7 @@ test {
     _ = server_mod;
     _ = client_mod;
     _ = socket;
+    _ = config_mod;
     _ = @import("signal.zig");
 }
 

@@ -8,12 +8,46 @@ A simple terminal multiplexer.
 - **Persistent floating panes** — panes that float above the layout and survive
   detaching.
 - **Swappable workspace panes** — rearrange the panes of the current workspace.
+- **Configurable keys and colours** — rebound prefix commands, and colours for
+  the borders and the status line.
 
 Escape sequence handling is delegated to
 [libghostty-vt](https://github.com/ghostty-org/ghostty), the VT library
 extracted from [Ghostty](https://ghostty.org). zmux owns the pty, the server
 and the TUI. See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and
 [ROADMAP.md](ROADMAP.md) for what is built and what is planned.
+
+## Configuration
+
+The first time zmux attaches to a session it writes a configuration file with
+every setting at its default, and reads it from then on:
+
+```
+$XDG_CONFIG_HOME/zmux/config.json     # or ~/.config/zmux/config.json
+```
+
+It is a flat JSON object of dotted names to strings. Delete a line to keep that
+setting's default, or change its value; a setting that is absent falls back to
+its default, so a file holding only what you changed is valid. An unreadable or
+malformed file is the defaults rather than a failure, and a name this build does
+not know is ignored, so one mistyped line does not cost you the rest.
+
+Keys are single characters. Colours are `#rrggbb`:
+
+```json
+{
+  "keybind.close": "Q",
+  "keybind.scroll": "z",
+  "border.active.fg": "#7ca86c",
+  "border.inactive.fg": "null",
+  "status.bg": "#2e3440",
+  "status.fg": "#d8dee9"
+}
+```
+
+`border.inactive.fg` is `null` by default, meaning an unfocused pane's frame
+keeps whatever the terminal is doing rather than being given a colour of its
+own. The other colours always have a value.
 
 ## Status
 

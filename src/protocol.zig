@@ -832,7 +832,7 @@ pub fn joinProgram(out: *std.ArrayList(u8), gpa: std.mem.Allocator, argv: []cons
         if (index != 0) try out.append(gpa, 0);
         // A NUL inside an argument would be indistinguishable from a separator,
         // so it cannot be represented and is not silently dropped.
-        if (std.mem.indexOfScalar(u8, argument, 0) != null) return Error.BadValue;
+        if (std.mem.findScalar(u8, argument, 0) != null) return Error.BadValue;
         try out.appendSlice(gpa, argument);
     }
 }

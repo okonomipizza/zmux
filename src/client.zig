@@ -14,6 +14,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const vt = @import("vt.zig");
 const socket = @import("socket.zig");
+const config_mod = @import("config.zig");
 const protocol = @import("protocol.zig");
 const terminal_mod = @import("terminal.zig");
 const signal_mod = @import("signal.zig");
@@ -111,6 +112,12 @@ pub const Client = struct {
     gpa: std.mem.Allocator,
     connection: socket.Connection,
     mode: Mode,
+    /// The keys and colours the user chose, or the defaults.
+    ///
+    /// Read once when the client starts and never re-read: a configuration that changed underfoot
+    /// would have to be reconciled with what is already on screen, and there is no way to do that for
+    /// a colour that has already been drawn.
+    config: config_mod.Config = .{},
     /// The panes the server says this session has.
     panes: std.ArrayList(RemotePane) = .empty,
     /// The pane the server says has focus, by identifier. Input is addressed to it.
@@ -203,6 +210,7 @@ pub const Client = struct {
         gpa: std.mem.Allocator,
         path: []const u8,
         mode: Mode,
+        config: config_mod.Config,
         out: *std.Io.Writer,
         err: *std.Io.Writer,
     ) !*Client {
@@ -221,6 +229,7 @@ pub const Client = struct {
             .gpa = gpa,
             .mode = mode,
             .connection = connection,
+            .config = config,
             .encoder = protocol.Encoder.init(gpa),
             .out = out,
             .err = err,
@@ -517,7 +526,15 @@ pub const Client = struct {
         if (self.status) |*status| {
             var text_buffer: [256]u8 = undefined;
             const text = self.statusText(&text_buffer);
-            status.render(self.gpa, local, window.rows - 1, text, window.cols) catch {};
+            status.render(
+                self.gpa,
+                local,
+                window.rows - 1,
+                text,
+                window.cols,
+                self.config.colours.status_fg.toArray(),
+                self.config.colours.status_bg.toArray(),
+            ) catch {};
         }
 
         // The cursor goes last, because every other write moves it. `Terminal.enter` hides the
@@ -898,7 +915,14 @@ pub const Client = struct {
                 pane.id == self.focused_float
             else
                 pane.id == self.focused;
-            if (!appendBorder(&pane.line, self.gpa, rect, active)) {
+            if (!appendBorder(
+                &pane.line,
+                self.gpa,
+                rect,
+                active,
+                self.config.colours.border_active_fg,
+                self.config.colours.border_inactive_fg,
+            )) {
                 pane.stale = true;
                 return;
             }
@@ -1260,8 +1284,43 @@ pub const Client = struct {
     /// Act on the key that followed the prefix.
     ///
     /// Returns true when the client should detach.
+    ///
+    /// The key the user pressed is translated to the command it stands for before the switch below,
+    /// so the switch can keep naming commands by the keys they were designed for. A `switch` in Zig
+    /// needs its cases at compile time, so a configured key could not be a case; translating first
+    /// leaves one table of defaults and one place a binding is looked up.
     fn handleCommand(self: *Client, byte: u8) !bool {
-        switch (byte) {
+        const keybinds = self.config.keybinds;
+        const command: u8 = if (byte == keybinds.split_horizontal)
+            's'
+        else if (byte == keybinds.split_vertical)
+            'v'
+        else if (byte == keybinds.close)
+            'q'
+        else if (byte == keybinds.float_toggle)
+            'f'
+        else if (byte == keybinds.float_focused)
+            'F'
+        else if (byte == keybinds.dock)
+            'd'
+        else if (byte == keybinds.focus_previous or byte == keybinds.focus_previous_alt)
+            'h'
+        else if (byte == keybinds.focus_next or byte == keybinds.focus_next_alt)
+            'l'
+        else if (byte == keybinds.move_next)
+            '>'
+        else if (byte == keybinds.move_previous)
+            '<'
+        else if (byte == keybinds.rotate)
+            'o'
+        else if (byte == keybinds.sessions)
+            'w'
+        else if (byte == keybinds.scroll)
+            'x'
+        else
+            byte;
+
+        switch (command) {
             // `s` splits the focused pane side by side, and a second `s` stacks.
             's' => {
                 try self.sendRequest(.{ .split = .{
@@ -1773,13 +1832,6 @@ fn commitFrame(painter: anytype) FrameOutcome {
     return .complete;
 }
 
-/// The colour of the focused pane's border, a muted young green.
-///
-/// Deliberately desaturated rather than a pure green: the border frames text that has its own
-/// colours, and a bright edge competes with it. This reads as a tint on the frame rather than as
-/// content, which is what an indicator should do.
-const active_border: [3]u8 = .{ 124, 168, 108 };
-
 /// Append the frame drawn around a pane's rectangle to a frame buffer.
 ///
 /// Box-drawing characters rather than dashes, so that a border meeting another border looks
@@ -1797,19 +1849,20 @@ fn appendBorder(
     gpa: std.mem.Allocator,
     rect: protocol.Rect,
     active: bool,
+    active_colour: config_mod.Rgb,
+    inactive_colour: ?config_mod.Rgb,
 ) bool {
     if (rect.width < 3 or rect.height < 3) return true;
 
     const horizontal = rect.width - 2;
 
     // The colour is set once at the start and cleared at the end, so a border costs two escapes
-    // whatever its size.
-    if (active) {
-        buffer.print(gpa, "\x1b[38;2;{d};{d};{d}m", .{
-            active_border[0],
-            active_border[1],
-            active_border[2],
-        }) catch return false;
+    // whatever its size. A pane without focus has no colour of its own unless one was configured,
+    // in which case it keeps whatever the terminal is already doing, which is one fewer colour to
+    // disagree with the user's theme.
+    const colour: ?config_mod.Rgb = if (active) active_colour else inactive_colour;
+    if (colour) |rgb| {
+        buffer.print(gpa, "\x1b[38;2;{d};{d};{d}m", .{ rgb.r, rgb.g, rgb.b }) catch return false;
     }
 
     // The edges are written straight into the frame buffer, which grows as needed, rather than
@@ -2299,7 +2352,7 @@ test "a content row cannot erase the border beside it" {
     try std.testing.expectEqualStrings("\x1b[2;2H\x1b[18X", move);
     // `EL`, which is the mistake this guards against, would be the same prefix with a bare K and
     // no count, erasing to the end of the screen line instead of to the pane's edge.
-    try std.testing.expect(std.mem.indexOf(u8, move, "[K") == null);
+    try std.testing.expect(std.mem.find(u8, move, "[K") == null);
     try std.testing.expect(std.mem.endsWith(u8, move, "[18X"));
 
     // The count is the interior's width, so the last cell it clears is one short of the pane's
@@ -2321,22 +2374,29 @@ test "the border is drawn at any width, however wide the terminal" {
 
     var line: std.ArrayList(u8) = .empty;
     defer line.deinit(gpa);
-    try std.testing.expect(appendBorder(&line, gpa, wide, false));
+    try std.testing.expect(appendBorder(&line, gpa, wide, false, .{ .r = 0x7c, .g = 0xa8, .b = 0x6c }, null));
 
     // A horizontal edge of 398 cells, three bytes each, is far past the old limit.
     try std.testing.expect(line.items.len > 1200);
     // Both corners and both sides are present.
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{250c}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2510}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2514}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2518}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "\u{2502}") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "\u{250c}") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "\u{2510}") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "\u{2514}") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "\u{2518}") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "\u{2502}") != null);
 
     // A pane too small for a frame is left alone and reports success, rather than drawing a frame
     // over the only cell the program has.
     var tiny: std.ArrayList(u8) = .empty;
     defer tiny.deinit(gpa);
-    try std.testing.expect(appendBorder(&tiny, gpa, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, false));
+    try std.testing.expect(appendBorder(
+        &tiny,
+        gpa,
+        .{ .x = 0, .y = 0, .width = 2, .height = 2 },
+        true,
+        .{ .r = 0x7c, .g = 0xa8, .b = 0x6c },
+        null,
+    ));
     try std.testing.expectEqual(@as(usize, 0), tiny.items.len);
 }
 
@@ -2384,15 +2444,28 @@ test "the active pane's border is tinted and the others are not" {
     const gpa = std.testing.allocator;
     const rect = protocol.Rect{ .x = 0, .y = 0, .width = 10, .height = 4 };
 
+    const tint = config_mod.Rgb{ .r = 0x7c, .g = 0xa8, .b = 0x6c };
+
     var active: std.ArrayList(u8) = .empty;
     defer active.deinit(gpa);
-    try std.testing.expect(appendBorder(&active, gpa, rect, true));
-    try std.testing.expect(std.mem.indexOf(u8, active.items, "\x1b[38;2;124;168;108m") != null);
+    try std.testing.expect(appendBorder(&active, gpa, rect, true, tint, null));
+    try std.testing.expect(std.mem.find(u8, active.items, "\x1b[38;2;124;168;108m") != null);
 
+    // Without a configured colour the unfocused frame is left in whatever the terminal is doing,
+    // which is the default: one fewer colour to disagree with the user's theme.
     var plain: std.ArrayList(u8) = .empty;
     defer plain.deinit(gpa);
-    try std.testing.expect(appendBorder(&plain, gpa, rect, false));
-    try std.testing.expect(std.mem.indexOf(u8, plain.items, "38;2;") == null);
+    try std.testing.expect(appendBorder(&plain, gpa, rect, false, tint, null));
+    try std.testing.expect(std.mem.find(u8, plain.items, "38;2;") == null);
+
+    // But it can be given one, and then the two frames differ by the colour they were given rather
+    // than by one of them being absent.
+    var inactive: std.ArrayList(u8) = .empty;
+    defer inactive.deinit(gpa);
+    const grey = config_mod.Rgb{ .r = 0x60, .g = 0x60, .b = 0x60 };
+    try std.testing.expect(appendBorder(&inactive, gpa, rect, false, tint, grey));
+    try std.testing.expect(std.mem.find(u8, inactive.items, "\x1b[38;2;96;96;96m") != null);
+    try std.testing.expect(std.mem.find(u8, inactive.items, "\x1b[38;2;124;168;108m") == null);
 
     // The colour is cleared at the end, so it cannot bleed into the pane's own cells or into a
     // neighbouring pane. Both forms end with the reset.
@@ -2403,10 +2476,12 @@ test "the active pane's border is tinted and the others are not" {
     const wide = protocol.Rect{ .x = 0, .y = 0, .width = 200, .height = 4 };
     var wide_active: std.ArrayList(u8) = .empty;
     defer wide_active.deinit(gpa);
-    try std.testing.expect(appendBorder(&wide_active, gpa, wide, true));
+    try std.testing.expect(appendBorder(&wide_active, gpa, wide, true, tint, null));
     var wide_plain: std.ArrayList(u8) = .empty;
     defer wide_plain.deinit(gpa);
-    try std.testing.expect(appendBorder(&wide_plain, gpa, wide, false));
+    // An unfocused pane with no colour of its own, so the difference below is exactly one
+    // introducer: a coloured frame must not write one per cell.
+    try std.testing.expect(appendBorder(&wide_plain, gpa, wide, false, tint, null));
     // One introducer plus one reset, whatever the width.
     const difference = wide_active.items.len - wide_plain.items.len;
     try std.testing.expectEqual(@as(usize, "\x1b[38;2;124;168;108m".len), difference);

@@ -190,6 +190,12 @@ pub const StatusLine = struct {
     /// `row` is zero-based and is the last row of the window. The text is
     /// truncated rather than wrapped, because a wrapped status line would push
     /// the terminal's own scroll region around.
+    ///
+    /// The colours are written explicitly rather than as inverse video. Inverse
+    /// borrows whatever the terminal's own foreground and background are, which is
+    /// right for a status line that belongs to the terminal and wrong for one the
+    /// user is allowed to colour: there would be no way to say what the two
+    /// colours are, only that they are swapped.
     pub fn render(
         self: *StatusLine,
         gpa: std.mem.Allocator,
@@ -197,21 +203,32 @@ pub const StatusLine = struct {
         row: u16,
         text: []const u8,
         cols: u16,
+        fg: [3]u8,
+        bg: [3]u8,
     ) !void {
         var buffer = &self.buffer;
         buffer.clearRetainingCapacity();
 
-        // Move to the row, erase it, then draw inverse video. The list's own
-        // `print` is used rather than a writer: `ArrayList.writer` does not exist
-        // in Zig 0.16, and the list takes the allocator per call instead.
-        try buffer.print(gpa, "\x1b[{d};1H\x1b[K\x1b[7m", .{row + 1});
+        // Move to the row, erase it, then set the colours. The list's own `print`
+        // is used rather than a writer: `ArrayList.writer` does not exist in Zig
+        // 0.16, and the list takes the allocator per call instead.
+        try buffer.print(gpa, "\x1b[{d};1H\x1b[K\x1b[38;2;{d};{d};{d}m\x1b[48;2;{d};{d};{d}m", .{
+            row + 1,
+            fg[0],
+            fg[1],
+            fg[2],
+            bg[0],
+            bg[1],
+            bg[2],
+        });
 
         // Truncating here rather than letting the terminal wrap keeps the layout
         // predictable. The column count is authoritative.
         const visible = if (text.len > cols) text[0..cols] else text;
         try buffer.appendSlice(gpa, visible);
 
-        // Pad to the full width so the inverse background covers the row.
+        // Pad to the full width so the background covers the whole row rather than
+        // stopping at the end of the text.
         var written: usize = visible.len;
         while (written < cols) : (written += 1) try buffer.append(gpa, ' ');
 

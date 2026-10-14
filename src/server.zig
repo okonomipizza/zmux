@@ -2474,24 +2474,24 @@ test "a re-sent screen keeps the colours its cells have" {
 
     // The first cell's colour is written before its glyph, which is the whole point: without it the
     // row would be the plain text "RED plain" and the terminal would draw it unstyled.
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "RED") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "plain") != null);
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "\x1b[") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "RED") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "plain") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "\x1b[") != null);
     // A colour introducer, not a bare reset: the glyphs have to arrive styled.
-    try std.testing.expect(std.mem.indexOf(u8, line.items, "38;2;") != null or
-        std.mem.indexOf(u8, line.items, ";31") != null);
+    try std.testing.expect(std.mem.find(u8, line.items, "38;2;") != null or
+        std.mem.find(u8, line.items, ";31") != null);
 
     // And the introducer has to come *before* the glyph it styles. A colour written after the text,
     // or not at all, leaves the row plain on the terminal that receives the resend.
-    const colour_at = std.mem.indexOf(u8, line.items, "\x1b[").?;
-    const red_at = std.mem.indexOf(u8, line.items, "RED").?;
+    const colour_at = std.mem.find(u8, line.items, "\x1b[").?;
+    const red_at = std.mem.find(u8, line.items, "RED").?;
     try std.testing.expect(colour_at < red_at);
 
     // The unstyled word after the reset is written with a reset rather than being left to inherit
     // the red, so the styles are what the screen says rather than what the previous cell left.
-    const plain_at = std.mem.indexOf(u8, line.items, "plain").?;
+    const plain_at = std.mem.find(u8, line.items, "plain").?;
     const after_red = line.items[red_at..plain_at];
-    try std.testing.expect(std.mem.indexOf(u8, after_red, "\x1b[0m") != null);
+    try std.testing.expect(std.mem.find(u8, after_red, "\x1b[0m") != null);
 }
 
 test "a row of only blanks is skipped, and a row with content is not" {
