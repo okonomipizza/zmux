@@ -519,10 +519,18 @@ fn dumpScreen(
         gpa: std.mem.Allocator,
         out: *std.Io.Writer,
         line: *std.ArrayList(u8),
+        /// Set when a cell could not be written.
+        ///
+        /// The visitor returns nothing, so a failure inside it has nowhere else to go. Without this
+        /// a dropped cell would shorten the row silently, and this command exists to show what a
+        /// terminal holds: output that is quietly wrong is worse than an error, because it reads as
+        /// the truth about the screen.
+        failed: bool = false,
 
         fn visit(self: *@This(), row: *vt.RowIterator) bool {
             self.line.clearRetainingCapacity();
             _ = row.forEachCell(self, collect) catch return false;
+            if (self.failed) return false;
 
             // Trim trailing blanks so the output does not carry the full width
             // of padding on every line.
@@ -536,15 +544,24 @@ fn dumpScreen(
             var utf8: [32]u8 = undefined;
             const bytes = cell.graphemesUtf8(&codepoints, &utf8);
             if (bytes.len == 0) {
-                self.line.append(self.gpa, ' ') catch {};
+                // A blank still has to be written: skipping it would shift every later cell one
+                // column to the left, so the row would be misaligned rather than one space short.
+                self.line.append(self.gpa, ' ') catch {
+                    self.failed = true;
+                };
                 return;
             }
-            self.line.appendSlice(self.gpa, bytes) catch {};
+            self.line.appendSlice(self.gpa, bytes) catch {
+                self.failed = true;
+            };
         }
     };
 
     var renderer = Renderer{ .gpa = gpa, .out = out, .line = &line };
     try render.forEachRow(&renderer, Renderer.visit);
+    // Reported rather than left as a short screen: a caller cannot tell a terminal that held less
+    // from one whose cells could not be read.
+    if (renderer.failed) return error.RenderFailed;
 }
 
 test {

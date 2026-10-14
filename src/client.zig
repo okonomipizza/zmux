@@ -156,6 +156,12 @@ pub const Client = struct {
     covered: std.ArrayList(protocol.Rect) = .empty,
     /// Set between the prefix key and the key that follows it.
     prefix_armed: bool = false,
+    /// How many messages this client could not decode.
+    ///
+    /// Counted rather than merely logged so that the complaint is made once. A frame the decoder
+    /// cannot read is likely to be followed by more of them, and a line per frame would bury the
+    /// screen it is warning about.
+    protocol_complaints: usize = 0,
     /// Output that arrived for panes this client has not been told about yet.
     ///
     /// Each entry is one pane and the bytes waiting for it. Replayed when the layout event
@@ -1400,10 +1406,27 @@ pub const Client = struct {
     /// Handle one decoded event.
     fn onMessage(self: *Client, payload: []const u8) anyerror!void {
         var decoder = protocol.Decoder.init(payload);
-        // A frame that does not decode is ignored rather than fatal. The server and this
-        // client are the same version, so a malformed frame would mean one of them is wrong
-        // about the protocol, which is not something this side can repair by exiting.
-        const event = decoder.event() catch return;
+        // A frame that does not decode is not fatal: the server and this client are the same
+        // version, so a malformed frame means one of them is wrong about the protocol, which is not
+        // something this side can repair by exiting.
+        //
+        // It is not silent either. Ignoring it outright left a protocol mismatch invisible: the
+        // session would simply stop updating with nothing anywhere to say why, and the cause would
+        // be a disagreement between two builds that neither side reported. The message goes to the
+        // client's own stderr, which is the terminal zmux was started from rather than the pane, so
+        // it is not drawn over the screen being painted.
+        const event = decoder.event() catch |err| {
+            self.protocol_complaints += 1;
+            // Reported once, because a frame the decoder cannot read is likely to be followed by
+            // more of them, and a message per frame would bury the screen it is warning about.
+            if (self.protocol_complaints == 1) {
+                self.err.print("zmux: ignoring a message this client cannot read ({s})\n", .{
+                    @errorName(err),
+                }) catch {};
+                self.err.flush() catch {};
+            }
+            return;
+        };
         try self.handleEvent(event);
     }
 
@@ -1701,6 +1724,9 @@ pub const Client = struct {
         const route: *PaneRoute = @ptrCast(@alignCast(userdata.?));
         const client = route.client;
         const pane = client.findPane(route.pane) orelse return;
+        // A failed allocation loses a reply, and the program waiting on it stalls; there is no way
+        // to report that from a C callback, which returns nothing. The queue is drained on the next
+        // paint, so anything that did arrive is sent, but what was dropped here is dropped.
         pane.reply.appendSlice(client.gpa, data[0..len]) catch {};
     }
 };

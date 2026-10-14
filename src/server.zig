@@ -1703,7 +1703,11 @@ const ScreenPainter = struct {
         // The style starts from whatever the terminal is in after this row's cursor move, which is
         // whatever the previous row's last cell left it in, so it begins unset for every row.
         var collector = CellCollector{ .line = &line, .gpa = self.gpa };
-        _ = row.forEachCell(&collector, CellCollector.collect) catch {};
+        try row.forEachCell(&collector, CellCollector.collect);
+        // A row that could not be built is abandoned rather than sent. Writing it would put a row on
+        // the screen with cells missing, and a missing blank shifts everything after it, so the row
+        // would be wrong in a way that looks like the program's output rather than like a failure.
+        if (collector.failed) return error.RowIncomplete;
 
         // A row of nothing but blanks would draw nothing, so it is skipped rather than costing a
         // cursor move and a reset.
@@ -1771,8 +1775,17 @@ const CellCollector = struct {
     /// The style the last cell was written with. Reset per row by the caller, since each row starts
     /// after a cursor move and the terminal keeps whatever the previous row left it in.
     current_style: vt.Style = .{},
+    /// Set when a cell could not be written.
+    ///
+    /// The visitor returns nothing, so a failure inside it cannot be reported any other way. Without
+    /// this, a dropped glyph or a dropped blank would leave the row silently short: the glyph itself
+    /// missing, or every cell after it shifted one column to the left, and the row sent as though it
+    /// were whole.
+    failed: bool = false,
 
     fn collect(self: *CellCollector, cell: *vt.CellIterator) void {
+        if (self.failed) return;
+
         const style = cell.resolvedStyle();
         if (!style.eql(self.current_style)) {
             if (style.isDefault()) {
@@ -1781,11 +1794,15 @@ const CellCollector = struct {
                 // something. That is right for a screen being painted from scratch, where the row
                 // starts unstyled, and wrong halfway through a row: the previous cell's colour
                 // would run on to the end of the line. An explicit reset is what ends it.
-                self.line.appendSlice(self.gpa, "\x1b[0m") catch return;
+                self.line.appendSlice(self.gpa, "\x1b[0m") catch {
+                    self.failed = true;
+                    return;
+                };
             } else {
                 terminal_mod.SgrWriter.write(self.line, self.gpa, style) catch {
-                    // A dropped escape would colour the rest of the line wrongly, so the row is left
-                    // as it is rather than written with the wrong colours.
+                    // A dropped escape would colour the rest of the line wrongly, which is harder to
+                    // notice than a missing glyph, so the row is abandoned rather than written.
+                    self.failed = true;
                     return;
                 };
             }
@@ -1796,10 +1813,17 @@ const CellCollector = struct {
         var utf8: [32]u8 = undefined;
         const bytes = cell.graphemesUtf8(&codepoints, &utf8);
         if (bytes.len == 0) {
-            self.line.append(self.gpa, ' ') catch {};
+            // A blank cell still has to be written: skipping it would shift every cell after it one
+            // column to the left, which misaligns the rest of the row rather than merely losing one
+            // space.
+            self.line.append(self.gpa, ' ') catch {
+                self.failed = true;
+            };
             return;
         }
-        self.line.appendSlice(self.gpa, bytes) catch {};
+        self.line.appendSlice(self.gpa, bytes) catch {
+            self.failed = true;
+        };
     }
 };
 
@@ -2443,4 +2467,58 @@ test "a row of only blanks is skipped, and a row with content is not" {
     try std.testing.expect(!isBlankRow("x"));
     try std.testing.expect(!isBlankRow(" x"));
     try std.testing.expect(!isBlankRow("\x1b[0mtext"));
+}
+
+test "a row whose cells could not all be written is abandoned, not sent short" {
+    // The defect this guards against: the cell visitor returns nothing, so a failure inside it had
+    // nowhere to go and was swallowed with `catch {}`. A dropped glyph left the glyph missing, and a
+    // dropped blank shifted every later cell one column to the left, so the row was wrong in a way
+    // that reads as the program's output rather than as a failure.
+    //
+    // The collector is exercised directly, because the failure it reports is an allocation failure
+    // and there is no way to make a real one happen on demand.
+    const gpa = std.testing.allocator;
+    var line: std.ArrayList(u8) = .empty;
+    defer line.deinit(gpa);
+    var collector = CellCollector{ .line = &line, .gpa = gpa, .current_style = .{} };
+
+    var terminal = try vt.Terminal.init(.{ .cols = 8, .rows = 1 });
+    defer terminal.deinit();
+    terminal.write("ab");
+    var render = try terminal.createRenderState();
+    defer render.deinit();
+
+    const Walker = struct {
+        collector: *CellCollector,
+        fn visit(self: *@This(), row: *vt.RowIterator) bool {
+            _ = row.forEachCell(self.collector, CellCollector.collect) catch {};
+            return false;
+        }
+    };
+    var walker = Walker{ .collector = &collector };
+    try render.forEachRow(&walker, Walker.visit);
+
+    // The cells arrive, and nothing is reported as failed.
+    try std.testing.expect(std.mem.startsWith(u8, line.items, "ab"));
+    try std.testing.expect(!collector.failed);
+
+    // A collector whose allocator refuses everything reports the failure rather than dropping the
+    // cell and carrying on, which is what the caller needs in order to abandon the row.
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    var dropped: std.ArrayList(u8) = .empty;
+    defer dropped.deinit(gpa);
+    var refusing = CellCollector{
+        .line = &dropped,
+        .gpa = failing.allocator(),
+        .current_style = .{},
+    };
+    var refusing_walker = Walker{ .collector = &refusing };
+    try render.forEachRow(&refusing_walker, Walker.visit);
+
+    try std.testing.expect(refusing.failed);
+    // And a collector that has failed stops appending, rather than continuing with a buffer whose
+    // holes it cannot describe.
+    const before = dropped.items.len;
+    refusing.collect(undefined);
+    try std.testing.expectEqual(before, dropped.items.len);
 }
