@@ -70,7 +70,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         "SHELL=/run/current-system/sw/bin/fish",
         "XDG_RUNTIME_DIR=/tmp/zmux-drive",
         "HOME=/tmp/zmux-drive",
+        // Set explicitly rather than left to fall back to $HOME/.config, so that the directory the
+        // product writes its configuration into is the one this harness owns.
+        "XDG_CONFIG_HOME=/tmp/zmux-drive",
     };
+
+    // The directory has to be made here. It used to be assumed, left over from an earlier run, and
+    // the failure was quiet and misleading: the client could not create its socket, exited before
+    // drawing anything, and the harness reported "the cursor was never shown", which reads as a
+    // product defect rather than a missing directory. Every measurement taken after a cleanup was
+    // therefore measuring nothing at all.
+    _ = std.os.linux.mkdir("/tmp/zmux-drive", 0o700);
 
     var pty = try pty_mod.Pty.spawn(@ptrCast(&argv), &envp, .{ .rows = 24, .cols = 80 });
     defer pty.deinit();

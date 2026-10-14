@@ -79,8 +79,8 @@ Inside an attached session the prefix key is `ctrl-b`:
 
 | key | action |
 | --- | --- |
-| `ctrl-b s` | split the focused pane side by side |
-| `ctrl-b v` | split it into stacked halves |
+| `ctrl-b \` | split the focused pane side by side |
+| `ctrl-b -` | split it into stacked halves |
 | `ctrl-b q` | close the focused pane |
 | `ctrl-b F` | float the focused pane above the layout |
 | `ctrl-b d` | dock a floating pane back into the layout |

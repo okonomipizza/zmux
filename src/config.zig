@@ -14,8 +14,8 @@ const linux = std.os.linux;
 
 /// The prefix commands zmux recognises. One byte each, because they are keys.
 pub const Keybinds = struct {
-    split_horizontal: u8 = 's',
-    split_vertical: u8 = 'v',
+    split_horizontal: u8 = '\\',
+    split_vertical: u8 = '-',
     close: u8 = 'q',
     float_toggle: u8 = 'f',
     float_focused: u8 = 'F',
@@ -85,8 +85,8 @@ pub const Error = error{PathTooLong};
 /// first use is generated from. A setting that exists in the structure but not here would be
 /// invisible to a user, and one that is here and not there would not compile.
 pub const entries = [_]Entry{
-    .{ .name = "keybind.split_horizontal", .key = 's' },
-    .{ .name = "keybind.split_vertical", .key = 'v' },
+    .{ .name = "keybind.split_horizontal", .key = '\\' },
+    .{ .name = "keybind.split_vertical", .key = '-' },
     .{ .name = "keybind.close", .key = 'q' },
     .{ .name = "keybind.float_toggle", .key = 'f' },
     .{ .name = "keybind.float_focused", .key = 'F' },
@@ -118,7 +118,18 @@ pub const Entry = struct {
     colour: ?Rgb = null,
 
     pub fn format(self: Entry, buffer: []u8) ![]const u8 {
-        if (self.key) |key| return std.fmt.bufPrint(buffer, "\"{c}\"", .{key});
+        if (self.key) |key| {
+            // A key that is a quote or a backslash has to be escaped, or the string it sits in ends
+            // early. That is not a cosmetic problem: `"a": "\"` is not JSON, so the whole file fails
+            // to parse and every setting in it reverts to its default -- the user's colours and
+            // their other bindings along with the one bad line. Backslash is a prefix command here,
+            // so this is not hypothetical.
+            return switch (key) {
+                '"' => "\"\\\"\"",
+                '\\' => "\"\\\\\"",
+                else => std.fmt.bufPrint(buffer, "\"{c}\"", .{key}),
+            };
+        }
         if (self.colour) |colour| {
             return std.fmt.bufPrint(buffer, "\"#{x:0>2}{x:0>2}{x:0>2}\"", .{
                 colour.r, colour.g, colour.b,
@@ -358,8 +369,11 @@ test "a missing file leaves every default in place" {
     var config = Config{};
     apply(&config, "keybind.close", "x");
     try std.testing.expectEqual(@as(u8, 'x'), config.keybinds.close);
-    // Untouched settings keep their defaults.
-    try std.testing.expectEqual(@as(u8, 's'), config.keybinds.split_horizontal);
+    // Untouched settings keep their defaults. The default is read from the structure rather than
+    // written here, so that changing one does not leave this asserting the old value: what is being
+    // tested is that a setting nobody named is untouched, not what any particular default is.
+    const defaults = Config{};
+    try std.testing.expectEqual(defaults.keybinds.split_horizontal, config.keybinds.split_horizontal);
     try std.testing.expect(config.colours.border_active_fg.eql(.{ .r = 0x7c, .g = 0xa8, .b = 0x6c }));
 }
 
@@ -375,8 +389,9 @@ test "a partial file changes only what it names" {
     );
     try std.testing.expectEqual(@as(u8, 'Q'), config.keybinds.close);
     try std.testing.expect(config.colours.status_fg.eql(.{ .r = 0xff, .g = 0xff, .b = 0xff }));
-    // Everything else is still the default.
-    try std.testing.expectEqual(@as(u8, 's'), config.keybinds.split_horizontal);
+    // Everything else is still the default, read from the structure rather than restated here.
+    const defaults = Config{};
+    try std.testing.expectEqual(defaults.keybinds.split_horizontal, config.keybinds.split_horizontal);
     try std.testing.expect(config.colours.status_bg.eql(.{ .r = 0x2e, .g = 0x34, .b = 0x40 }));
 }
 
@@ -412,35 +427,104 @@ test "colours parse with and without the hash, and nothing else does" {
     try std.testing.expectEqual(@as(?Rgb, null), parseColour("#gggggg"));
 }
 
-test "the written file parses back to the defaults it was generated from" {
-    // The file written on first use and the defaults in the structure have to agree, or a user who
-    // never edits anything would get different behaviour from one who deletes the file.
-    var buffer: [4096]u8 = undefined;
-    var stream = std.Io.Writer.fixed(&buffer);
-    _ = &stream;
-
+test "the written file parses, and says what it was generated from" {
+    // Two things are checked, and the second is the one that was missing. That the object built from
+    // the table parses at all, and that it does not merely parse to the defaults.
+    //
+    // Comparing the result against the defaults is not enough on its own: a file that fails to parse
+    // *becomes* the defaults, so that comparison passes when the file is unreadable. Which is how an
+    // unescaped backslash went unnoticed -- the key was written as `"\`, the file stopped being JSON,
+    // and a test comparing against the defaults agreed with it.
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(std.testing.allocator);
     for (entries, 0..) |entry, index| {
-        var value_buffer: [32]u8 = undefined;
+        var value_buffer: [64]u8 = undefined;
         const value = try entry.format(&value_buffer);
         try text.print(std.testing.allocator, "\"{s}\": {s}", .{ entry.name, value });
         if (index + 1 < entries.len) try text.appendSlice(std.testing.allocator, ",");
     }
+
+    // The file itself, without the comments the real writer adds, so this is exactly what a user
+    // would be editing.
     const object = try std.fmt.allocPrint(std.testing.allocator, "{{{s}}}", .{text.items});
     defer std.testing.allocator.free(object);
 
-    const config = parse(std.testing.allocator, object);
-    const fresh = Config{};
+    // It parses to something that is not the fallback. `parse` returns the defaults both for a valid
+    // file of defaults and for a broken one, so the two are told apart by a file that must differ.
+    const parsed = std.json.parseFromSlice(std.json.Value, std.testing.allocator, object, .{}) catch {
+        std.debug.print("the generated configuration is not valid JSON:\n{s}\n", .{object});
+        return error.GeneratedFileIsMalformed;
+    };
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqual(entries.len, parsed.value.object.count());
 
-    try std.testing.expectEqual(fresh.keybinds.close, config.keybinds.close);
-    try std.testing.expectEqual(fresh.keybinds.split_horizontal, config.keybinds.split_horizontal);
-    try std.testing.expectEqual(fresh.keybinds.float_focused, config.keybinds.float_focused);
-    try std.testing.expect(fresh.colours.border_active_fg.eql(config.colours.border_active_fg));
-    try std.testing.expect(fresh.colours.status_bg.eql(config.colours.status_bg));
-    try std.testing.expect(fresh.colours.status_fg.eql(config.colours.status_fg));
-    // The one that is deliberately absent stays absent, rather than being read back as black.
-    try std.testing.expectEqual(@as(?Rgb, null), config.colours.border_inactive_fg);
+    // And every value in it is the one the table holds, read back through `apply` rather than by
+    // comparing the whole structure, so a name the writer wrote wrongly shows up as a setting that
+    // did not change.
+    const config = parse(std.testing.allocator, object);
+    for (entries) |entry| {
+        if (entry.key) |key| {
+            const got = keybindField(&config.keybinds, entry.name) orelse {
+                std.debug.print("{s} did not survive the round trip\n", .{entry.name});
+                return error.SettingLost;
+            };
+            if (got != key) {
+                std.debug.print("{s} was written as '{c}' and read back as '{c}'\n", .{
+                    entry.name, key, got,
+                });
+                return error.SettingLost;
+            }
+            continue;
+        }
+        // The colour entries. The one whose default is null is written as the string "null", which
+        // `apply` reads as "no colour". So for that one it is the absence that has to survive, and a
+        // colour coming back instead would mean the frame was being drawn in one the user never asked
+        // for.
+        if (colourField(&config.colours, entry.name)) |got| {
+            if (entry.colour) |expected| {
+                if (!got.eql(expected)) {
+                    std.debug.print("{s} did not survive the round trip\n", .{entry.name});
+                    return error.SettingLost;
+                }
+            } else {
+                std.debug.print("{s} has no default but came back as a colour\n", .{entry.name});
+                return error.SettingLost;
+            }
+        } else if (entry.colour != null) {
+            std.debug.print("{s} did not survive the round trip\n", .{entry.name});
+            return error.SettingLost;
+        }
+    }
+}
+
+test "a key that needs escaping is written escaped" {
+    // A backslash or a quote in a key has to be escaped, or the string it sits in ends early. The
+    // consequence is not cosmetic: `"k": "\"` is not JSON, so the whole file fails to parse and every
+    // setting reverts to its default. Backslash is a prefix command, so this is not hypothetical.
+    var buffer: [64]u8 = undefined;
+
+    const backslash = try (Entry{ .name = "k", .key = '\\' }).format(&buffer);
+    try std.testing.expectEqualStrings("\"\\\\\"", backslash);
+
+    var quote_buffer: [64]u8 = undefined;
+    const quote = try (Entry{ .name = "k", .key = '"' }).format(&quote_buffer);
+    try std.testing.expectEqualStrings("\"\\\"\"", quote);
+
+    // And a key that needs no escaping is unchanged.
+    var plain_buffer: [64]u8 = undefined;
+    const plain = try (Entry{ .name = "k", .key = 'q' }).format(&plain_buffer);
+    try std.testing.expectEqualStrings("\"q\"", plain);
+
+    // The escaped forms are valid JSON, which is the point of escaping them.
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        "{\"k\": \"\\\\\"}",
+        .{},
+    );
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("\\", parsed.value.object.get("k").?.string);
 }
 
 test "every entry in the table is a name this build acts on" {

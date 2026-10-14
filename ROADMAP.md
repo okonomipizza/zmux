@@ -387,12 +387,18 @@ Input carries the pane it is meant for rather than relying on which pane is focu
 keystroke already in flight when focus moves must reach the pane the user was typing
 into, and focus is the server's idea, read later.
 
-Key bindings are vim-flavoured behind the existing `ctrl-b` prefix: `s` splits side by
-side, `v` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
+Key bindings are vim-flavoured behind the existing `ctrl-b` prefix: `\` splits side by
+side, `-` stacks, `q` closes the focused pane, `F` floats it, `f` toggles the floats,
 `h`/`j`/`k`/`l` move focus, `<`/`>` move the focused pane past its neighbour, `o`
 rotates the arrangement, `w` lists the sessions and switches to one, and `x` reads
 the focused pane's history. A bare `ctrl-b` twice still detaches, and a key the prefix
 does not use does nothing at all.
+
+The split keys were `s` and `v` until they were moved to `\` and `-`, which are the
+characters the splits are drawn with: a backslash leans the way the panes are laid out
+beside each other, and a dash lies the way they are stacked. The old keys are free, and
+`v` had the further problem of being vim's visual mode, which is the one thing a
+multiplexer's `v` might be expected to mean.
 
 Closing the last pane discards the session, which is what a program exiting in it already
 did. It used to remove the pane and leave the session behind, so the client stayed attached

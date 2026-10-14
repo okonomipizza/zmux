@@ -479,7 +479,7 @@ pub const Client = struct {
 
         return std.fmt.bufPrint(
             buffer,
-            " zmux | {s} | {d}x{d} | ctrl-b: s/v split q close h/j/k/l focus <> swap o rotate F/f floats d dock | {s}",
+            " zmux | {s} | {d}x{d} | ctrl-b: \\/- split q close h/j/k/l focus <> swap o rotate F/f floats d dock | {s}",
             .{
                 name,
                 self.area_cols,
