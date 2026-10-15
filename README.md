@@ -90,7 +90,7 @@ Inside an attached session the prefix key is `ctrl-b`:
 | `ctrl-b <` / `>` | move the focused pane past its neighbour |
 | `ctrl-b o` | rotate every pane one place along |
 | `ctrl-b w` | list the sessions and switch to one |
-| `ctrl-b x` | read the focused pane's history |
+| `ctrl-b x` | read the focused pane's history, and select and copy from it |
 | `ctrl-b ctrl-b` | detach, leaving every pane running |
 
 `ctrl-b h`, `j`, `k` and `l` move focus one pane in the direction the key points,
@@ -120,11 +120,53 @@ and `ctrl-v` a whole one, `g` and `G` go to the ends, and `q` or Escape leaves.
 Nothing is detached and the program keeps running: only the viewport moves, so
 what you are reading is the pane's own history rather than a copy of it.
 
+Entering the read mode puts a cursor in the pane, at the position the program's own
+cursor was left in. `h`, `j`, `k` and `l` move it a cell at a time, and the viewport
+follows when it would leave the screen. Nothing is selected yet: this is how you aim.
+
+`v` anchors a selection where the cursor is. Moving then extends it, and the selected
+cells are shown in reverse video, so the range you are about to copy is the range you
+can see. `y` or Enter copies what is selected and leaves the mode, and Escape drops the
+selection without leaving it. Copying joins a soft-wrapped line back into one and trims
+the blanks a line was padded with, so what lands on the clipboard is what the program
+printed rather than the grid it was drawn on.
+
+Two keys reshape the selection instead of moving one end of it. `w` reaches one word
+further each time it is pressed, so copying three words is three keystrokes and no
+dragging over the spaces between them; it works on its own too, anchoring at the cursor
+on the first press, for when you want a few words and nothing else. `V` takes whole
+lines, and `R` makes the selection a block: the same columns on every row between the two
+ends, which is how you lift one column out of a table without the text on either side of
+it. Word and line boundaries are Ghostty's, so they are what you would get in Ghostty
+itself.
+
+The text goes to the terminal first, as an OSC 52 escape. That is what makes a
+copy work over SSH: the bytes travel back down the connection the screen already
+comes up, and nothing has to be installed on the far side. Not every terminal
+implements OSC 52 or allows it through, and there is no reply to say whether it
+worked, so `wl-copy`, `xclip`, `xsel` or `pbcopy` are tried as well when one is
+installed. The status line says which program took the text, or `sent` when
+neither could be confirmed. A selection larger than a terminal will accept is
+refused with a word rather than sent and silently dropped.
+
+The cursor starts where the program left its own, which is the one place on screen you
+were already looking at. If the program has hidden its cursor, or scrolled it out of
+view, there is no position to start from and the middle of the pane is used instead,
+which you then move. `w` cannot find a word where there is only whitespace and says so
+rather than guessing which word you meant; moving onto the text with the cursor is how
+you say where.
+
 While the history is open the pane stops following new output, because a
 viewport that moved under the reader would be unreadable. Typing anything puts
 it back at the bottom first, so the program's answer is visible rather than
-arriving below the view. A pane with no history to show is left alone: a mode
-that opened onto a frozen screen would read as the program hanging.
+arriving below the view.
+
+The mode opens whether or not the pane has anything above the screen. It used to
+refuse when there was no history, which was right while it was only a way to scroll: it
+would have opened onto a frozen screen and swallowed every key. It is also how text is
+copied now, and a command that printed one screenful is exactly what you want to pick a
+few words out of. The one pane still refused is a full-screen program's alternate screen,
+where the rows are that program's own redraw rather than its output.
 
 `ctrl-b w` lists the sessions in the same window, numbered from one. Type a
 number and press Enter to move to that session, or Escape to stay where you
@@ -206,7 +248,8 @@ is useful for inspecting what zmux makes of a byte stream:
 printf 'Hello, \033[1;32mWorld\033[0m!\r\n' | zmux dump
 ```
 
-Not yet built: copy mode. `zmux detach` outside
+Not yet built: selecting with the mouse, a rectangular selection, and searching
+the scrollback. `zmux detach` outside
 an attached client reports that, because the prefix key is how a client detaches.
 See [ROADMAP.md](ROADMAP.md).
 

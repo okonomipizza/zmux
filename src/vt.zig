@@ -18,6 +18,11 @@ pub const Error = error{
     InvalidValue,
     /// An output buffer was too small for the value being read.
     OutOfSpace,
+    /// A copy of the library's own buffer could not be allocated.
+    ///
+    /// The library allocates the formatted selection and frees it again, so the bytes are copied
+    /// into a buffer this side owns; that copy is the only allocation in this module.
+    OutOfMemory,
 };
 
 fn check(result: c.GhosttyResult) Error!void {
@@ -182,12 +187,28 @@ pub const Terminal = struct {
 
     /// How many rows of history are above the active area.
     ///
-    /// Zero on the alternate screen, which has no scrollback, so this is also what says whether
-    /// scrolling is possible at all.
+    /// Zero on the alternate screen, which has no scrollback, and zero on a primary screen that has
+    /// printed less than a screenful.
     pub fn scrollbackRows(self: Terminal) usize {
         var value: usize = 0;
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_SCROLLBACK_ROWS, &value);
         return value;
+    }
+
+    /// Whether the alternate screen is the active one.
+    ///
+    /// A full-screen program owns the alternate screen and redraws it at will, so the rows there are
+    /// a frame of that program's interface rather than anything it printed. Reading and copying from
+    /// them would be copying a picture of a menu, and the next redraw would take the selection out
+    /// from under the user.
+    ///
+    /// This is not the same question as `scrollbackRows() == 0`, which it replaces at the call site:
+    /// a primary screen that has printed less than a screenful also has no scrollback, but its rows
+    /// are the program's own output, which is exactly what a user wants to copy from.
+    pub fn altScreen(self: Terminal) bool {
+        var screen: c.GhosttyTerminalScreen = c.GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+        _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN, &screen);
+        return screen == c.GHOSTTY_TERMINAL_SCREEN_ALTERNATE;
     }
 
     /// Whether the viewport is following the active area rather than sitting in history.
@@ -244,6 +265,210 @@ pub const Terminal = struct {
         var value: bool = false;
         _ = c.ghostty_terminal_get(self.handle, c.GHOSTTY_TERMINAL_DATA_CURSOR_VISIBLE, &value);
         return value;
+    }
+
+    /// A cell position in the viewport, which is what the read modes move.
+    ///
+    /// Viewport coordinates rather than active-area ones, because the reader is looking at a
+    /// scrolled screen; a position measured from the cursor's own area would shift under them as
+    /// they scrolled. The library offers both, and this is the one that matches what is on screen.
+    pub const CellPosition = struct {
+        x: u16,
+        y: u32,
+    };
+
+    /// Install a selection covering the word at `position`, and say whether there was one.
+    ///
+    /// The word boundaries are the library's, so a word here means what it means in Ghostty.
+    /// False means the cell held nothing selectable, such as a blank, which is not an error worth
+    /// telling the user about.
+    pub fn selectWord(self: Terminal, position: CellPosition) bool {
+        const ref = self.gridRef(position) orelse return false;
+        var options = c.GhosttyTerminalSelectWordOptions{
+            .size = @sizeOf(c.GhosttyTerminalSelectWordOptions),
+            .ref = ref,
+            .boundary_codepoints = null,
+            .boundary_codepoints_len = 0,
+        };
+        var selection: c.GhosttySelection = undefined;
+        selection.size = @sizeOf(c.GhosttySelection);
+        if (c.ghostty_terminal_select_word(self.handle, &options, &selection) != c.GHOSTTY_SUCCESS)
+            return false;
+        return self.installSelection(&selection);
+    }
+
+    /// Install a selection covering the word at `position`, and report where that word ends.
+    ///
+    /// The end is returned in viewport coordinates so that a caller building a multi-word selection can
+    /// continue from it; without it the next request would find the same word again.
+    ///
+    /// The span itself is the caller's business. `ghostty_terminal_select_word_between` looks like the
+    /// natural primitive for growing one and is not: it searches toward its end ref but is anchored on
+    /// its start ref, so a start inside a word returns that same word however much further the end
+    /// reaches. It exists for double-click-and-drag, where the question is "which single word did the
+    /// user mean".
+    pub fn selectWordEnding(self: Terminal, position: CellPosition) ?CellPosition {
+        const ref = self.gridRef(position) orelse return null;
+        var options = c.GhosttyTerminalSelectWordOptions{
+            .size = @sizeOf(c.GhosttyTerminalSelectWordOptions),
+            .ref = ref,
+            .boundary_codepoints = null,
+            .boundary_codepoints_len = 0,
+        };
+        var word: c.GhosttySelection = undefined;
+        word.size = @sizeOf(c.GhosttySelection);
+        if (c.ghostty_terminal_select_word(self.handle, &options, &word) != c.GHOSTTY_SUCCESS)
+            return null;
+        // A position on whitespace succeeds and selects nothing. That is not a word, and reporting it as
+        // one would let a caller stepping forward word by word install an empty selection: the copy
+        // would then say there was nothing to copy, having just appeared to find a word.
+        if (word.start.x == word.end.x and word.start.y == word.end.y) return null;
+        if (!self.installSelection(&word)) return null;
+
+        // The selection's coordinates are in the terminal's screen space, which counts the scrollback
+        // above the viewport. The caller works in viewport rows, so the difference is taken off here
+        // rather than at every call site.
+        const scrollback: u32 = @intCast(self.scrollbackRows());
+        const end_y = @as(u32, word.end.y);
+        if (end_y < scrollback) return null;
+        return .{ .x = word.end.x, .y = end_y - scrollback };
+    }
+
+    /// Install a selection covering the line at `position`.
+    ///
+    /// Asked for as a line rather than as a run from column zero to the last column, because the
+    /// library knows where the line's content ends; a fixed range would copy the padding a program
+    /// never printed.
+    pub fn selectLine(self: Terminal, position: CellPosition) bool {
+        const ref = self.gridRef(position) orelse return false;
+        var options = c.GhosttyTerminalSelectLineOptions{
+            .size = @sizeOf(c.GhosttyTerminalSelectLineOptions),
+            .ref = ref,
+            .whitespace = null,
+            .whitespace_len = 0,
+            // Prompt boundaries are not used: the shell integration that marks them is a feature
+            // zmux does not implement, so asking for it could only ever bound nothing.
+            .semantic_prompt_boundary = false,
+        };
+        var selection: c.GhosttySelection = undefined;
+        selection.size = @sizeOf(c.GhosttySelection);
+        if (c.ghostty_terminal_select_line(self.handle, &options, &selection) != c.GHOSTTY_SUCCESS)
+            return false;
+        return self.installSelection(&selection);
+    }
+
+    /// Install a selection covering everything the terminal holds, history included.
+    pub fn selectAll(self: Terminal) bool {
+        var selection: c.GhosttySelection = undefined;
+        selection.size = @sizeOf(c.GhosttySelection);
+        if (c.ghostty_terminal_select_all(self.handle, &selection) != c.GHOSTTY_SUCCESS) return false;
+        return self.installSelection(&selection);
+    }
+
+    /// Install a linear selection between two viewport positions, both inclusive.
+    ///
+    /// This is the shape a character-wise selection needs: an anchor the user started at and a
+    /// cursor they have since moved. Neither end is snapped, so the selection is exactly the cells
+    /// the user marked.
+    pub fn selectRange(self: Terminal, anchor: CellPosition, cursor: CellPosition) bool {
+        return self.selectBetween(anchor, cursor, false);
+    }
+
+    /// Install a rectangular selection between two viewport positions, both inclusive.
+    ///
+    /// Every row between the two ends, limited to the columns between them. This is the selection
+    /// that lifts one column out of a table without dragging the text on either side of it, which a
+    /// linear selection cannot do however carefully it is drawn.
+    pub fn selectRectangle(self: Terminal, anchor: CellPosition, cursor: CellPosition) bool {
+        return self.selectBetween(anchor, cursor, true);
+    }
+
+    fn selectBetween(
+        self: Terminal,
+        anchor: CellPosition,
+        cursor: CellPosition,
+        rectangle: bool,
+    ) bool {
+        const anchor_ref = self.gridRef(anchor) orelse return false;
+        const cursor_ref = self.gridRef(cursor) orelse return false;
+        var selection = c.GhosttySelection{
+            .size = @sizeOf(c.GhosttySelection),
+            .start = anchor_ref,
+            .end = cursor_ref,
+            .rectangle = rectangle,
+        };
+        return self.installSelection(&selection);
+    }
+
+    /// Drop the terminal's selection.
+    pub fn clearSelection(self: Terminal) void {
+        // A null value is how the library spells "no selection". It copies nothing out of the
+        // pointer, so there is no struct to build first.
+        _ = c.ghostty_terminal_set(self.handle, c.GHOSTTY_TERMINAL_OPT_SELECTION, null);
+    }
+
+    /// The selected text in a buffer this side owns, or null when nothing is selected.
+    ///
+    /// Formatting is left to the library rather than assembled from cells here, because it owns the
+    /// two decisions that make copied text usable: a soft-wrapped line is joined back into one, and
+    /// the blanks a line was padded with are trimmed from its end. Reimplementing either would
+    /// drift from what the screen shows.
+    ///
+    /// The result is plain text. A styled copy is deliberately not offered: what a user pastes into
+    /// a shell or an editor wants the characters, and the escapes that carried the colours would
+    /// arrive as literal bytes.
+    pub fn copyText(self: Terminal, gpa: std.mem.Allocator) Error!?[]u8 {
+        const options = c.GhosttyTerminalSelectionFormatOptions{
+            .size = @sizeOf(c.GhosttyTerminalSelectionFormatOptions),
+            .emit = c.GHOSTTY_FORMATTER_FORMAT_PLAIN,
+            .unwrap = true,
+            .trim = true,
+            .selection = null,
+        };
+        var pointer: [*c]u8 = null;
+        var length: usize = 0;
+        const result = c.ghostty_terminal_selection_format_alloc(
+            self.handle,
+            null,
+            options,
+            &pointer,
+            &length,
+        );
+        // Nothing to copy is the ordinary case of pressing copy with an empty selection, so it is
+        // reported as no value rather than as a failure.
+        if (result == c.GHOSTTY_NO_VALUE) return null;
+        try check(result);
+        if (pointer == null or length == 0) return null;
+        defer c.ghostty_free(null, pointer, length);
+
+        // The library's buffer is its own allocation and is freed above, so the bytes are copied
+        // into one this side owns. Handing the library's pointer out would mean every caller had to
+        // know which allocator frees it.
+        return try gpa.dupe(u8, pointer[0..length]);
+    }
+
+    /// Resolve a viewport position to a grid reference, or null when it is off the screen.
+    ///
+    /// A reference is only valid until the next mutation of the terminal, so every caller uses one
+    /// immediately and none is stored.
+    fn gridRef(self: Terminal, position: CellPosition) ?c.GhosttyGridRef {
+        const point = c.GhosttyPoint{
+            .tag = c.GHOSTTY_POINT_TAG_VIEWPORT,
+            .value = .{ .coordinate = .{ .x = position.x, .y = position.y } },
+        };
+        var ref: c.GhosttyGridRef = undefined;
+        ref.size = @sizeOf(c.GhosttyGridRef);
+        if (c.ghostty_terminal_grid_ref(self.handle, point, &ref) != c.GHOSTTY_SUCCESS) return null;
+        return ref;
+    }
+
+    /// Hand a freshly derived selection to the terminal, which copies it.
+    fn installSelection(self: Terminal, selection: *c.GhosttySelection) bool {
+        return c.ghostty_terminal_set(
+            self.handle,
+            c.GHOSTTY_TERMINAL_OPT_SELECTION,
+            @ptrCast(selection),
+        ) == c.GHOSTTY_SUCCESS;
     }
 
     /// The terminal title as set by OSC 0/2, or an empty slice.
@@ -402,6 +627,16 @@ pub fn ansiMode(value: u16) c.GhosttyMode {
     return value | 0x8000;
 }
 
+/// The columns of one row that a selection covers, both ends inclusive.
+///
+/// A named type rather than an anonymous struct at the return site, because a caller that stores it
+/// needs a type the two sides agree on: two structurally identical anonymous structs are different
+/// types in Zig, and an inferred one cannot be assigned to a declared field.
+pub const SelectionRange = struct {
+    start: u16,
+    end: u16,
+};
+
 pub const RowIterator = struct {
     handle: c.GhosttyRenderStateRowIterator,
 
@@ -426,6 +661,23 @@ pub const RowIterator = struct {
             c.GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY,
             &value,
         );
+    }
+
+    /// The part of this row the current selection covers, or null when it covers none of it.
+    ///
+    /// Asked per row rather than per cell, which is what the library recommends: the answer is a
+    /// column range, and querying it once per row avoids a C call for every cell on the screen.
+    /// Null is the common case and means the row is outside the selection entirely.
+    pub fn selectedColumns(self: RowIterator) ?SelectionRange {
+        var range: c.GhosttyRenderStateRowSelection = undefined;
+        range.size = @sizeOf(c.GhosttyRenderStateRowSelection);
+        const result = c.ghostty_render_state_row_get(
+            self.handle,
+            c.GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
+            @ptrCast(&range),
+        );
+        if (result != c.GHOSTTY_SUCCESS) return null;
+        return .{ .start = range.start_x, .end = range.end_x };
     }
 
     /// Walk the cells of this row, invoking `visitor` for each one.
@@ -1188,4 +1440,181 @@ test "every scroll movement goes the way it says" {
     terminal.scrollBy(-5);
     try std.testing.expect(row(terminal) < bottom);
     try std.testing.expect(!terminal.viewportActive());
+}
+
+test "a word selection copies the word under a position" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 40, .rows = 4 });
+    defer term.deinit();
+
+    term.write("alpha beta_gamma delta\r\n");
+
+    // The middle of the second word, which must come back whole rather than as a fragment.
+    try std.testing.expect(term.selectWord(.{ .x = 8, .y = 0 }));
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    // Underscores are part of a word by Ghostty's rules, which is what makes a copied identifier or
+    // path segment come back intact.
+    try std.testing.expectEqualStrings("beta_gamma", copied);
+}
+
+test "a line selection copies the line without its padding" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 30, .rows = 4 });
+    defer term.deinit();
+
+    // The line is far shorter than the terminal, so the cells after it are blanks the program never
+    // printed. Copying them would put trailing whitespace on the clipboard.
+    term.write("hello\r\nsecond\r\n");
+
+    try std.testing.expect(term.selectLine(.{ .x = 2, .y = 0 }));
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("hello", copied);
+}
+
+test "a range selection copies exactly the cells marked" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    term.write("abcdefgh\r\n");
+
+    // Columns 2 through 5 inclusive, so the copy is four characters and neither end is snapped.
+    try std.testing.expect(term.selectRange(.{ .x = 2, .y = 0 }, .{ .x = 5, .y = 0 }));
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("cdef", copied);
+}
+
+test "a reversed range selection copies in reading order" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    term.write("abcdefgh\r\n");
+
+    // The same cells marked from the other end. The endpoints keep the direction the user drew
+    // them, so a selection dragged right to left must still copy left to right.
+    try std.testing.expect(term.selectRange(.{ .x = 5, .y = 0 }, .{ .x = 2, .y = 0 }));
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("cdef", copied);
+}
+
+test "copying with no selection yields nothing rather than an empty string" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    term.write("text\r\n");
+    // Nothing was selected, so there is no value to report. An empty string would be
+    // indistinguishable from a selection of nothing, and the caller has to tell them apart to
+    // decide whether to put anything on the clipboard.
+    try std.testing.expectEqual(@as(?[]u8, null), try term.copyText(gpa));
+}
+
+test "clearing a selection makes the copy yield nothing" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    term.write("alpha beta\r\n");
+    try std.testing.expect(term.selectWord(.{ .x = 1, .y = 0 }));
+    term.clearSelection();
+    try std.testing.expectEqual(@as(?[]u8, null), try term.copyText(gpa));
+}
+
+test "selecting all copies across a soft wrap as one line" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 5, .rows = 4 });
+    defer term.deinit();
+
+    // Ten characters into a five-column terminal wraps without a newline, so the two rows are one
+    // logical line. Joining them is the library's `unwrap`, and a copy that kept the break would
+    // paste a newline the program never produced.
+    term.write("abcdefghij");
+
+    try std.testing.expect(term.selectAll());
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("abcdefghij", copied);
+}
+
+test "a word selection on a blank cell reports nothing" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 20, .rows = 4 });
+    defer term.deinit();
+
+    term.write("ab\r\n");
+    // Column 10 is past the text, so there is no word to select. This has to be reported as false
+    // rather than installing an empty selection, or a user pressing the key on blank space would
+    // silently wipe the clipboard.
+    try std.testing.expect(!term.selectWord(.{ .x = 10, .y = 0 }));
+    try std.testing.expectEqual(@as(?[]u8, null), try term.copyText(gpa));
+}
+
+test "a word selection reports where the word ends so the next one can be found" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 40, .rows = 4 });
+    defer term.deinit();
+
+    term.write("alpha beta gamma delta\r\n");
+
+    // The word at the anchor, and the column just past its end. That end is what the caller uses to
+    // find the next word: without it the same word is found again and a multi-word span never grows.
+    const first = term.selectWordEnding(.{ .x = 0, .y = 0 }).?;
+    const one = (try term.copyText(gpa)).?;
+    defer gpa.free(one);
+    try std.testing.expectEqualStrings("alpha", one);
+    try std.testing.expectEqual(@as(u16, 4), first.x);
+
+    // One cell past that end is the space between the words. It reports nothing, not an empty word:
+    // the library succeeds on whitespace with a zero-width selection, and reporting that as a word
+    // would let a caller stepping forward install an empty selection and then say there was nothing
+    // to copy, having just appeared to find a word.
+    try std.testing.expectEqual(@as(?Terminal.CellPosition, null), term.selectWordEnding(.{ .x = first.x + 1, .y = 0 }));
+
+    // Stepping past the space finds the second word and its end, which is where the next search begins.
+    const second = term.selectWordEnding(.{ .x = first.x + 2, .y = 0 }).?;
+    const two = (try term.copyText(gpa)).?;
+    defer gpa.free(two);
+    try std.testing.expectEqualStrings("beta", two);
+    try std.testing.expectEqual(@as(u16, 9), second.x);
+
+    const third = term.selectWordEnding(.{ .x = second.x + 2, .y = 0 }).?;
+    const three = (try term.copyText(gpa)).?;
+    defer gpa.free(three);
+    try std.testing.expectEqualStrings("gamma", three);
+    try std.testing.expectEqual(@as(u16, 15), third.x);
+}
+
+test "a rectangular selection takes the same columns on every row" {
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 40, .rows = 6 });
+    defer term.deinit();
+
+    // Three rows with their columns lined up, which is what a table looks like.
+    term.write("aaa111\r\nbbb222\r\nccc333\r\n");
+
+    // Rows 0 to 2, columns 3 to 5 inclusive: the digits and nothing else.
+    try std.testing.expect(term.selectRectangle(.{ .x = 3, .y = 0 }, .{ .x = 5, .y = 2 }));
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("111\n222\n333", copied);
+}
+
+test "a linear selection from the same ends would take the columns on either side" {
+    // The comparison that shows why the rectangle exists: the same two corners drawn as a linear
+    // selection swallow the first row's letters, the wrap, and the third row's letters.
+    const gpa = std.testing.allocator;
+    var term = try Terminal.init(.{ .cols = 40, .rows = 6 });
+    defer term.deinit();
+
+    term.write("aaa111\r\nbbb222\r\nccc333\r\n");
+
+    try std.testing.expect(term.selectRange(.{ .x = 3, .y = 0 }, .{ .x = 5, .y = 2 }));
+    const copied = (try term.copyText(gpa)).?;
+    defer gpa.free(copied);
+    try std.testing.expectEqualStrings("111\nbbb222\nccc333", copied);
 }

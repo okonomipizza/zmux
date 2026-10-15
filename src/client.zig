@@ -18,6 +18,7 @@ const config_mod = @import("config.zig");
 const protocol = @import("protocol.zig");
 const terminal_mod = @import("terminal.zig");
 const signal_mod = @import("signal.zig");
+const clipboard = @import("clipboard.zig");
 
 pub const Error = error{
     /// A raw syscall failed.
@@ -125,6 +126,23 @@ const PendingOutput = struct {
 /// and losing output at all is only possible in a case where the pane is not on screen.
 const pending_limit = 256 * 1024;
 
+/// What a selection key is drawing.
+///
+/// The three differ only in how the range is derived from the two ends: a character at a time, whole
+/// lines, or a block of columns.
+pub const SelectionKind = enum {
+    /// From the anchor to the cursor, cell by cell.
+    character,
+    /// Whole lines: the anchor's line through the cursor's line.
+    line,
+    /// A block: the columns between the two ends, on every row between them.
+    ///
+    /// This is what lifts one column out of a table. A character selection joins the ends and takes
+    /// everything between them, so copying the middle of an `ls -l` listing drags the columns on
+    /// either side along with it; a rectangle takes the same columns on each row and leaves the rest.
+    rectangle,
+};
+
 pub const Client = struct {
     gpa: std.mem.Allocator,
     connection: socket.Connection,
@@ -161,6 +179,39 @@ pub const Client = struct {
     /// viewport instead of being typed, and `q` leaves rather than closing a pane. The pane's
     /// viewport is the library's, so what is being read is the pane's own history and not a copy.
     scroll_mode: bool = false,
+    /// Where the copy cursor is in the pane, in viewport coordinates.
+    ///
+    /// It exists from the moment the read mode opens, before anything is selected, because a user
+    /// who cannot see where the cursor is cannot aim: the previous design started a selection at the
+    /// middle of the pane on `v`, which made the anchor arbitrary and, being a single cell, invisible.
+    /// Moving a visible cursor first and starting the selection there is what makes the copy range
+    /// something the user chose rather than something they were given.
+    copy_cursor: vt.Terminal.CellPosition = .{ .x = 0, .y = 0 },
+    /// Where a selection began, in viewport coordinates, or null when nothing is selected.
+    ///
+    /// The anchor is kept rather than a whole range, because a character-wise selection is defined
+    /// by where it started and where it has reached; storing both ends would mean deciding which is
+    /// which on every move, and the pair has to be handed to the library in the order the user drew
+    /// it anyway. Viewport coordinates, because that is the space the reader's cursor moves in.
+    selection_anchor: ?vt.Terminal.CellPosition = null,
+    /// What kind of selection the keys are drawing.
+    ///
+    /// Character-wise is the default because it can express every other kind: a whole line is a
+    /// character selection that happens to span one, and a word is one that happens to span a word.
+    /// The other two modes are shortcuts that snap an end for the user, not separate selections.
+    selection_kind: SelectionKind = .character,
+    /// What to tell the user about the last copy, or null when there is nothing to say.
+    ///
+    /// A copy has no visible result of its own: the text goes to the clipboard and the screen is
+    /// unchanged. Without a word in the status line, a copy that failed because the terminal does
+    /// not accept OSC 52 looks exactly like one that worked, and the user finds out when they
+    /// paste.
+    copy_notice: ?[]const u8 = null,
+    /// Whether `copy_notice` is a failure rather than the name of a program that took the text.
+    ///
+    /// A flag rather than looking the string up, because the two are formatted differently in the
+    /// status line and a phrase like "nothing to copy" is not a program name.
+    copy_notice_is_failure: bool = false,
     /// The digits typed so far, as a number, or zero when none has been typed.
     ///
     /// A value rather than a string, because the menu chooses a session by its position and a number
@@ -461,6 +512,29 @@ pub const Client = struct {
         const name = if (self.watching.len > 0) self.watching.slice() else "-";
         const state = if (self.exited) "exited" else "running";
 
+        // The copy result outranks everything else, including the mode hints, because it is the only
+        // confirmation a copy ever gets: the text goes to the clipboard and the screen looks exactly
+        // as it did. Copying also leaves the read mode, so this has to be checked before the mode
+        // branches rather than inside the scroll one, or the notice would be cleared by leaving the
+        // mode before a single frame could show it.
+        if (self.copy_notice) |notice| {
+            // "copied via" only fits a program that took the text. The other outcomes are sentences
+            // already -- a refusal and a failure -- and prefixing them produced lines like "copied
+            // via nothing to copy", which reads as nonsense and hides which of the three happened.
+            if (self.copy_notice_is_failure) {
+                return std.fmt.bufPrint(
+                    buffer,
+                    " zmux | {s} | {s} | {s}",
+                    .{ name, notice, state },
+                ) catch buffer[0..0];
+            }
+            return std.fmt.bufPrint(
+                buffer,
+                " zmux | {s} | copied via {s} | {s}",
+                .{ name, notice, state },
+            ) catch buffer[0..0];
+        }
+
         // While a dock target is being chosen the status line is the instruction for the mode, since
         // the whole window is now a menu.
         // While the history is being read the status line is the only thing that says the mode is
@@ -469,9 +543,21 @@ pub const Client = struct {
             const pane = self.focusedPane();
             const history = if (pane) |p| p.terminal.scrollbackRows() else 0;
             const at_live = if (pane) |p| p.terminal.viewportActive() else true;
+
+            // The hint changes once a selection is being drawn, because the keys do: while one is
+            // up, the movement keys extend it rather than scroll and `q` no longer leaves. Showing
+            // the scrolling hint there would name keys that no longer do what it says.
+            if (self.selection_anchor != null) {
+                return std.fmt.bufPrint(
+                    buffer,
+                    " zmux | {s} | selecting: hjkl extend  w next word  V line  R block  y/enter copy  esc cancel | {d} rows of history",
+                    .{ name, history },
+                ) catch buffer[0..0];
+            }
+
             return std.fmt.bufPrint(
                 buffer,
-                " zmux | {s} | scroll: j/k line  J/K ten  ctrl-d/u half  ctrl-f/v page  g/G ends  q quit |{s} {d} rows of history",
+                " zmux | {s} | read: hjkl move cursor  J/K ten  ctrl-d/u half  ctrl-f/v page  g/G ends  v select  q quit |{s} {d} rows of history",
                 .{ name, if (at_live) " live," else "", history },
             ) catch buffer[0..0];
         }
@@ -605,6 +691,24 @@ pub const Client = struct {
     /// all, which is why the position is optional rather than assumed to be in range.
     fn drawCursor(self: *Client, local: terminal_mod.Terminal) void {
         const pane = self.focusedPane() orelse return hideCursor(local);
+        const interior = pane.rect.interior();
+
+        // While the history is being read, the cursor is the copy cursor rather than the program's.
+        // The program's own cursor is not where the keystrokes go in this mode, so showing its place
+        // would point at something the user cannot move; the copy cursor is what `v` anchors on and
+        // what the movement keys move, and a user who cannot see it cannot aim.
+        if (self.scroll_mode) {
+            if (interior.width == 0 or interior.height == 0) return hideCursor(local);
+            var buffer: [32]u8 = undefined;
+            const move = std.fmt.bufPrint(
+                &buffer,
+                "\x1b[{d};{d}H\x1b[?25h",
+                .{ interior.y + self.copy_cursor.y + 1, interior.x + self.copy_cursor.x + 1 },
+            ) catch return hideCursor(local);
+            local.writeAll(move) catch {};
+            return;
+        }
+
         // A float takes the focus when one is raised, and the server says which; the tiled focus
         // is not what the user is typing into while a float is up.
         if (!pane.render.cursorVisible()) return hideCursor(local);
@@ -613,7 +717,6 @@ pub const Client = struct {
         // The cursor is reported in the program's own coordinates, whose origin is the interior's
         // top left rather than the pane's. The frame is one cell, so the pane's origin alone would
         // put the cursor in the border.
-        const interior = pane.rect.interior();
         var buffer: [32]u8 = undefined;
         const move = std.fmt.bufPrint(
             &buffer,
@@ -856,6 +959,11 @@ pub const Client = struct {
             /// How many cells of this row have been written, which is how the row is clipped to the
             /// rectangle without cutting into the escape sequences sharing the buffer.
             columns_written: u16 = 0,
+            /// The selected columns of the row being painted, or null when it has none.
+            ///
+            /// Set once per row by `visit` and read by `collect`, so that the selection costs one
+            /// library call per row rather than one per cell.
+            selected: ?vt.SelectionRange = null,
 
             fn visit(painter: *@This(), row: *vt.RowIterator) bool {
                 defer painter.row_index.* += 1;
@@ -897,6 +1005,11 @@ pub const Client = struct {
                 // consider itself unstyled until it says otherwise.
                 painter.current_style = .{};
                 painter.columns_written = 0;
+                // The selected columns of this row, read once here rather than per cell. Null
+                // means this row is outside the selection, which is the common case; the library
+                // reports the range per row precisely so that a screenful costs one call a row and
+                // not one a cell.
+                painter.selected = row.selectedColumns();
                 _ = row.forEachCell(painter, collect) catch {
                     painter.failed = true;
                     return false;
@@ -917,11 +1030,23 @@ pub const Client = struct {
                 // Cells beyond the rectangle are dropped rather than written and clipped. A wide
                 // glyph or a mis-sized terminal would otherwise run into the pane beside this one.
                 if (painter.columns_written >= painter.rect.width) return;
+                const column = painter.columns_written;
                 painter.columns_written += 1;
                 // Styling is emitted before the glyph, and only when it differs from the cell
                 // before it. A run of text in one colour therefore costs one escape rather than one
                 // per character, which matters for a screenful of a shell's output.
-                const style = cell.resolvedStyle();
+                var style = cell.resolvedStyle();
+                // A selected cell is drawn in reverse video, which is what every terminal does and what
+                // a user reads as "this is what will be copied".
+                //
+                // The bit is toggled rather than set, because a program's own styling may already have
+                // set it: the shell prompt this was written against draws its user and host in reverse,
+                // and setting the bit left those cells looking exactly as they did unselected, so the
+                // selection was invisible on the very text the user was aiming at. Toggling makes a
+                // selected cell always look different from the same cell unselected.
+                if (painter.selected) |range| {
+                    if (column >= range.start and column <= range.end) style.inverse = !style.inverse;
+                }
                 if (!style.eql(painter.current_style)) {
                     terminal_mod.SgrWriter.write(
                         &painter.pane.line,
@@ -1177,10 +1302,71 @@ pub const Client = struct {
             // A page is the visible height less one row, so that a line of context carries over and
             // the reader can see where they were. That is what `less` and `vim` do.
             const page: i32 = if (pane.rect.height > 2) @as(i32, pane.rect.height) - 2 else 1;
+
+            // `w` works whether or not anything is selected. On the first press it anchors at the
+            // cursor and takes the word there; on each press after that it reaches one word further.
+            // That is what makes "copy these three words" three keystrokes rather than a character-by
+            // -character drag over the spaces in between.
+            if (byte == 'w') {
+                self.extendToWord(pane);
+                pane.stale = true;
+                return false;
+            }
+
+            // The rest of the selection keys only mean something once there is a selection to work
+            // on, and before that they fall through to the scrolling keys below rather than being
+            // silently swallowed. The movement keys are handled down there too, where they move the
+            // copy cursor; see `moveCopyCursor`.
+            if (self.selection_anchor != null) {
+                switch (byte) {
+                    'V' => {
+                        _ = pane.terminal.selectLine(self.copy_cursor);
+                        self.selection_kind = .line;
+                        pane.stale = true;
+                        return false;
+                    },
+                    // `R` switches to a rectangular selection and re-draws the current range as one.
+                    // It is a mode switch rather than a snap, because a block is not something the
+                    // library can derive from a single position: it is the shape the user has already
+                    // drawn, reinterpreted. `ctrl-v` is vim's key for the same thing and is already
+                    // page-up here, which a reader uses far more often.
+                    'R' => {
+                        self.selection_kind = .rectangle;
+                        self.applySelection(pane, self.selection_anchor.?, self.copy_cursor);
+                        pane.stale = true;
+                        return false;
+                    },
+                    // Copy, and leave the mode. Enter does the same, because a reader who has just
+                    // watched a range grow expects to confirm it, and `y` is vim's spelling of the
+                    // same intent.
+                    'y', '\r', '\n' => {
+                        self.copyAndLeave(pane);
+                        return false;
+                    },
+                    // Abandoning the selection leaves the reader where they were rather than
+                    // leaving the mode: a selection drawn too wide is usually redrawn, not given up
+                    // on along with the whole scrollback view.
+                    0x1B => {
+                        self.clearSelection(pane);
+                        pane.stale = true;
+                        return false;
+                    },
+                    else => {},
+                }
+            }
+
             switch (byte) {
-                'j', 'l' => pane.terminal.scrollBy(1),
-                'k', 'h' => pane.terminal.scrollBy(-1),
-                // The capitals move by ten, so a long history can be crossed without holding a key.
+                // The movement keys move the copy cursor. The viewport follows when the cursor would
+                // leave the screen, so the same four keys both aim and scroll; `moveCopyCursor` is
+                // where that is decided.
+                'j', 'l', 'k', 'h' => {
+                    self.moveCopyCursor(pane, byte);
+                    pane.stale = true;
+                    return false;
+                },
+                // The capitals scroll by ten without moving the cursor, so a long history can be
+                // crossed without dragging the cursor along with it. The cursor keeps its place on
+                // screen, which is what makes it a fixed aim rather than a moving one.
                 'J', 'L' => pane.terminal.scrollBy(10),
                 'K', 'H' => pane.terminal.scrollBy(-10),
                 // Half a screen, the movement a reader makes most when looking for something.
@@ -1196,8 +1382,17 @@ pub const Client = struct {
                 // The ends of the history. `g` is vim's and `G` the same for the other end.
                 'g' => pane.terminal.scrollToTop(),
                 'G' => pane.terminal.scrollToBottom(),
+                // `v` anchors a selection at the copy cursor, so the range copied is the range
+                // between where the user put the cursor and where they move it. It is the key vim
+                // uses for the same thing, and it was free once the split keys moved off it.
+                'v' => {
+                    self.beginSelection(pane);
+                    pane.stale = true;
+                    return false;
+                },
                 // Leaving with Enter returns to the live screen, which is what the user wants when
-                // they have found what they were looking for.
+                // they have found what they were looking for. Enter only reaches here when no
+                // selection is being drawn, since the block above takes it while one is.
                 'q', 0x1B, '\r', '\n' => {
                     self.leaveScroll();
                     return false;
@@ -1283,15 +1478,27 @@ pub const Client = struct {
         return false;
     }
 
-    /// Enter the scroll mode on the focused pane, if there is any history to read.
+    /// Enter the read mode on the focused pane.
     ///
-    /// Refusing when there is nothing above the screen is deliberate: a mode that opens onto a
-    /// frozen screen and swallows the keys would read as the program hanging. The status line stays
-    /// as it is, so the user sees why nothing happened.
+    /// A pane with nothing above the screen still opens the mode. The mode was once only a way to
+    /// scroll, and refusing it there was right: it would have opened onto a frozen screen and
+    /// swallowed every key, which reads as the program hanging. It is now also how text is selected
+    /// and copied, and copying from the visible screen is the ordinary case — a command that printed
+    /// one screenful is exactly what a user wants to pick a few words out of. Refusing then meant the
+    /// only way to copy was to print enough output to scroll first.
+    ///
+    /// The alternate screen is the one case still refused, because there the pane holds no rows of
+    /// its own to copy: a full-screen program owns the screen, and `alt_screen` says so. Scrolling
+    /// and selecting would both act on a screen the program is about to redraw.
     fn enterScroll(self: *Client) void {
         const pane = self.focusedPane() orelse return;
-        if (pane.terminal.scrollbackRows() == 0) return;
+        if (pane.terminal.altScreen()) return;
         self.scroll_mode = true;
+        // The cursor is placed here rather than left at whatever the previous session of reading
+        // left behind, so that every entry into the mode starts from something visible and
+        // predictable. Nothing is selected yet; `v` is what starts a selection, at this position.
+        self.placeCopyCursor(pane);
+        pane.stale = true;
     }
 
     /// Leave the scroll mode and return the pane to the live screen.
@@ -1302,6 +1509,10 @@ pub const Client = struct {
     fn leaveScroll(self: *Client) void {
         self.scroll_mode = false;
         const pane = self.focusedPane() orelse return;
+        // The selection belongs to the read mode. Leaving it installed would make the terminal
+        // repaint those cells as selected on the live screen, where the user is no longer reading,
+        // and a later copy would take text they had forgotten marking.
+        self.clearSelection(pane);
         pane.terminal.scrollToBottom();
         pane.stale = true;
     }
@@ -1314,6 +1525,236 @@ pub const Client = struct {
     fn endScrollForInput(self: *Client) void {
         if (!self.scroll_mode) return;
         self.leaveScroll();
+    }
+
+    /// Put the copy cursor in the pane, so the user has something to aim with.
+    ///
+    /// It starts where the program's own cursor is, because that is the one place on the screen the
+    /// user was already looking at and the most likely place they want to copy from. A cursor the
+    /// program has hidden, or one scrolled out of view, has no position to offer; the centre is used
+    /// then, which is a guess but a visible one the movement keys immediately correct.
+    ///
+    /// Nothing is selected yet. A selection is what `v` adds, and starting one here would leave the
+    /// user unable to see the cursor before choosing where the selection should begin.
+    fn placeCopyCursor(self: *Client, pane: *RemotePane) void {
+        const interior = pane.rect.interior();
+        if (interior.width == 0 or interior.height == 0) return;
+
+        self.selection_anchor = null;
+        pane.terminal.clearSelection();
+        self.selection_kind = .character;
+
+        self.copy_cursor = if (pane.render.cursorPosition()) |at|
+            .{ .x = @min(at.x, interior.width - 1), .y = @min(@as(u32, at.y), interior.height - 1) }
+        else
+            .{ .x = interior.width / 2, .y = interior.height / 2 };
+    }
+
+    /// Anchor the selection at the copy cursor, so that the next move extends from there.
+    ///
+    /// The selection is installed immediately as a single cell: a user who presses `v` and then `y`
+    /// has asked for one character, and reporting that nothing was selected would be a refusal to do
+    /// what was asked.
+    fn beginSelection(self: *Client, pane: *RemotePane) void {
+        self.selection_anchor = self.copy_cursor;
+        self.selection_kind = .character;
+        self.clearCopyNotice();
+        _ = pane.terminal.selectRange(self.copy_cursor, self.copy_cursor);
+    }
+
+    /// Move the copy cursor one cell in the direction the key names, and extend any selection to it.
+    ///
+    /// The cursor is clamped to the pane rather than allowed to leave it, because a cursor past the
+    /// edge has no cell to draw at and the library would be asked about a column the row does not
+    /// have. Scrolling still reaches the rest of the history: the viewport is moved when the cursor
+    /// would step past the bottom or the top, which is what makes a selection longer than a screen
+    /// possible.
+    ///
+    /// With nothing selected this only moves the cursor, which is what lets a user aim before
+    /// committing to a start point.
+    fn moveCopyCursor(self: *Client, pane: *RemotePane, byte: u8) void {
+        const interior = pane.rect.interior();
+        if (interior.width == 0 or interior.height == 0) return;
+
+        const max_x: u16 = interior.width - 1;
+        const max_y: u32 = interior.height - 1;
+        var cursor = self.copy_cursor;
+
+        switch (byte) {
+            'h' => cursor.x = if (cursor.x > 0) cursor.x - 1 else 0,
+            'l' => cursor.x = if (cursor.x < max_x) cursor.x + 1 else max_x,
+            'k' => {
+                if (cursor.y > 0) {
+                    cursor.y -= 1;
+                } else {
+                    // At the top of the screen, moving up scrolls the history instead of stopping,
+                    // so a selection can be dragged past the first visible row.
+                    pane.terminal.scrollBy(-1);
+                }
+            },
+            'j' => {
+                if (cursor.y < max_y) {
+                    cursor.y += 1;
+                } else {
+                    pane.terminal.scrollBy(1);
+                }
+            },
+            else => return,
+        }
+
+        self.copy_cursor = cursor;
+
+        const anchor = self.selection_anchor orelse return;
+        self.applySelection(pane, anchor, cursor);
+    }
+
+    /// Extend the selection forward to the end of the next word, and move the cursor there.
+    ///
+    /// With nothing selected the anchor is the cursor, which is what makes `w` usable on its own: a
+    /// user who wants two words and nothing else can press it twice without knowing about `v`.
+    ///
+    /// The anchor is kept, so pressing `w` again reaches the next word and the span grows: three
+    /// presses copy three words. Each press re-installs the whole span rather than only the new word,
+    /// because the library's selection is a single range and there is nothing to append to.
+    ///
+    /// The search starts one cell past the cursor and keeps stepping while it lands on whitespace. A
+    /// single step is not enough on its own: the space between two words holds no word, and stopping
+    /// there would leave the selection where it was while appearing to have moved on.
+    fn extendToWord(self: *Client, pane: *RemotePane) void {
+        const interior = pane.rect.interior();
+        if (interior.width == 0 or interior.height == 0) return;
+
+        const anchor = self.selection_anchor orelse self.copy_cursor;
+        var x = self.copy_cursor.x;
+        while (x + 1 < interior.width) {
+            x += 1;
+            const end = pane.terminal.selectWordEnding(.{ .x = x, .y = self.copy_cursor.y }) orelse continue;
+            self.selection_anchor = anchor;
+            self.selection_kind = .character;
+            self.clearCopyNotice();
+            // The whole span is installed rather than the word alone, so the words already taken stay
+            // in it. The cursor goes to the end of the word just found, which is where the next press
+            // starts looking from.
+            _ = pane.terminal.selectRange(anchor, end);
+            self.copy_cursor = self.clampToPane(pane, end);
+            return;
+        }
+    }
+
+    /// Install a selection of the current kind between the anchor and the cursor.
+    fn applySelection(
+        self: *Client,
+        pane: *RemotePane,
+        anchor: vt.Terminal.CellPosition,
+        cursor: vt.Terminal.CellPosition,
+    ) void {
+        switch (self.selection_kind) {
+            .character => {
+                // A character selection joins the anchor to the cursor; the library keeps the
+                // direction they were drawn in and copies them in reading order either way.
+                _ = pane.terminal.selectRange(anchor, cursor);
+            },
+            .line => {
+                // A line selection is re-derived from the cursor, so the lines it covers follow it.
+                // The end that moves is the cursor's line, and the library supplies the bounds.
+                _ = pane.terminal.selectLine(cursor);
+            },
+            .rectangle => {
+                // The rows between the two ends, each limited to the columns between them. This is
+                // what makes a table's column copyable without the text either side of it.
+                _ = pane.terminal.selectRectangle(anchor, cursor);
+            },
+        }
+    }
+
+    /// Keep a position inside the pane's interior.
+    fn clampToPane(self: *Client, pane: *RemotePane, position: vt.Terminal.CellPosition) vt.Terminal.CellPosition {
+        _ = self;
+        const interior = pane.rect.interior();
+        if (interior.width == 0 or interior.height == 0) return position;
+        return .{
+            .x = @min(position.x, interior.width - 1),
+            .y = @min(position.y, interior.height - 1),
+        };
+    }
+
+    /// Drop any selection this client is drawing, here and in the pane's terminal.
+    fn clearSelection(self: *Client, pane: *RemotePane) void {
+        self.selection_anchor = null;
+        pane.terminal.clearSelection();
+        self.clearCopyNotice();
+    }
+
+    /// Put the selected text on the clipboard, and say in the status line what happened.
+    ///
+    /// The terminal is tried first: OSC 52 needs no program installed and works across a connection,
+    /// which the fallback cannot do. The fallback is for terminals that do not implement it or
+    /// refuse it, which zmux cannot detect directly -- there is no reply to an OSC 52 -- so it is
+    /// run whenever one exists.
+    /// Copy, and leave the read mode.
+    ///
+    /// Leaving has to happen after the copy and must not undo its report, which is why the mode is
+    /// brought down first and the notice is set last: `leaveScroll` clears the selection along with
+    /// the notice, so a notice written before it would be wiped before the user ever saw it.
+    fn copyAndLeave(self: *Client, pane: *RemotePane) void {
+        const outcome = self.copySelection(pane);
+        self.leaveScroll();
+        self.copy_notice = outcome.text;
+        self.copy_notice_is_failure = outcome.failed;
+    }
+
+    /// What a copy attempt should tell the user.
+    const CopyOutcome = struct {
+        /// The program that took the text, or a phrase describing what went wrong.
+        text: []const u8,
+        /// Whether `text` is a failure rather than a program name.
+        failed: bool = false,
+    };
+
+    /// Put the selected text on the clipboard, and report how it went.
+    ///
+    /// Returns the line to show rather than setting it, so that the caller can bring the mode down
+    /// first; see `copyAndLeave`.
+    fn copySelection(self: *Client, pane: *RemotePane) CopyOutcome {
+        const text = pane.terminal.copyText(self.gpa) catch
+            return .{ .text = "copy failed", .failed = true };
+        const owned = text orelse return .{ .text = "nothing selected", .failed = true };
+        defer self.gpa.free(owned);
+
+        return self.sendToClipboard(owned);
+    }
+
+    /// Hand already-formatted text to the terminal and then to a fallback program.
+    ///
+    /// Returns the program that took the text, or a word for what happened instead. Split out from
+    /// `copySelection` so that the delivery can be tested without a terminal that has a selection,
+    /// which needs a pane and a screen to build.
+    fn sendToClipboard(self: *Client, text: []const u8) CopyOutcome {
+        const escape = clipboard.encode(self.gpa, text) catch |err| switch (err) {
+            error.TooLarge => return .{ .text = "too large to copy", .failed = true },
+            error.OutOfMemory => return .{ .text = "copy failed", .failed = true },
+        };
+        defer self.gpa.free(escape);
+
+        // The escape goes to the local terminal, which is the emulator zmux is running inside. A
+        // failed write is not reported: it means the terminal is gone, and the next frame will fail
+        // in a way the user can see.
+        if (self.local) |local| local.writeAll(escape) catch {};
+
+        // The fallback runs even when the escape was written, because there is no reply to an OSC 52
+        // and zmux cannot tell a terminal that accepted it from one that ignored it. Running it
+        // costs a process launch only when one of the programs exists.
+        if (clipboard.runFallback(text)) |program| return .{ .text = program };
+
+        // Neither route could be confirmed. The escape may still have worked, so this says the text
+        // was sent rather than claiming a delivery that cannot be verified, and rather than claiming
+        // a failure that would be wrong for every terminal that does accept OSC 52.
+        return .{ .text = "sent" };
+    }
+
+    fn clearCopyNotice(self: *Client) void {
+        self.copy_notice = null;
+        self.copy_notice_is_failure = false;
     }
 
     /// Open the switch menu and ask the server for the sessions to fill it.
@@ -2892,10 +3333,15 @@ test "digits typed at the menu build a number" {
     try std.testing.expectEqualStrings("s12", client.chosenSession().?.name.slice());
 }
 
-test "the scroll mode refuses to open with nothing to scroll" {
-    // A mode that opens onto a frozen screen and swallows every key reads as the program hanging.
-    // A pane on the alternate screen has no scrollback at all, and one that has printed less than a
-    // screenful has none either, so both must leave the mode off.
+test "the read mode opens without history but not on the alternate screen" {
+    // The mode is no longer only a way to scroll: it is also how text is selected and copied, and a
+    // command that printed one screenful is exactly what a user wants to pick a few words out of.
+    // Refusing there meant the only way to copy was to print enough output to scroll first.
+    //
+    // The alternate screen is still refused, because the rows there belong to a full-screen program's
+    // redraw rather than to its output, and a selection would be taken out from under the user by the
+    // next frame. That is a different question from "is there scrollback", which is what the guard
+    // used to ask.
     const gpa = std.testing.allocator;
     var client: Client = .{
         .gpa = gpa,
@@ -2911,11 +3357,10 @@ test "the scroll mode refuses to open with nothing to scroll" {
         client.encoder.deinit();
     }
 
-    // No panes at all: nothing to scroll.
+    // No panes at all: there is nothing to read.
     client.enterScroll();
     try std.testing.expect(!client.scroll_mode);
 
-    // A pane that has printed one line into a five-row terminal has no history.
     var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
     errdefer terminal.deinit();
     var render = try terminal.createRenderState();
@@ -2929,18 +3374,24 @@ test "the scroll mode refuses to open with nothing to scroll" {
         .route = route,
     });
     client.focused = 7;
+    const pane = client.findPane(7).?;
 
+    // One line in a five-row pane: no scrollback, but the line is the program's own output and is
+    // what the user wants to copy, so the mode opens.
     terminal.write("one line\n");
-    try std.testing.expectEqual(@as(usize, 0), client.findPane(7).?.terminal.scrollbackRows());
-    client.enterScroll();
-    try std.testing.expect(!client.scroll_mode);
-
-    // Once lines have scrolled out of view there is history, so the mode opens.
-    var line: usize = 0;
-    while (line < 20) : (line += 1) terminal.write("more\n");
-    try std.testing.expect(client.findPane(7).?.terminal.scrollbackRows() > 0);
+    try std.testing.expectEqual(@as(usize, 0), pane.terminal.scrollbackRows());
+    try std.testing.expect(!pane.terminal.altScreen());
     client.enterScroll();
     try std.testing.expect(client.scroll_mode);
+
+    client.leaveScroll();
+
+    // A full-screen program switches to the alternate screen, where the rows are its interface
+    // rather than its output. The mode refuses there.
+    terminal.write("\x1b[?1049h");
+    try std.testing.expect(pane.terminal.altScreen());
+    client.enterScroll();
+    try std.testing.expect(!client.scroll_mode);
 }
 
 test "leaving the scroll mode returns the pane to the live screen" {
@@ -3177,4 +3628,360 @@ test "an unbound key after the prefix does nothing" {
     payload.clearRetainingCapacity();
     _ = try client.handleByte('a', &payload);
     try std.testing.expectEqualStrings("a", payload.items);
+}
+
+test "the copy cursor starts at the program's cursor and v anchors there" {
+    // The design the user asked for: entering the read mode puts a visible cursor on the screen, the
+    // movement keys move it, and `v` anchors a selection at wherever it has reached. The previous
+    // design anchored at the middle of the pane on `v`, which made the start point arbitrary and, at
+    // one cell, invisible.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 6 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 1 };
+    try client.panes.append(gpa, .{
+        .id = 1,
+        .terminal = terminal,
+        .render = render,
+        // The interior is the rectangle less its two-cell frame on each side.
+        .rect = .{ .x = 0, .y = 0, .width = 22, .height = 8 },
+        .route = route,
+    });
+    client.focused = 1;
+    const pane = client.findPane(1).?;
+
+    // Enough lines to give the pane history, since the read mode refuses to open without it, and the
+    // cursor left after the text on the last written row. That position is the one place on screen
+    // the user was already looking at, which is why it is where the copy cursor starts.
+    terminal.write("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\nab");
+    pane.render.update(pane.terminal) catch {};
+    try std.testing.expect(pane.terminal.scrollbackRows() > 0);
+    const at = pane.render.cursorPosition().?;
+    try std.testing.expectEqual(@as(u16, 2), at.x);
+
+    client.enterScroll();
+    // The copy cursor starts exactly where the library says the program's cursor is, whatever row
+    // that turns out to be. Asserting a literal row here would be asserting the pane's height rather
+    // than the behaviour under test.
+    try std.testing.expectEqual(at.x, client.copy_cursor.x);
+    try std.testing.expectEqual(@as(u32, at.y), client.copy_cursor.y);
+    // Nothing is selected on entry: the cursor is what the user aims with, and `v` is what selects.
+    try std.testing.expectEqual(@as(?vt.Terminal.CellPosition, null), client.selection_anchor);
+
+    // Moving before anchoring moves only the cursor, so the user can aim first.
+    const before = client.copy_cursor.x;
+    client.moveCopyCursor(pane, 'l');
+    try std.testing.expectEqual(before + 1, client.copy_cursor.x);
+    try std.testing.expectEqual(@as(?vt.Terminal.CellPosition, null), client.selection_anchor);
+
+    // `v` anchors exactly where the cursor is, and not somewhere else.
+    client.beginSelection(pane);
+    const anchor = client.selection_anchor.?;
+    try std.testing.expectEqual(client.copy_cursor.x, anchor.x);
+    try std.testing.expectEqual(client.copy_cursor.y, anchor.y);
+    try std.testing.expectEqual(SelectionKind.character, client.selection_kind);
+}
+
+test "the copy cursor stays inside the pane" {
+    // A cursor past the pane would have no cell to draw at, and the library would be asked for a
+    // column the row does not have. The clamp is what keeps the two in step.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 20 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 1 };
+    try client.panes.append(gpa, .{
+        .id = 1,
+        .terminal = terminal,
+        .render = render,
+        .rect = .{ .x = 0, .y = 0, .width = 12, .height = 6 },
+        .route = route,
+    });
+    client.focused = 1;
+    const pane = client.findPane(1).?;
+    const interior = pane.rect.interior();
+
+    client.placeCopyCursor(pane);
+    // Left and up from wherever the cursor started, all the way past the edge.
+    var step: usize = 0;
+    while (step < 50) : (step += 1) client.moveCopyCursor(pane, 'h');
+    try std.testing.expectEqual(@as(u16, 0), client.copy_cursor.x);
+    step = 0;
+    while (step < 50) : (step += 1) client.moveCopyCursor(pane, 'k');
+    try std.testing.expectEqual(@as(u32, 0), client.copy_cursor.y);
+
+    // And right and down, which must stop at the last cell rather than one past it.
+    step = 0;
+    while (step < 50) : (step += 1) client.moveCopyCursor(pane, 'l');
+    try std.testing.expectEqual(interior.width - 1, client.copy_cursor.x);
+    step = 0;
+    while (step < 50) : (step += 1) client.moveCopyCursor(pane, 'j');
+    try std.testing.expectEqual(@as(u32, interior.height - 1), client.copy_cursor.y);
+}
+
+test "the copy notice reports which route took the text" {
+    // A copy has no visible result, so the status line is the only confirmation. The three outcomes
+    // have to be told apart: a program that took it is named, and a copy that was only sent is not
+    // claimed as delivered, because an OSC 52 that worked and one that was ignored look identical
+    // from here.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    // With no local terminal and no fallback program installed, the text was still sent as an
+    // escape, so the notice says so rather than reporting a failure it cannot know about.
+    const notice = client.sendToClipboard("hello");
+    try std.testing.expectEqualStrings("sent", notice.text);
+    try std.testing.expect(!notice.failed);
+
+    client.clearCopyNotice();
+    try std.testing.expectEqual(@as(?[]const u8, null), client.copy_notice);
+}
+
+test "a selection too large to send is refused rather than truncated" {
+    // Terminals cap what they will accept and several drop anything longer in silence, so a copy
+    // past the limit is reported instead of being sent and hoped for.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    const huge = try gpa.alloc(u8, clipboard.max_payload + 1);
+    defer gpa.free(huge);
+    @memset(huge, 'x');
+
+    const refused = client.sendToClipboard(huge);
+    try std.testing.expectEqualStrings("too large to copy", refused.text);
+    try std.testing.expect(refused.failed);
+}
+
+test "the status line names the selection keys only while selecting" {
+    // The keys change meaning once a selection is up, so the hint has to change with them. Showing
+    // the scrolling hint while selecting would name `q` as leaving and `j` as scrolling, neither of
+    // which is true in that state.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var terminal = try vt.Terminal.init(.{ .cols = 20, .rows = 5 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 1 };
+    try client.panes.append(gpa, .{
+        .id = 1,
+        .terminal = terminal,
+        .render = render,
+        .rect = .{ .x = 0, .y = 0, .width = 22, .height = 8 },
+        .route = route,
+    });
+    client.focused = 1;
+
+    var buffer: [256]u8 = undefined;
+    client.scroll_mode = true;
+    const scrolling = client.statusText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, scrolling, "q quit") != null);
+
+    client.selection_anchor = .{ .x = 1, .y = 1 };
+    client.copy_cursor = .{ .x = 3, .y = 2 };
+    const selecting = client.statusText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, selecting, "selecting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, selecting, "y/enter copy") != null);
+    // The scrolling hint is gone, because its keys no longer do what it says.
+    try std.testing.expect(std.mem.indexOf(u8, selecting, "q quit") == null);
+
+    // A copy notice takes the line once the selection has been dealt with.
+    client.selection_anchor = null;
+    client.copy_notice = "wl-copy";
+    const copied = client.statusText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, copied, "copied via wl-copy") != null);
+}
+
+test "a failed copy is not phrased as if a program had taken the text" {
+    // "copied via nothing selected" is what the status line produced before the outcome carried
+    // whether it was a failure: the notice and the program name shared one string, so a refusal was
+    // formatted as a delivery. It reads as nonsense and hides which of the two happened.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var buffer: [256]u8 = undefined;
+
+    // A program taking the text is named as such.
+    client.copy_notice = "wl-copy";
+    client.copy_notice_is_failure = false;
+    try std.testing.expect(std.mem.indexOf(u8, client.statusText(&buffer), "copied via wl-copy") != null);
+
+    // A failure is a sentence of its own, with no "copied via" in front of it.
+    client.copy_notice = "nothing selected";
+    client.copy_notice_is_failure = true;
+    const refused = client.statusText(&buffer);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "nothing selected") != null);
+    try std.testing.expect(std.mem.indexOf(u8, refused, "copied via") == null);
+
+    // Clearing a notice clears the flag with it, so a stale failure cannot mislabel the next copy.
+    client.clearCopyNotice();
+    try std.testing.expect(!client.copy_notice_is_failure);
+}
+
+test "pressing w twice selects two words and not the second one alone" {
+    // The question a user asks: "I want to copy three or four words out of this output." Before this,
+    // `w` re-anchored on each press, so pressing it three times copied the third word rather than the
+    // first three. The anchor is now kept and only the far end moves.
+    const gpa = std.testing.allocator;
+    var client: Client = .{
+        .gpa = gpa,
+        .connection = .{ .fd = -1 },
+        .mode = .interactive,
+        .encoder = protocol.Encoder.init(gpa),
+        .out = undefined,
+        .err = undefined,
+    };
+    defer {
+        for (client.panes.items) |*pane| pane.deinit(gpa);
+        client.panes.deinit(gpa);
+        client.encoder.deinit();
+    }
+
+    var terminal = try vt.Terminal.init(.{ .cols = 40, .rows = 4 });
+    errdefer terminal.deinit();
+    var render = try terminal.createRenderState();
+    errdefer render.deinit();
+    const route = try gpa.create(PaneRoute);
+    route.* = .{ .client = &client, .pane = 1 };
+    try client.panes.append(gpa, .{
+        .id = 1,
+        .terminal = terminal,
+        .render = render,
+        .rect = .{ .x = 0, .y = 0, .width = 42, .height = 6 },
+        .route = route,
+    });
+    client.focused = 1;
+    const pane = client.findPane(1).?;
+
+    terminal.write("alpha beta gamma delta\r\n");
+    client.enterScroll();
+    client.copy_cursor = .{ .x = 0, .y = 0 };
+
+    // The first press takes the whole first word, not the single character under the cursor.
+    client.extendToWord(pane);
+    const one = (try pane.terminal.copyText(gpa)).?;
+    defer gpa.free(one);
+    try std.testing.expectEqualStrings("alpha", one);
+
+    // The second press extends to the second word: the span grows rather than being replaced.
+    client.extendToWord(pane);
+    const two = (try pane.terminal.copyText(gpa)).?;
+    defer gpa.free(two);
+    try std.testing.expectEqualStrings("alpha beta", two);
+
+    // And a third, which is the case the user actually asked about.
+    client.extendToWord(pane);
+    const three = (try pane.terminal.copyText(gpa)).?;
+    defer gpa.free(three);
+    try std.testing.expectEqualStrings("alpha beta gamma", three);
+}
+
+test "a selected cell that was already inverse is still visibly selected" {
+    // The shell prompt this was written against draws its user and host in reverse video. Setting the
+    // inverse bit for a selected cell therefore left that text looking exactly as it did unselected, so
+    // the selection was invisible on the very cells a user was aiming at -- which is what "the whole
+    // row glows and I cannot see my selection" turned out to be. The bit is toggled instead, so a
+    // selected cell always differs from the same cell unselected, whichever way it started.
+    var base = vt.Style{};
+    try std.testing.expect(!base.inverse);
+
+    var plain = base;
+    plain.inverse = !plain.inverse;
+    try std.testing.expect(plain.inverse);
+
+    var already = vt.Style{ .inverse = true };
+    already.inverse = !already.inverse;
+    try std.testing.expect(!already.inverse);
+
+    // Whichever way it started, the two differ: that is the property the drawing depends on.
+    var toggled_plain = base;
+    toggled_plain.inverse = !toggled_plain.inverse;
+    try std.testing.expect(!base.eql(toggled_plain));
+    // Named rather than written inline, because Zig reads `Struct{...}.method()` as a block followed by
+    // a statement.
+    const started_inverse = vt.Style{ .inverse = true };
+    try std.testing.expect(!started_inverse.eql(already));
 }

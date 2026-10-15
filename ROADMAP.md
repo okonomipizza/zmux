@@ -491,6 +491,144 @@ give a frozen screen and a mode that swallowed every key, which reads as the pro
 hanging. That is checked by asking the terminal how many rows it holds rather than by
 tracking any of it here.
 
+### Selecting and copying
+
+The read mode puts a copy cursor in the pane, `h`/`j`/`k`/`l` move it, `v` anchors a
+selection there, `w` and `V` snap it to a word and a line, `y` or Enter copies, and Escape
+drops the selection without leaving. The keys live inside the existing read mode rather
+than in a mode of their own, because they mean nothing except against a screen that is
+being read, and a fourth mode would be a fourth set of meanings for the same letters.
+
+Almost none of the selection logic is zmux's. The library owns word boundaries, line
+bounds, joining a soft-wrapped line back into one, and trimming the blanks a line was
+padded with; this side decides which key asks for which selection and how it is drawn.
+That is the same division as the rest of the terminal handling, and it is why the word
+under a path or an identifier comes back whole rather than split on punctuation zmux
+would have guessed at.
+
+The anchor is stored as a viewport position and the pair is handed to the library in the
+order the user drew it, so dragging right to left copies left to right: the endpoints
+keep their direction rather than being sorted, which is what the library asks for and
+what a user expects.
+
+Highlighting reads the selected columns once per row rather than once per cell, which is
+what the library recommends, and folds reverse video into the cell's own style so a run
+of selected text costs one escape rather than one per character. The style comparison
+already there is what makes that free.
+
+The bit is toggled rather than set, and that took a report to find. A cell's style can
+already carry reverse video: the shell prompt this was developed against draws its user and
+host that way. Setting the bit for a selected cell therefore left those cells looking exactly
+as they did unselected, so the selection was invisible on the very text the user was aiming
+at while appearing fine on ordinary text. Toggling makes a selected cell always differ from
+the same cell unselected, whichever way it started.
+
+That report also cost a detour worth recording, because it was misread. The symptom as
+first described was a whole row lighting up on `v`, and the search went into the selection
+model -- `select_line` ignoring the anchor, the anchor being expanded, a range being
+installed wrong. All three were innocent; the library reported a correct single-cell range
+and the drawing condition was correct. What actually glowed was the prompt text that the
+shell had already drawn in reverse, which the selection could not alter. The lesson is the
+one this file keeps repeating: read the symptom as a question about the data, not as a
+diagnosis, and measure before changing anything. Two earlier probes were themselves wrong
+-- one counted the shell's own colours as selection, the other's escape parser captured
+across cursor moves -- and both were believed for longer than they deserved.
+
+The clipboard is reached first through OSC 52, because that is the only route that works
+over a connection: the text travels back down the same link the screen comes up, and
+nothing has to exist on the far side. It is also the route that cannot be confirmed —
+there is no reply to tell an accepted escape from an ignored one — so a fallback program
+is tried as well when one is installed, and the status line names whichever took the
+text. `sent` is the honest answer when neither could be confirmed: claiming a failure
+would be wrong on every terminal that accepts OSC 52 and simply cannot say so, and
+claiming a delivery would be wrong on every terminal that ignored it.
+
+The fallback runs the program with the text on a pipe and its output pointed at
+`/dev/null`. Inheriting the terminal would let a program that printed a warning write it
+into the middle of a drawn frame, where it would stay until the next full repaint. The
+path is searched and the argument vector built before the fork, because the child of a
+fork may only call async-signal-safe functions; `xclip` and `xsel` also need telling to
+write the clipboard rather than the primary selection, which is their default.
+
+The copy result is checked before the mode hints in the status line, and that ordering is
+load-bearing. Copying leaves the read mode, and leaving clears the selection along with
+the notice, so a notice drawn only inside the mode's own branch was never visible at all
+— the end-to-end run is what showed it, and no unit test could have, since the pieces
+were each right on their own.
+
+The same run showed a second defect: the notice and the program name were one string, so
+a refusal was formatted as a delivery and the status line read "copied via nothing to
+copy". The outcome now carries whether it is a failure, and the two are worded
+differently. Both bugs lived in the seam between pieces that were individually correct,
+which is the shape of thing only running the program finds.
+
+What the run also showed is that a selection anchored at the middle of a scrolled screen
+often lands on a blank cell, and `w` and `V` cannot snap to a word or a line from blank
+space. The first answer was to report "nothing selected" rather than do nothing visible,
+which was honest but left the user aiming blind: the anchor was arbitrary and, being a
+single cell, invisible.
+
+The second answer is the one that stands, and it came from the user. Entering the read
+mode now places a visible copy cursor, at the program's own cursor position when there is
+one, and the movement keys move it before anything is selected. `v` anchors exactly where
+it has reached. So the sequence is aim, anchor, extend, copy, and each step is something
+the user can see: the previous design collapsed aiming and anchoring into one invisible
+keystroke.
+
+The cursor is drawn by the same function that draws the program's cursor, and the read
+mode branch is checked first, because in that mode the keystrokes do not go to the program
+and showing where its cursor is would point at something the user cannot move. A cursor
+the program has hidden, or one scrolled out of view, reports no position, so the middle of
+the pane is used; that is a guess, but a visible one that the movement keys immediately
+correct.
+
+The selection keys other than the movement ones are only read once an anchor exists.
+Before `v`, `w` and `y` fall through to the scrolling keys, so a keystroke in a mode where
+nothing is selected yet is not silently swallowed. The movement keys are handled in the
+scrolling switch itself, since they both aim and scroll: the viewport follows when the
+cursor would leave the screen.
+
+`w` reaches one word further on each press rather than re-selecting the word under the
+cursor, which is what makes copying three or four words a few keystrokes instead of a drag
+over the spaces between them. It works with no selection too, anchoring at the cursor on
+the first press, because a user who wants three words should not have to know about `v` to
+get them.
+
+Building that on the library's `select_word_between` was the obvious move and was wrong.
+It is documented as the *first selectable word found* between two refs, which is what
+double-click-and-drag wants, and it is anchored on its start ref: passing a start inside a
+word returns that same word however much further the end reaches, so a span built from it
+never grew past the first word. The client builds the span instead, from `select_word`
+bounds, and steps past whitespace looking for the next real word.
+
+That step found a second trap. `select_word` *succeeds* on a whitespace cell and returns a
+zero-width selection, so a caller stepping forward one cell at a time appears to find a word
+where there is none, installs an empty selection, and then reports "nothing to select" after
+having just looked successful. `selectWordEnding` now rejects a zero-width answer, and the
+caller keeps stepping rather than stopping at the first success.
+
+`R` makes the selection a block: the same columns on every row between the two ends. This
+is the one selection a linear range cannot express, and the difference is worth stating
+because it is what the key is for. Dragging the same two corners as a linear selection
+takes the first row's leading text, the whole of the last row, and the wrap between them;
+the rectangle takes the columns and nothing else, which is how one column comes out of an
+`ls -l` listing. It is a mode switch rather than a snap, since a block is not derivable from
+one position: it reinterprets the range the user has already drawn.
+
+Mouse dragging is not built, and would need the terminal put into a mouse-reporting mode and
+its reports translated into pane-relative cells.
+
+The mode opens whether or not the pane has anything above the screen. It used to refuse
+when `scrollbackRows()` was zero, which was right while the mode was only a way to scroll:
+it would have opened onto a frozen screen and swallowed every key, which reads as the
+program hanging. Once it became how text is copied that guard was wrong, because a command
+that printed one screenful is exactly what a user wants to pick a few words out of, and
+refusing meant printing enough output to scroll first. The question is now `altScreen()`,
+which is a different one: the alternate screen holds a full-screen program's own redraw
+rather than its output, and a selection there would be taken out from under the user by the
+next frame. A primary screen that has printed less than a screenful answers no to that and
+opens.
+
 ### Switching sessions without detaching
 
 `ctrl-b w` opens a menu over the whole window listing the sessions numbered from one.
@@ -870,10 +1008,10 @@ compromise is the one tmux makes; a better answer is to size to the smallest and
 letterbox the rest. Resizing an *attached* client now propagates correctly, but
 the choice of which client wins is still last-one-in.
 
-**Copy mode.** Scrollback browsing, selection and search are natural for a
-multiplexer but are a phase of their own. `ghostty_terminal_scroll_viewport`
-already supports absolute and prompt-relative scrolling, so the mechanism
-exists.
+**Copy mode.** Reading, selecting and copying are built; see the phase below. What
+is left is the mouse (dragging to select, which needs the terminal put into a
+mouse-reporting mode and the reports translated into pane-relative cells),
+rectangular selection, and searching the scrollback.
 
 **Configuration.** Settled: a flat JSON object of dotted names to strings, under
 `$XDG_CONFIG_HOME/zmux/config.json`, written in full on first attach and read

@@ -600,6 +600,7 @@ test {
     _ = socket;
     _ = config_mod;
     _ = @import("signal.zig");
+    _ = @import("clipboard.zig");
 }
 
 test "a copied name outlives the iterator's buffer" {
